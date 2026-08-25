@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 )
 
 // where 一条动态过滤条件。
@@ -42,6 +43,7 @@ type Query[T any] struct {
 	offset        int
 	forUpdate     bool   // 悲观锁：SELECT 末尾追加 FOR UPDATE（SQLite 自动降级为空）
 	last          string // 自定义 SQL 结尾（原样拼接，对标 MyBatis-Plus 的 last()）
+	unscoped      bool   // true 时关闭逻辑删除自动过滤（Unscoped / 物理删除逃生通道）
 	hasVector     bool
 	vecCol        string
 	vector        any
@@ -260,6 +262,50 @@ func (q *Query[T]) ForUpdate() *Query[T] {
 func (q *Query[T]) Last(sql string) *Query[T] {
 	q.last = sql
 	return q
+}
+
+// Unscoped 关闭本次查询/删除的逻辑删除自动过滤，用于查询已删除数据或物理删除。
+func (q *Query[T]) Unscoped() *Query[T] {
+	q.unscoped = true
+	return q
+}
+
+// applyLogic 若模型定义了逻辑删除列且未显式 Unscoped，返回一个追加了「未删除」过滤条件的新查询。
+// 条件作为独立的 AND 组追加，与原条件正确衔接；新查询标记 unscoped 以防重复叠加。
+func (q *Query[T]) applyLogic(meta *modelMeta) *Query[T] {
+	if meta.logicCol == nil || q.unscoped {
+		return q
+	}
+	op := "IS NULL"
+	if !meta.logicIsTime {
+		op = "= 0"
+	}
+	c := *q
+	c.groups = append(append([][]where{}, q.groups...), []where{{
+		col: meta.logicCol.colName, op: op, raw: true,
+	}})
+	c.unscoped = true
+	return &c
+}
+
+// logicSuffix 返回逻辑删除列的「未删除」判定片段（不含 AND 前缀）。
+// time 类型 → "col IS NULL"；int 类型 → "col = 0"；无逻辑列或已 Unscoped 时返回空串。
+func logicSuffix(meta *modelMeta, d Dialect, unscoped bool) string {
+	if meta.logicCol == nil || unscoped {
+		return ""
+	}
+	if meta.logicIsTime {
+		return d.QuoteIdent(meta.logicCol.colName) + " IS NULL"
+	}
+	return d.QuoteIdent(meta.logicCol.colName) + " = 0"
+}
+
+// logicDeletedValue 返回软删除时写入逻辑列的值：time 类型写当前时间，int 类型写 1。
+func logicDeletedValue(meta *modelMeta) any {
+	if meta.logicIsTime {
+		return time.Now()
+	}
+	return 1
 }
 
 // Build 生成最终 SQL 与参数。向量（若有）恒为第一个占位符。

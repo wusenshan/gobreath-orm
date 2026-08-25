@@ -76,6 +76,16 @@ func (r *Repo[T]) Delete(ctx context.Context, q *Query[T]) error {
 	return Delete[T](ctx, r.db, q)
 }
 
+// ForceDeleteById 无视逻辑删除列，按主键物理删除。
+func (r *Repo[T]) ForceDeleteById(ctx context.Context, id any) error {
+	return ForceDeleteById[T](ctx, r.db, id)
+}
+
+// ForceDelete 无视逻辑删除列，按查询条件物理删除。
+func (r *Repo[T]) ForceDelete(ctx context.Context, q *Query[T]) error {
+	return ForceDelete[T](ctx, r.db, q)
+}
+
 // Transaction 在本 Repo 的事务中执行 fn；回调收到的是同一 T 绑定的事务仓储句柄，
 // 因此回调内同样免类型参数。fn 返回 error 时自动回滚，否则提交。
 func (r *Repo[T]) Transaction(ctx context.Context, fn func(tx *Repo[T]) error) error {

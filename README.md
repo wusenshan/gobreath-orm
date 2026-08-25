@@ -534,6 +534,40 @@ db := orm.Open("mysql", dsn).WithPrefix("t_")
 
 ---
 
+## 逻辑删除（Soft Delete）
+
+给模型字段加 `,logic` 标记即可启用逻辑删除（对标 MyBatis-Plus 的 `@TableLogic`）。
+
+- **time 类型**（`time.Time` / `*time.Time`）列：未删除判定为 `IS NULL`，删除时写入当前时间。
+- **int 类型**列：未删除判定为 `= 0`，删除时写入 `1`。
+
+启用后，**所有读操作自动过滤已删除数据**（`SelectById` / `SelectList` / `SelectOne` / `Count` / `Exists` / `Page` / `Update` / `UpdateById` 都会追加 `未删除条件`）；**`Delete` / `DeleteById` 自动改为 `UPDATE ... SET 逻辑列 = ...` 软删除**，不再物理删行。
+
+```go
+type User struct {
+    Id        int64      `db:"id,pk,autoincrement"`
+    Name      string     `db:"name"`
+    DeletedAt *time.Time `db:"deleted_at,logic"` // 逻辑删除列
+}
+```
+
+```go
+// 自动：SELECT * FROM "users" WHERE "id" = ? AND "deleted_at" IS NULL
+u, _ := orm.SelectById[User](ctx, db, 1)
+
+// 自动软删：UPDATE "users" SET "deleted_at" = ? WHERE "id" = ? AND "deleted_at" IS NULL
+orm.DeleteById[User](ctx, db, 1)
+
+// 查询已删除数据 / 物理删除：用 Unscoped 或 ForceDelete
+orm.SelectList(ctx, db, orm.NewQuery[User]().Unscoped())      // 不过滤已删除
+orm.Delete(ctx, db, orm.NewQuery[User]().Unscoped().Eq(...))  // 物理删（无视逻辑列）
+orm.ForceDeleteById[User](ctx, db, 1)                         // 物理删（Repo 同样有 ForceDelete/ForceDeleteById）
+```
+
+**注意**：逻辑列不参与 `Insert` / `Update` 的实体赋值（交由数据库默认值 `NULL` / `0`），避免零值时间写入破坏 `IS NULL` 判定；请确保该列在表结构上有对应默认值。
+
+---
+
 ## SQL 执行日志
 
 内建轻量级 SQL 日志：输出每条 SQL、绑定参数、耗时与执行错误，并按日志等级过滤。默认 **Silent**（不打印），按需开启。

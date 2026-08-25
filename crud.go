@@ -81,7 +81,7 @@ func BatchInsert[T any](ctx context.Context, db *DB, entities []T) error {
 
 // ---- 查询 ----
 
-// SelectById 按主键查询单条；未命中返回 ErrNotFound。
+// SelectById 按主键查询单条；未命中返回 ErrNotFound。自动过滤已逻辑删除的行。
 func SelectById[T any](ctx context.Context, db *DB, id any) (*T, error) {
 	meta := getMeta[T]()
 	if meta.pk == nil {
@@ -90,6 +90,9 @@ func SelectById[T any](ctx context.Context, db *DB, id any) (*T, error) {
 	sqlStr := fmt.Sprintf("SELECT * FROM %s WHERE %s = %s",
 		quoteTable(meta.finalTable(db.prefix), db.dialect),
 		db.dialect.QuoteIdent(meta.pk.colName), db.dialect.Placeholder(1))
+	if s := logicSuffix(meta, db.dialect, false); s != "" {
+		sqlStr += " AND " + s
+	}
 	rows, err := db.queryContext(ctx, sqlStr, id)
 	if err != nil {
 		return nil, err
@@ -108,9 +111,9 @@ func SelectById[T any](ctx context.Context, db *DB, id any) (*T, error) {
 	return &t, nil
 }
 
-// SelectList 按查询构造器返回列表。
+// SelectList 按查询构造器返回列表。自动过滤已逻辑删除的行（Unscoped 例外）。
 func SelectList[T any](ctx context.Context, db *DB, q *Query[T]) ([]T, error) {
-	sqlStr, args := q.WithDialect(db.dialect).WithPrefix(db.prefix).Build()
+	sqlStr, args := q.applyLogic(getMeta[T]()).WithDialect(db.dialect).WithPrefix(db.prefix).Build()
 	rows, err := db.queryContext(ctx, sqlStr, args...)
 	if err != nil {
 		return nil, err
@@ -127,9 +130,9 @@ func SelectList[T any](ctx context.Context, db *DB, q *Query[T]) ([]T, error) {
 	return out, rows.Err()
 }
 
-// SelectOne 返回列表首条；空结果返回 ErrNotFound。
+// SelectOne 返回列表首条；空结果返回 ErrNotFound。自动过滤已逻辑删除的行。
 func SelectOne[T any](ctx context.Context, db *DB, q *Query[T]) (*T, error) {
-	list, err := SelectList(ctx, db, q.Limit(1))
+	list, err := SelectList(ctx, db, q.applyLogic(getMeta[T]()).Limit(1))
 	if err != nil {
 		return nil, err
 	}
@@ -139,13 +142,20 @@ func SelectOne[T any](ctx context.Context, db *DB, q *Query[T]) (*T, error) {
 	return &list[0], nil
 }
 
-// Count 返回符合条件的记录数。
+// Count 返回符合条件的记录数。自动过滤已逻辑删除的行（Unscoped 例外）。
 func Count[T any](ctx context.Context, db *DB, q *Query[T]) (int64, error) {
 	meta := getMeta[T]()
 	args := []any{}
 	idx := 0
 	add := func(v any) int { idx++; args = append(args, v); return idx }
 	w := whereSQL(q.groups, db.dialect, add)
+	if s := logicSuffix(meta, db.dialect, q.unscoped); s != "" {
+		if w == "" {
+			w = s
+		} else {
+			w += " AND " + s
+		}
+	}
 	sqlStr := fmt.Sprintf("SELECT COUNT(*) FROM %s", quoteTable(meta.finalTable(db.prefix), db.dialect))
 	if w != "" {
 		sqlStr += " WHERE " + w
@@ -253,11 +263,14 @@ func UpdateById[T any](ctx context.Context, db *DB, entity *T) error {
 	sqlStr := fmt.Sprintf("UPDATE %s SET %s WHERE %s = %s",
 		quoteTable(meta.finalTable(db.prefix), db.dialect), strings.Join(setParts, ", "),
 		db.dialect.QuoteIdent(meta.pk.colName), nextPh())
+	if s := logicSuffix(meta, db.dialect, false); s != "" {
+		sqlStr += " AND " + s
+	}
 	_, err = db.execContext(ctx, sqlStr, args...)
 	return err
 }
 
-// Update 按查询条件更新，使用 entity 的非主键字段作为新值。
+// Update 按查询条件更新，使用 entity 的非主键字段作为新值。自动跳过已逻辑删除的行。
 func Update[T any](ctx context.Context, db *DB, q *Query[T], entity *T) error {
 	meta := getMeta[T]()
 	cols := updateCols(meta)
@@ -285,17 +298,72 @@ func Update[T any](ctx context.Context, db *DB, q *Query[T], entity *T) error {
 	}
 	sqlStr := fmt.Sprintf("UPDATE %s SET %s WHERE %s",
 		quoteTable(meta.finalTable(db.prefix), db.dialect), strings.Join(setParts, ", "), w)
+	if s := logicSuffix(meta, db.dialect, q.unscoped); s != "" {
+		sqlStr += " AND " + s
+	}
 	_, err := db.execContext(ctx, sqlStr, args...)
 	return err
 }
 
 // ---- 删除 ----
 
-// DeleteById 按主键删除。
+// DeleteById 按主键「逻辑删除」（若模型定义了逻辑删除列），否则物理删除。
+// 软删时只更新逻辑列（不触碰已删除行），如需物理删除请使用 ForceDeleteById。
 func DeleteById[T any](ctx context.Context, db *DB, id any) error {
 	meta := getMeta[T]()
 	if meta.pk == nil {
 		return fmt.Errorf("orm: %s 无主键，无法 DeleteById", meta.table)
+	}
+	d := db.dialect
+	if meta.logicCol != nil {
+		sqlStr := fmt.Sprintf("UPDATE %s SET %s = %s WHERE %s = %s",
+			quoteTable(meta.finalTable(db.prefix), d),
+			d.QuoteIdent(meta.logicCol.colName), d.Placeholder(1),
+			d.QuoteIdent(meta.pk.colName), d.Placeholder(2))
+		args := []any{logicDeletedValue(meta), id}
+		if s := logicSuffix(meta, d, false); s != "" {
+			sqlStr += " AND " + s
+		}
+		_, err := db.execContext(ctx, sqlStr, args...)
+		return err
+	}
+	sqlStr := fmt.Sprintf("DELETE FROM %s WHERE %s = %s",
+		quoteTable(meta.finalTable(db.prefix), d),
+		d.QuoteIdent(meta.pk.colName), d.Placeholder(1))
+	_, err := db.execContext(ctx, sqlStr, id)
+	return err
+}
+
+// Delete 按查询条件「逻辑删除」（若模型定义了逻辑删除列且未 Unscoped），否则物理删除；禁止无条件全表删除。
+func Delete[T any](ctx context.Context, db *DB, q *Query[T]) error {
+	meta := getMeta[T]()
+	d := db.dialect
+	args := []any{}
+	idx := 0
+	add := func(v any) int { idx++; args = append(args, v); return idx }
+	w := whereSQL(q.groups, d, add)
+	if w == "" {
+		return fmt.Errorf("orm: Delete 必须有条件，禁止全表删除")
+	}
+	if meta.logicCol != nil && !q.unscoped {
+		setPart := fmt.Sprintf("%s = %s", d.QuoteIdent(meta.logicCol.colName), d.Placeholder(add(logicDeletedValue(meta))))
+		sqlStr := fmt.Sprintf("UPDATE %s SET %s WHERE %s", quoteTable(meta.finalTable(db.prefix), d), setPart, w)
+		if s := logicSuffix(meta, d, false); s != "" {
+			sqlStr += " AND " + s
+		}
+		_, err := db.execContext(ctx, sqlStr, args...)
+		return err
+	}
+	sqlStr := fmt.Sprintf("DELETE FROM %s WHERE %s", quoteTable(meta.finalTable(db.prefix), d), w)
+	_, err := db.execContext(ctx, sqlStr, args...)
+	return err
+}
+
+// ForceDeleteById 无视逻辑删除列，按主键物理删除。
+func ForceDeleteById[T any](ctx context.Context, db *DB, id any) error {
+	meta := getMeta[T]()
+	if meta.pk == nil {
+		return fmt.Errorf("orm: %s 无主键，无法 ForceDeleteById", meta.table)
 	}
 	sqlStr := fmt.Sprintf("DELETE FROM %s WHERE %s = %s",
 		quoteTable(meta.finalTable(db.prefix), db.dialect),
@@ -304,15 +372,15 @@ func DeleteById[T any](ctx context.Context, db *DB, id any) error {
 	return err
 }
 
-// Delete 按查询条件删除；禁止无条件全表删除。
-func Delete[T any](ctx context.Context, db *DB, q *Query[T]) error {
+// ForceDelete 无视逻辑删除列，按查询条件物理删除；禁止无条件全表删除。
+func ForceDelete[T any](ctx context.Context, db *DB, q *Query[T]) error {
 	meta := getMeta[T]()
 	args := []any{}
 	idx := 0
 	add := func(v any) int { idx++; args = append(args, v); return idx }
 	w := whereSQL(q.groups, db.dialect, add)
 	if w == "" {
-		return fmt.Errorf("orm: Delete 必须有条件，禁止全表删除")
+		return fmt.Errorf("orm: ForceDelete 必须有条件，禁止全表删除")
 	}
 	sqlStr := fmt.Sprintf("DELETE FROM %s WHERE %s", quoteTable(meta.finalTable(db.prefix), db.dialect), w)
 	_, err := db.execContext(ctx, sqlStr, args...)

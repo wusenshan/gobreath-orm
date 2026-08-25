@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // fieldInfo 结构体字段的元数据。
@@ -18,6 +19,7 @@ type fieldInfo struct {
 	autoInc bool
 	ignore  bool
 	json    bool // true 表示字段以 JSON 形式读写（db tag 含 ",json"）
+	logic   bool // true 表示该字段是逻辑删除列（db tag 含 ",logic"）
 }
 
 // modelMeta 一张表的模型元数据（字段、列、主键）。
@@ -27,6 +29,8 @@ type modelMeta struct {
 	fields        []fieldInfo
 	columns       []string // 所有非忽略列
 	pk            *fieldInfo
+	logicCol      *fieldInfo // 逻辑删除列（db tag 含 ",logic" 时非空）
+	logicIsTime   bool       // true 表示逻辑列是 time.Time/*time.Time，未删除判定为 IS NULL；否则 = 0
 }
 
 var metaCache sync.Map
@@ -81,6 +85,8 @@ func parseMeta(typ reflect.Type) *modelMeta {
 					fi.autoInc = true
 				case "json":
 					fi.json = true
+				case "logic":
+					fi.logic = true
 				}
 			}
 		}
@@ -91,6 +97,10 @@ func parseMeta(typ reflect.Type) *modelMeta {
 		m.columns = append(m.columns, fi.colName)
 		if fi.pk {
 			m.pk = &m.fields[len(m.fields)-1]
+		}
+		if fi.logic {
+			m.logicCol = &m.fields[len(m.fields)-1]
+			m.logicIsTime = isTimeType(f.Type)
 		}
 	}
 	if m.pk == nil {
@@ -369,7 +379,7 @@ func writableCols(meta *modelMeta) []string {
 	var cols []string
 	for i := range meta.fields {
 		f := meta.fields[i]
-		if f.ignore || f.autoInc {
+		if f.ignore || f.autoInc || f.logic {
 			continue
 		}
 		cols = append(cols, f.colName)
@@ -381,12 +391,20 @@ func updateCols(meta *modelMeta) []string {
 	var cols []string
 	for i := range meta.fields {
 		f := meta.fields[i]
-		if f.ignore || f.pk || f.autoInc {
+		if f.ignore || f.pk || f.autoInc || f.logic {
 			continue
 		}
 		cols = append(cols, f.colName)
 	}
 	return cols
+}
+
+// isTimeType 判断字段类型是否为 time.Time（含指针形式），用于决定逻辑删除的「未删除」判定。
+func isTimeType(t reflect.Type) bool {
+	for t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+	return t == reflect.TypeOf(time.Time{})
 }
 
 func quoteCols(cols []string, d Dialect) string {
