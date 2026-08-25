@@ -82,7 +82,7 @@ import (
 ```go
 package main
 
-import "github.com/wusenshan/gobreath-orm"
+import "github.com/yourname/gobreath-orm"
 
 // 注意：所有需要映射的字段必须导出（首字母大写）。
 // 非导出字段会被直接忽略。
@@ -431,6 +431,41 @@ rows, err := orm.SelectList(ctx, db,
         Having(statusCol, ">", 1),
 )
 ```
+
+---
+
+### 悲观锁与自定义结尾（ForUpdate / Last）
+
+**`ForUpdate`** 在 `SELECT` 末尾追加悲观行锁 `FOR UPDATE`，用于「先查后改」防并发覆盖：
+
+```go
+// PG / MySQL 生成：SELECT * FROM users WHERE id = $1 FOR UPDATE
+// SQLite 无行级锁，自动降级为空串（不生成任何锁子句）
+u, err := orm.SelectOne(ctx, db,
+    orm.NewQuery[User]().Eq(idCol, 1).ForUpdate(),
+)
+```
+
+- 方言感知：Postgres / MySQL 生成 `" FOR UPDATE"`；**SQLite 自动降级为空**（避免老版本直接报语法错）。
+- 必须在**事务内**才真正生效，建议配合 `db.Transaction` 使用。
+
+**`Last`** 在生成的 SQL **最末尾**原样拼接一段自定义片段（对标 MyBatis-Plus 的 `last()`），典型用于方言特有语法：
+
+```go
+// 跳过已被其他事务锁住的行（Postgres / Oracle 支持）
+// SELECT * FROM users WHERE status = $1 FOR UPDATE SKIP LOCKED
+orm.NewQuery[User]().
+    Eq(statusCol, 1).
+    ForUpdate().
+    Last("SKIP LOCKED")
+
+// 其他方言特有尾语法：OFFSET ... FETCH ...、窗口函数提示、数据库 hint 等
+orm.NewQuery[User]().Limit(10).Last("FETCH NEXT 10 ROWS ONLY")
+```
+
+> ⚠️ **安全提示**：`Last` 的内容**不经占位符参数化、直接拼接进 SQL**，只允许放可信 / 静态片段，**切勿拼接任何用户输入**，否则会造成 SQL 注入。
+
+`ForUpdate` 与 `Last` 的拼接顺序固定为：`... LIMIT/OFFSET → FOR UPDATE → Last`，即 `Last` 永远在最末尾。
 
 ---
 
