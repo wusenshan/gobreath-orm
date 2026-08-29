@@ -26,6 +26,8 @@ type DB struct {
 }
 
 // Config 用于配置数据库连接。推荐方式是按结构体传入，避免参数顺序写错。
+// 连接池参数为零值时不设置，保持 database/sql 默认行为
+// （MaxIdleConns 想显式设为 0 时请通过 db.SQL().SetMaxIdleConns(0) 设置）。
 type Config struct {
 	Driver        string
 	DSN           string
@@ -33,6 +35,11 @@ type Config struct {
 	Logger        LogFunc
 	LogLevel      LogLevel
 	SlowThreshold time.Duration
+
+	MaxOpenConns    int           // 最大打开连接数（0 = 不限制，默认）
+	MaxIdleConns    int           // 最大空闲连接数（0 = 保持默认值 2）
+	ConnMaxLifetime time.Duration // 连接最长存活时间（0 = 永不回收，默认；连 MySQL 建议小于 wait_timeout）
+	ConnMaxIdleTime time.Duration // 连接最长空闲时间（0 = 永不回收，默认）
 }
 
 // Open 用标准 database/sql 打开连接，并按驱动名选择方言。
@@ -52,6 +59,18 @@ func Open(args ...any) (*DB, error) {
 	sqlDB, err := sql.Open(cfg.Driver, cfg.DSN)
 	if err != nil {
 		return nil, err
+	}
+	if cfg.MaxOpenConns != 0 {
+		sqlDB.SetMaxOpenConns(cfg.MaxOpenConns)
+	}
+	if cfg.MaxIdleConns != 0 {
+		sqlDB.SetMaxIdleConns(cfg.MaxIdleConns)
+	}
+	if cfg.ConnMaxLifetime != 0 {
+		sqlDB.SetConnMaxLifetime(cfg.ConnMaxLifetime)
+	}
+	if cfg.ConnMaxIdleTime != 0 {
+		sqlDB.SetConnMaxIdleTime(cfg.ConnMaxIdleTime)
 	}
 
 	db := NewDB(sqlDB, dialectForDriver(cfg.Driver))
@@ -172,6 +191,16 @@ func (db *DB) WithSlowThreshold(d time.Duration) *DB {
 		logLevel:      db.logLevel,
 		slowThreshold: d,
 	}
+}
+
+// SQL 返回底层的 *sql.DB，用于设置连接池参数（SetMaxOpenConns 等）、
+// 获取统计信息（Stats()）或 Ping 验活等逃逸操作。
+// 底层不是 *sql.DB（如事务副本绑定 *sql.Tx）时返回 nil。
+func (db *DB) SQL() *sql.DB {
+	if sqlDB, ok := db.exec.(*sql.DB); ok {
+		return sqlDB
+	}
+	return nil
 }
 
 // Transaction 在事务中执行 fn；fn 内使用传入的 tx *DB（已绑定 *sql.Tx，且继承日志配置与前缀）。

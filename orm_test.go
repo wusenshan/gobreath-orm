@@ -4,9 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
+	"time"
 )
 
 // ---- 测试用模型 ----
@@ -126,6 +128,43 @@ func TestOpenConfigStruct(t *testing.T) {
 	if err := db.exec.(*sql.DB).Close(); err != nil {
 		t.Fatalf("关闭 DB 错误: %v", err)
 	}
+}
+
+func TestOpenConfigPool(t *testing.T) {
+	db, err := Open(Config{
+		Driver:          "ormmock",
+		MaxOpenConns:    5,
+		MaxIdleConns:    2,
+		ConnMaxLifetime: time.Minute,
+		ConnMaxIdleTime: 30 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Open(Config) 返回错误: %v", err)
+	}
+	defer db.SQL().Close()
+
+	if got := db.SQL(); got == nil {
+		t.Fatal("SQL() 应返回底层 *sql.DB")
+	} else if got.Stats().MaxOpenConnections != 5 {
+		t.Fatalf("MaxOpenConns 应为 5，实际 %d", got.Stats().MaxOpenConnections)
+	}
+}
+
+func TestSQLAccessorNil(t *testing.T) {
+	// 底层执行器不是 *sql.DB 时，SQL() 应返回 nil。
+	db := NewDB(stubExecutor{}, SQLite)
+	if db.SQL() != nil {
+		t.Fatal("非 *sql.DB 底层时 SQL() 应返回 nil")
+	}
+}
+
+type stubExecutor struct{}
+
+func (stubExecutor) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	return nil, fmt.Errorf("stub")
+}
+func (stubExecutor) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	return nil, fmt.Errorf("stub")
 }
 
 // ---- 测试用例 ----

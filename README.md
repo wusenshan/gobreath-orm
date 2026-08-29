@@ -20,7 +20,7 @@
 - 📦 **JSON 字段**：`db:"meta,json"` 即可把结构体字段（map / struct）自动与 JSON 列互转；支持按路径查询与 `JSON_CONTAINS / @>` 包含查询，三方言全适配。
 - 🔍 **向量检索**：`Nearest / WithinDistance` 生成 `<embedding> <-> $1` 距离排序（Postgres 语法，需数据库支持向量类型）。
 - 🛡 **三层防注入**：值参数化绑定 + 列名仅取自结构体 tag 白名单 + 表名白名单校验与引号转义。
-- ⚙️ **结构体配置**：`orm.Open(orm.Config{...})` 具名传参一次配齐驱动 / 前缀 / 日志，也兼容 `Open(driver, dsn)` 旧写法。
+- ⚙️ **结构体配置**：`orm.Open(orm.Config{...})` 具名传参一次配齐驱动 / 前缀 / 日志 / 连接池，也兼容 `Open(driver, dsn)` 旧写法。
 
 ---
 
@@ -127,6 +127,12 @@ db, err := orm.Open(orm.Config{
     // Logger:        orm.DefaultLogger(os.Stdout),  // SQL 日志输出
     // LogLevel:      orm.Info,                      // 日志等级
     // SlowThreshold: 200 * time.Millisecond,        // 慢查询阈值
+
+    // 连接池参数（不填保持 database/sql 默认行为）
+    // MaxOpenConns:    20,                // 最大打开连接数（默认不限制）
+    // MaxIdleConns:    20,                // 最大空闲连接数（默认 2）
+    // ConnMaxLifetime: time.Hour,         // 连接最长存活时间（默认永不回收）
+    // ConnMaxIdleTime: 10 * time.Minute,  // 连接最长空闲时间（默认永不回收）
 })
 if err != nil {
     panic(err)
@@ -141,7 +147,19 @@ db, err := orm.Open("postgres", "postgres://user:pass@localhost:5432/demo?sslmod
 // db = db.WithPrefix("t_")
 ```
 
-> `Config` 里没填的可选项（`Prefix` / `Logger` / `LogLevel` / `SlowThreshold`）保持默认值，也可事后用 `WithXxx` 链式方法补配，两种方式效果等价。
+> `Config` 里没填的可选项（`Prefix` / `Logger` / `LogLevel` / `SlowThreshold` / 连接池四项）保持默认值，也可事后用 `WithXxx` 链式方法补配（连接池参数除外，见下）。
+
+**连接池调优提示**：`database/sql` 默认 `ConnMaxLifetime` 永不回收，连 MySQL 时若超过服务端 `wait_timeout`（默认 8h），会随机报 `invalid connection` / `driver: bad connection`——建议把 `ConnMaxLifetime` 设成略小于 `wait_timeout` 的值（如 `time.Hour`）。
+
+更冷门的池参数或统计信息可通过逃生舱拿到底层连接再调：
+
+```go
+sqlDB := db.SQL()               // 返回底层 *sql.DB（事务副本/非 *sql.DB 底层时为 nil）
+sqlDB.SetMaxIdleConns(0)        // 例如显式关闭空闲连接
+_ = sqlDB.Stats()               // 连接池统计
+```
+
+> 连接池参数属于 `database/sql` 原生能力，框架在 `Open` 后自动透传设置；`orm.Open` 之外的构建方式（如 `NewDB`）可自行通过 `db.SQL()` 配置。
 
 ### 3. 一个最小可运行示例
 
