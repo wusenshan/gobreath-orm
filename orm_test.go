@@ -109,6 +109,25 @@ func newMockDB(t *testing.T) *DB {
 	return NewDB(sqlDB, SQLite)
 }
 
+func TestOpenConfigStruct(t *testing.T) {
+	db, err := Open(Config{Driver: "ormmock", DSN: ""})
+	if err != nil {
+		t.Fatalf("Open(Config) 返回错误: %v", err)
+	}
+	if db == nil {
+		t.Fatal("Open(Config) 返回 nil DB")
+	}
+	if db.prefix != "" {
+		t.Fatalf("Open(Config) 默认前缀应为空，实际 %q", db.prefix)
+	}
+	if db.dialect != PG {
+		t.Fatalf("Open(Config) 未知驱动应回退到 PG，实际 %v", db.dialect)
+	}
+	if err := db.exec.(*sql.DB).Close(); err != nil {
+		t.Fatalf("关闭 DB 错误: %v", err)
+	}
+}
+
 // ---- 测试用例 ----
 
 func TestQueryBuildBasic(t *testing.T) {

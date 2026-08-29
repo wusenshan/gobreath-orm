@@ -25,14 +25,75 @@ type DB struct {
 	slowThreshold time.Duration // 慢查询阈值；>0 且超过则按 Warn 输出
 }
 
+// Config 用于配置数据库连接。推荐方式是按结构体传入，避免参数顺序写错。
+type Config struct {
+	Driver        string
+	DSN           string
+	Prefix        string
+	Logger        LogFunc
+	LogLevel      LogLevel
+	SlowThreshold time.Duration
+}
+
 // Open 用标准 database/sql 打开连接，并按驱动名选择方言。
+// 兼容两种调用方式：
+//   - orm.Open("mysql", dsn)
+//   - orm.Open(orm.Config{Driver: "mysql", DSN: dsn})
 // driver 支持：postgres/pgx → PG；mysql → MySQL；sqlite/sqlite3 → SQLite。
-func Open(driver, dsn string) (*DB, error) {
-	sqlDB, err := sql.Open(driver, dsn)
+func Open(args ...any) (*DB, error) {
+	cfg, err := parseOpenConfig(args...)
 	if err != nil {
 		return nil, err
 	}
-	return NewDB(sqlDB, dialectForDriver(driver)), nil
+	if cfg.Driver == "" {
+		return nil, fmt.Errorf("orm: Open() 缺少 Driver 配置")
+	}
+
+	sqlDB, err := sql.Open(cfg.Driver, cfg.DSN)
+	if err != nil {
+		return nil, err
+	}
+
+	db := NewDB(sqlDB, dialectForDriver(cfg.Driver))
+	if cfg.Prefix != "" {
+		db = db.WithPrefix(cfg.Prefix)
+	}
+	if cfg.Logger != nil {
+		db = db.WithLogger(cfg.Logger)
+	}
+	if cfg.LogLevel != 0 {
+		db = db.WithLogLevel(cfg.LogLevel)
+	}
+	if cfg.SlowThreshold != 0 {
+		db = db.WithSlowThreshold(cfg.SlowThreshold)
+	}
+	return db, nil
+}
+
+func parseOpenConfig(args ...any) (Config, error) {
+	switch len(args) {
+	case 1:
+		switch c := args[0].(type) {
+		case Config:
+			return c, nil
+		case *Config:
+			if c == nil {
+				return Config{}, fmt.Errorf("orm: Open() 收到 nil *Config")
+			}
+			return *c, nil
+		default:
+			return Config{}, fmt.Errorf("orm: Open() 参数类型不支持 %T，期望 Config 或 (driver string, dsn string)", args[0])
+		}
+	case 2:
+		driver, ok1 := args[0].(string)
+		dsn, ok2 := args[1].(string)
+		if !ok1 || !ok2 {
+			return Config{}, fmt.Errorf("orm: Open() 需要传入 (driver string, dsn string) 或 Config")
+		}
+		return Config{Driver: driver, DSN: dsn}, nil
+	default:
+		return Config{}, fmt.Errorf("orm: Open() 期望传入 Config 或 (driver string, dsn string)")
+	}
 }
 
 func dialectForDriver(d string) Dialect {
