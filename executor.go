@@ -23,6 +23,8 @@ type DB struct {
 	logger        LogFunc       // SQL 日志回调；nil 表示不打印
 	logLevel      LogLevel      // 日志等级阈值，默认 Silent
 	slowThreshold time.Duration // 慢查询阈值；>0 且超过则按 Warn 输出
+
+	softDeleteField string // 约定软删除字段名；实体未用 ,logic tag 声明时按此字段名匹配（列名或 Go 字段名）
 }
 
 // Config 用于配置数据库连接。推荐方式是按结构体传入，避免参数顺序写错。
@@ -40,6 +42,13 @@ type Config struct {
 	MaxIdleConns    int           // 最大空闲连接数（0 = 保持默认值 2）
 	ConnMaxLifetime time.Duration // 连接最长存活时间（0 = 永不回收，默认；连 MySQL 建议小于 wait_timeout）
 	ConnMaxIdleTime time.Duration // 连接最长空闲时间（0 = 永不回收，默认）
+
+	// SoftDeleteField 约定软删除字段名（如 "deleted_at" 或 "deleted"）。
+	// 实体未用 db:"...,logic" tag 显式声明时，只要存在列名或 Go 字段名
+	// 等于该值的字段、且类型为 time/int/bool，即自动启用软删除。
+	// 单表优先级：,logic tag 显式声明 > 本约定；不匹配或类型不支持则物理删除；
+	// 可用 ,nologic tag 显式退出约定匹配。
+	SoftDeleteField string
 }
 
 // Open 用标准 database/sql 打开连接，并按驱动名选择方言。
@@ -90,6 +99,9 @@ func Open(args ...any) (*DB, error) {
 	if cfg.SlowThreshold != 0 {
 		db = db.WithSlowThreshold(cfg.SlowThreshold)
 	}
+	if cfg.SoftDeleteField != "" {
+		db = db.WithSoftDeleteField(cfg.SoftDeleteField)
+	}
 	return db, nil
 }
 
@@ -139,12 +151,13 @@ func NewDB(exec Executor, d Dialect) *DB {
 // 日志配置与前缀一并继承。
 func (db *DB) WithExecutor(e Executor) *DB {
 	return &DB{
-		exec:          e,
-		dialect:       db.dialect,
-		prefix:        db.prefix,
-		logger:        db.logger,
-		logLevel:      db.logLevel,
-		slowThreshold: db.slowThreshold,
+		exec:            e,
+		dialect:         db.dialect,
+		prefix:          db.prefix,
+		logger:          db.logger,
+		logLevel:        db.logLevel,
+		slowThreshold:   db.slowThreshold,
+		softDeleteField: db.softDeleteField,
 	}
 }
 
@@ -152,36 +165,54 @@ func (db *DB) WithExecutor(e Executor) *DB {
 // 例：db := orm.Open(...).WithPrefix("t_")，此后所有 CRUD 自动推导的表名都会带 t_。
 func (db *DB) WithPrefix(prefix string) *DB {
 	return &DB{
-		exec:          db.exec,
-		dialect:       db.dialect,
-		prefix:        prefix,
-		logger:        db.logger,
-		logLevel:      db.logLevel,
-		slowThreshold: db.slowThreshold,
+		exec:            db.exec,
+		dialect:         db.dialect,
+		prefix:          prefix,
+		logger:          db.logger,
+		logLevel:        db.logLevel,
+		slowThreshold:   db.slowThreshold,
+		softDeleteField: db.softDeleteField,
+	}
+}
+
+// WithSoftDeleteField 设置约定软删除字段名（链式调用，不修改原实例）。
+// 实体未用 ,logic tag 声明时，列名或 Go 字段名等于该值的 time/int/bool 字段
+// 自动启用软删除；详见 Config.SoftDeleteField 文档。
+func (db *DB) WithSoftDeleteField(name string) *DB {
+	return &DB{
+		exec:            db.exec,
+		dialect:         db.dialect,
+		prefix:          db.prefix,
+		logger:          db.logger,
+		logLevel:        db.logLevel,
+		slowThreshold:   db.slowThreshold,
+		softDeleteField: name,
 	}
 }
 
 // WithLogger 设置 SQL 日志回调（详见 LogFunc 文档）。
 func (db *DB) WithLogger(f LogFunc) *DB {
 	return &DB{
-		exec:          db.exec,
-		dialect:       db.dialect,
-		prefix:        db.prefix,
-		logger:        f,
-		logLevel:      db.logLevel,
-		slowThreshold: db.slowThreshold,
+		exec:            db.exec,
+		dialect:         db.dialect,
+		prefix:          db.prefix,
+		logger:          f,
+		logLevel:        db.logLevel,
+		slowThreshold:   db.slowThreshold,
+		softDeleteField: db.softDeleteField,
 	}
 }
 
 // WithLogLevel 设置日志等级阈值（Silent / Info / Warn / Error），默认 Silent（不打印）。
 func (db *DB) WithLogLevel(l LogLevel) *DB {
 	return &DB{
-		exec:          db.exec,
-		dialect:       db.dialect,
-		prefix:        db.prefix,
-		logger:        db.logger,
-		logLevel:      l,
-		slowThreshold: db.slowThreshold,
+		exec:            db.exec,
+		dialect:         db.dialect,
+		prefix:          db.prefix,
+		logger:          db.logger,
+		logLevel:        l,
+		slowThreshold:   db.slowThreshold,
+		softDeleteField: db.softDeleteField,
 	}
 }
 
@@ -193,7 +224,8 @@ func (db *DB) WithSlowThreshold(d time.Duration) *DB {
 		prefix:        db.prefix,
 		logger:        db.logger,
 		logLevel:      db.logLevel,
-		slowThreshold: d,
+		slowThreshold:   d,
+		softDeleteField: db.softDeleteField,
 	}
 }
 

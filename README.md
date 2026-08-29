@@ -678,6 +678,7 @@ db := orm.Open("mysql", dsn).WithPrefix("t_")
 
 - **time 类型**（`time.Time` / `*time.Time`）列：未删除判定为 `IS NULL`，删除时写入当前时间。
 - **int 类型**列：未删除判定为 `= 0`，删除时写入 `1`。
+- **bool 类型**列：未删除判定为 `= false`，删除时写入 `true`。
 
 启用后，**所有读操作自动过滤已删除数据**（`SelectById` / `SelectList` / `SelectOne` / `Count` / `Exists` / `Page` / `Update` / `UpdateById` 都会追加 `未删除条件`）；**`Delete` / `DeleteById` 自动改为 `UPDATE ... SET 逻辑列 = ...` 软删除**，不再物理删行。
 
@@ -702,7 +703,38 @@ orm.Delete(ctx, db, orm.NewQuery[User]().Unscoped().Eq(...))  // 物理删（无
 orm.ForceDeleteById[User](ctx, db, 1)                         // 物理删（Repo 同样有 ForceDelete/ForceDeleteById）
 ```
 
-**注意**：逻辑列不参与 `Insert` / `Update` 的实体赋值（交由数据库默认值 `NULL` / `0`），避免零值时间写入破坏 `IS NULL` 判定；请确保该列在表结构上有对应默认值。
+### 约定软删除字段名（免 tag）
+
+如果项目里每张表都用同一个软删除列名（如 `deleted_at` / `deleted` / `is_del`），不想给每个模型都写 `,logic`，可在 `orm.Open` 时配置 `SoftDeleteField`：**只要实体存在列名或 Go 字段名等于该值、且类型为 time/int/bool 的字段，就自动启用软删除**：
+
+```go
+db := orm.Open(orm.Config{
+    Driver: "postgres", DSN: dsn,
+    SoftDeleteField: "deleted_at", // 约定软删除列名
+})
+
+type Order struct {
+    Id        int64      `db:"id,pk,autoincrement"`
+    Title     string     `db:"title"`
+    DeletedAt *time.Time `db:"deleted_at"` // 没有 ,logic，但列名命中约定 → 自动软删
+}
+```
+
+- **优先级**：`db:"...,logic"` 显式声明 > `SoftDeleteField` 约定匹配 > 都没有则**物理删除**。
+- **匹配规则**：列名（`db` tag 第一项）或 Go 字段名等于 `SoftDeleteField` 即命中；类型必须是 `time` / `int` / `bool`，不支持的类型（如 string）不启用（保守处理，避免误软删）。
+- **显式退出**：实体不想要软删除时，加 `,nologic` 即可退出约定匹配，退化为物理删除：
+
+```go
+type Log struct {
+    Id        int64      `db:"id,pk,autoincrement"`
+    Body      string     `db:"body"`
+    DeletedAt *time.Time `db:"deleted_at,nologic"` // 命中约定名但显式退出 → 物理删除
+}
+```
+
+> 也可用链式 `db.WithSoftDeleteField("deleted_at")` 设置；该配置会随 `WithPrefix` / `WithLogger` 等一并继承。
+
+**注意**：逻辑列不参与 `Insert` / `Update` 的实体赋值（交由数据库默认值 `NULL` / `0` / `false`），避免零值写入破坏「未删除」判定；请确保该列在表结构上有对应默认值。
 
 ---
 

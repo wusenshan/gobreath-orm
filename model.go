@@ -18,8 +18,10 @@ type fieldInfo struct {
 	pk      bool
 	autoInc bool
 	ignore  bool
-	json    bool // true 表示字段以 JSON 形式读写（db tag 含 ",json"）
-	logic   bool // true 表示该字段是逻辑删除列（db tag 含 ",logic"）
+	json    bool    // true 表示字段以 JSON 形式读写（db tag 含 ",json"）
+	logic   bool    // true 表示该字段是逻辑删除列（db tag 含 ",logic"）
+	nologic bool    // true 表示显式退出约定软删除匹配（db tag 含 ",nologic"）
+	typ     reflect.Type
 }
 
 // modelMeta 一张表的模型元数据（字段、列、主键）。
@@ -73,7 +75,7 @@ func parseMeta(typ reflect.Type) *modelMeta {
 			m.fields = append(m.fields, fieldInfo{goName: f.Name, ignore: true})
 			continue
 		}
-		fi := fieldInfo{goName: f.Name}
+		fi := fieldInfo{goName: f.Name, typ: f.Type}
 		if tag != "" {
 			parts := strings.Split(tag, ",")
 			fi.colName = parts[0]
@@ -87,6 +89,8 @@ func parseMeta(typ reflect.Type) *modelMeta {
 					fi.json = true
 				case "logic":
 					fi.logic = true
+				case "nologic":
+					fi.nologic = true
 				}
 			}
 		}
@@ -405,6 +409,27 @@ func isTimeType(t reflect.Type) bool {
 		t = t.Elem()
 	}
 	return t == reflect.TypeOf(time.Time{})
+}
+
+// isBoolType 判断字段类型是否为 bool（含指针形式）。
+func isBoolType(t reflect.Type) bool {
+	for t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+	return t.Kind() == reflect.Bool
+}
+
+// isIntType 判断字段类型是否为整数（含指针形式）。
+func isIntType(t reflect.Type) bool {
+	for t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+	switch t.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return true
+	}
+	return false
 }
 
 func quoteCols(cols []string, d Dialect) string {

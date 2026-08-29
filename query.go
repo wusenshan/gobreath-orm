@@ -270,42 +270,95 @@ func (q *Query[T]) Unscoped() *Query[T] {
 	return q
 }
 
-// applyLogic 若模型定义了逻辑删除列且未显式 Unscoped，返回一个追加了「未删除」过滤条件的新查询。
+// applyLogic 若模型存在生效的软删除列且未显式 Unscoped，返回一个追加了「未删除」过滤条件的新查询。
 // 条件作为独立的 AND 组追加，与原条件正确衔接；新查询标记 unscoped 以防重复叠加。
-func (q *Query[T]) applyLogic(meta *modelMeta) *Query[T] {
-	if meta.logicCol == nil || q.unscoped {
+func (q *Query[T]) applyLogic(meta *modelMeta, db *DB) *Query[T] {
+	li := resolveLogic(meta, db)
+	if li == nil || q.unscoped {
 		return q
-	}
-	op := "IS NULL"
-	if !meta.logicIsTime {
-		op = "= 0"
 	}
 	c := *q
 	c.groups = append(append([][]where{}, q.groups...), []where{{
-		col: meta.logicCol.colName, op: op, raw: true,
+		col: li.col, op: li.notDeletedCond(), raw: true,
 	}})
 	c.unscoped = true
 	return &c
 }
 
-// logicSuffix 返回逻辑删除列的「未删除」判定片段（不含 AND 前缀）。
-// time 类型 → "col IS NULL"；int 类型 → "col = 0"；无逻辑列或已 Unscoped 时返回空串。
-func logicSuffix(meta *modelMeta, d Dialect, unscoped bool) string {
-	if meta.logicCol == nil || unscoped {
-		return ""
-	}
-	if meta.logicIsTime {
-		return d.QuoteIdent(meta.logicCol.colName) + " IS NULL"
-	}
-	return d.QuoteIdent(meta.logicCol.colName) + " = 0"
+// logicInfo 解析后实际生效的软删除列信息。
+type logicInfo struct {
+	col    string
+	isTime bool // time.Time/*time.Time：未删除判定 IS NULL，软删写当前时间
+	isBool bool // bool：未删除判定 = false，软删写 true
+	// 其余（int 系列）：未删除判定 = 0，软删写 1
 }
 
-// logicDeletedValue 返回软删除时写入逻辑列的值：time 类型写当前时间，int 类型写 1。
-func logicDeletedValue(meta *modelMeta) any {
-	if meta.logicIsTime {
+// notDeletedCond 返回「未删除」判定的 SQL 片段（不含列名）。
+func (li *logicInfo) notDeletedCond() string {
+	if li.isTime {
+		return "IS NULL"
+	}
+	if li.isBool {
+		return "= false"
+	}
+	return "= 0"
+}
+
+// deletedValue 返回软删除时写入逻辑列的值。
+func (li *logicInfo) deletedValue() any {
+	if li.isTime {
 		return time.Now()
 	}
+	if li.isBool {
+		return true
+	}
 	return 1
+}
+
+// resolveLogic 解析模型实际生效的软删除列，优先级：
+//  1. db:"...,logic" tag 显式声明（单表级别，不依赖全局配置，总是生效）；
+//  2. DB 的约定字段名（Config.SoftDeleteField）：列名或 Go 字段名与其相等、
+//     且类型为 time/int/bool 的字段自动启用；类型不支持则不启用（保守处理，
+//     可用 ,nologic tag 显式退出匹配）；
+//  3. 都不满足 → 返回 nil，即物理删除。
+func resolveLogic(meta *modelMeta, db *DB) *logicInfo {
+	if meta.logicCol != nil {
+		return &logicInfo{col: meta.logicCol.colName, isTime: meta.logicIsTime, isBool: isBoolType(meta.logicCol.typ)}
+	}
+	name := db.softDeleteField
+	if name == "" {
+		return nil
+	}
+	for i := range meta.fields {
+		f := &meta.fields[i]
+		if f.ignore || f.autoInc || f.nologic {
+			continue
+		}
+		if f.colName != name && f.goName != name {
+			continue
+		}
+		switch {
+		case isTimeType(f.typ):
+			return &logicInfo{col: f.colName, isTime: true}
+		case isBoolType(f.typ):
+			return &logicInfo{col: f.colName, isBool: true}
+		case isIntType(f.typ):
+			return &logicInfo{col: f.colName}
+		default:
+			return nil
+		}
+	}
+	return nil
+}
+
+// logicSuffix 返回逻辑删除列的「未删除」判定片段（不含 AND 前缀）。
+// time 类型 → "col IS NULL"；bool → "col = false"；int → "col = 0"；
+// 无生效逻辑列或已 Unscoped 时返回空串。
+func logicSuffix(li *logicInfo, d Dialect, unscoped bool) string {
+	if li == nil || unscoped {
+		return ""
+	}
+	return d.QuoteIdent(li.col) + " " + li.notDeletedCond()
 }
 
 // Build 生成最终 SQL 与参数。向量（若有）恒为第一个占位符。
