@@ -77,8 +77,12 @@ func Open(args ...any) (*DB, error) {
 	if cfg.Prefix != "" {
 		db = db.WithPrefix(cfg.Prefix)
 	}
+	// 用户设置了日志等级却没给 Logger 时，默认输出到 os.Stderr，
+	// 避免 LogLevel: orm.Info 静默失效。
 	if cfg.Logger != nil {
 		db = db.WithLogger(cfg.Logger)
+	} else if cfg.LogLevel != Silent {
+		db = db.WithLogger(DefaultLogger(nil))
 	}
 	if cfg.LogLevel != 0 {
 		db = db.WithLogLevel(cfg.LogLevel)

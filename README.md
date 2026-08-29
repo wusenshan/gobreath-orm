@@ -1,5 +1,11 @@
 # gobreath-orm
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/wusenshan/gobreath-orm.svg)](https://pkg.go.dev/github.com/wusenshan/gobreath-orm)
+[![Go Report Card](https://goreportcard.com/badge/github.com/wusenshan/gobreath-orm)](https://goreportcard.com/report/github.com/wusenshan/gobreath-orm)
+[![CI](https://github.com/wusenshan/gobreath-orm/actions/workflows/ci.yml/badge.svg)](https://github.com/wusenshan/gobreath-orm/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+![Go](https://img.shields.io/badge/go-1.23%2B-00ADD8)
+
 > 用了这个 ORM，查询数据就像呼吸一样简单。
 
 `gobreath-orm` 是一个极简、类型安全、零魔法字符串的 Go ORM。它借鉴 MyBatis-Plus 的 `LambdaQueryWrapper` 风格：
@@ -31,8 +37,17 @@
 go get github.com/wusenshan/gobreath-orm
 ```
 
-
 要求 Go 1.23+。
+
+**30 秒体验**：仓库自带一个零依赖（纯 Go SQLite 驱动）的可运行示例，不需要装任何数据库：
+
+```bash
+git clone https://github.com/wusenshan/gobreath-orm.git
+cd gobreath-orm/examples/quickstart
+go run .
+```
+
+示例覆盖了建表、插入（主键回填 + JSON 列）、闭包条件查询、原生 SQL + DTO 聚合、事务更新，看一遍就能上手。
 
 ---
 
