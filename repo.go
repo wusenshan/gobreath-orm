@@ -1,6 +1,9 @@
 package orm
 
-import "context"
+import (
+	"context"
+	"database/sql"
+)
 
 // Repo 把 *DB 与实体类型 T 绑定，提供免类型参数的 CRUD 方法（类似 DAO / Repository 模式）。
 //
@@ -92,4 +95,20 @@ func (r *Repo[T]) Transaction(ctx context.Context, fn func(tx *Repo[T]) error) e
 	return r.db.Transaction(ctx, func(txDB *DB) error {
 		return fn(&Repo[T]{db: txDB})
 	})
+}
+
+// RawQuery / RawOne / RawExec 透传原生 SQL 能力（绑定到本 Repo 的 T 与 db）。
+// 结果类型不是 T 时（JOIN 出来的 DTO），请改用包级函数：
+//
+//	vos, err := orm.RawQuery[UserDeptVO](ctx, repo.DB(), "SELECT ... JOIN ...")
+func (r *Repo[T]) RawQuery(ctx context.Context, query string, args ...any) ([]T, error) {
+	return RawQuery[T](ctx, r.db, query, args...)
+}
+
+func (r *Repo[T]) RawOne(ctx context.Context, query string, args ...any) (T, error) {
+	return RawOne[T](ctx, r.db, query, args...)
+}
+
+func (r *Repo[T]) RawExec(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	return RawExec(ctx, r.db, query, args...)
 }

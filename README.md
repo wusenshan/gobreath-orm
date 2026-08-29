@@ -20,6 +20,7 @@
 - 📦 **JSON 字段**：`db:"meta,json"` 即可把结构体字段（map / struct）自动与 JSON 列互转；支持按路径查询与 `JSON_CONTAINS / @>` 包含查询，三方言全适配。
 - 🔍 **向量检索**：`Nearest / WithinDistance` 生成 `<embedding> <-> $1` 距离排序（Postgres 语法，需数据库支持向量类型）。
 - 🛡 **三层防注入**：值参数化绑定 + 列名仅取自结构体 tag 白名单 + 表名白名单校验与引号转义。
+- ⚡ **原生 SQL 出口**：`RawQuery / RawOne / RawExec` 执行任意 SQL 并自动扫描结果，支持字段别名与非表 DTO 接收（对标 MP 交给 XML 的复杂查询）。
 - ⚙️ **结构体配置**：`orm.Open(orm.Config{...})` 具名传参一次配齐驱动 / 前缀 / 日志 / 连接池，也兼容 `Open(driver, dsn)` 旧写法。
 
 ---
@@ -504,6 +505,55 @@ orm.NewQuery[User]().Limit(10).Last("FETCH NEXT 10 ROWS ONLY")
 
 ---
 
+## 原生 SQL（Raw SQL）
+
+单表构造器覆盖不到的场景（JOIN、子查询、报表、方言专属语法）交给 `RawQuery / RawOne / RawExec`——对标 MyBatis-Plus 把复杂 SQL 交给 XML 的那部分。参数只走占位符绑定，SQL 日志 / 慢查询与普通 CRUD 走同一管线；传入事务内的 `*DB` 即在事务中执行。
+
+```go
+// 多行：JOIN / 子查询随便写，结果自动扫描进 []T
+users, err := orm.RawQuery[User](ctx, db,
+    "SELECT * FROM users WHERE age > ? AND status = ?", 18, 1)
+
+// 增删改 / DDL
+res, err := orm.RawExec(ctx, db, "UPDATE users SET status = ? WHERE id IN (?, ?)", 1, 7, 9)
+
+// 命名参数：database/sql 原生支持，直接用
+u, err := orm.RawOne[User](ctx, db, "SELECT * FROM users WHERE id = :id", sql.Named("id", 7))
+```
+
+### 字段别名与 DTO（非表结构体）接收结果
+
+`T` 不要求是表结构体——任何普通 struct 都能当"视图对象"用，**不需要 `db` tag、不需要 `TableName()`**：
+
+```go
+type UserDeptVO struct {   // 纯 DTO，只声明关心的列
+    UserName string        // 无 tag → 按字段名 snake_case 匹配列 user_name
+    DeptName string        // ← 匹配列 dept_name
+}
+
+vos, err := orm.RawQuery[UserDeptVO](ctx, db, `
+    SELECT u.name AS user_name, d.name AS dept_name
+    FROM users u JOIN dept d ON d.id = u.dept_id
+    WHERE u.age > ?`, 18)
+```
+
+映射规则：
+
+- **列名精确匹配**：优先 `db` tag，无 tag 时用字段名的 snake_case；SQL 里 `AS` 别名即返回列名，按 snake_case 起名即可命中字段。
+- **未匹配的列直接忽略**：`SELECT u.*` 带出的多余列不会报错，DTO 只放需要的字段。
+- **标量类型直接查**：`RawOne[int64](ctx, db, "SELECT COUNT(*) ...")`、`RawQuery[string](...)` 取单列。
+
+两个约定（写进团队规范即可避免）：
+
+1. **别名一律用 snake_case**：`AS deptName` 在 PostgreSQL 会折叠成 `deptname`，与 `dept_name` 匹配不上；MySQL 虽保留大小写但 `deptName` ≠ `dept_name`。
+2. **JOIN 出现同名列时必须用别名消歧**：`SELECT u.id, d.id` 两列都会落进 `Id` 字段，后者覆盖前者。
+
+`Repo[T]` 提供同名透传（`repo.RawQuery / RawOne / RawExec`，绑定到 T）；结果类型不是 T 时用包级函数 `orm.RawQuery[DTO](ctx, repo.DB(), ...)`。
+
+> 防注入底线不变：SQL 文本由你负责（它是 raw 的意义所在），**参数永远走 `?` / `$1` 绑定**，不要字符串拼接。
+
+---
+
 ## JSON 字段支持
 
 ### 存储映射
@@ -702,7 +752,9 @@ q := orm.NewQuery[Doc]().Nearest(embCol, vec, 10).WithinDistance(embCol, vec, 0.
 
 ## 路线图（Phase 2+）
 
-- `Join`（联表查询）
+- `Join`（联表查询；当前可先用 `RawQuery` + DTO 兜底）
+- `RawQuery` 体验增强：`IN` 占位符批量展开（slice → `(?, ?, ...)`）、`map[string]any` 结果集、流式游标（大结果集分批读取）
+- Upsert（`ON CONFLICT` / `ON DUPLICATE KEY`）
 - 软删除（`deleted_at` 自动过滤）
 - 钩子（`BeforeCreate / AfterUpdate` 等）
 - 乐观锁（`version` 字段）
