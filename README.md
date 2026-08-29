@@ -11,7 +11,7 @@
 
 ## 特性
 
-- 🦭 **零字段名字符串**：用 `orm.Col[T](func(u *T) *F { return &u.Name })` 选字段，列名从结构体 `db` tag 自动推导，编译期就能发现字段用错。
+- 🦭 **零字段名字符串**：用 `orm.Col[T](func(u *T) *F { return &u.Name })` 选字段，列名从结构体 `db` tag 自动推导；配合 `ormgen` 代码生成器可进一步缩成 `UserCols.Age`，编译期就能发现字段用错。
 - 🧩 **泛型 + 链式条件**：`Eq / Ne / Gt / Ge / Lt / Le / Like / In / NotIn / Between / IsNull / IsNotNull`，自动处理 `AND/OR` 拼接与占位符。
 - 🪄 **MyBatis-Plus 式条件块**：`Or()` 与 `If(cond, func(q))` 对标 MP 的 `.or()` 与三参数条件（Go 不支持重载，用条件块统一实现）。
 - 🗂 **自动表名推导**：`User` → `users`（蛇形 + 复数），也可实现 `TableName()` 显式指定；支持 DB 级表前缀（`t_users`）。
@@ -418,6 +418,44 @@ err := db.Transaction(ctx, func(tx *orm.DB) error {
 | `Between(col, lo, hi)` | `col BETWEEN ? AND ?` |
 | `IsNull(col)` | `col IS NULL` |
 | `IsNotNull(col)` | `col IS NOT NULL` |
+
+### 列名代码生成（ormgen）：从手写闭包到 `UserCols.Age`
+
+`orm.Col[T](func(u *T) *F { return &u.Age })` 写法零风险，但链式条件里同一个字段反复出现会很啰嗦。框架提供 `ormgen` 生成器，给每个模型生成一个列名集合结构体，调用点变成真正的字段访问：
+
+```go
+//go:generate go run github.com/wusenshan/gobreath-orm/cmd/ormgen -type User -out user_cols.go -dir .
+
+type User struct { ... }
+```
+
+执行后生成 `user_cols.go`：
+
+```go
+type UserColumnSet struct {
+    Id   orm.ColExpr
+    Name orm.ColExpr
+    Age  orm.ColExpr
+}
+
+var UserCols = UserColumnSet{
+    Id:   orm.ColOf[User]("Id"),
+    Name: orm.ColOf[User]("Name"),
+    Age:  orm.ColOf[User]("Age"),
+}
+```
+
+然后查询条件可以写成：
+
+```go
+q := orm.NewQuery[User]().
+    Ge(UserCols.Age, 10).
+    Le(UserCols.Age, 20)
+```
+
+比手写闭包短很多，而且 `UserCols.Age` 拼错会在编译期报错。`ColOf[T]` 按 Go 字段名匹配，也回退支持 db tag 列名；不存在的字段会在运行时 panic，和 `Col` 一样。
+
+> 推荐：每个模型文件顶上加一行 `//go:generate`，保存或 CI 时跑 `go generate ./...`，列名集合会自动保持同步。
 
 ### OR 与条件块
 
