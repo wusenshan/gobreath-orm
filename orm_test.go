@@ -111,6 +111,14 @@ func newMockDB(t *testing.T) *DB {
 	return NewDB(sqlDB, SQLite)
 }
 
+type testHook struct {
+	events []HookEvent
+}
+
+func (h *testHook) On(event HookEvent) {
+	h.events = append(h.events, event)
+}
+
 func TestOpenConfigStruct(t *testing.T) {
 	db, err := Open(Config{Driver: "ormmock", DSN: ""})
 	if err != nil {
@@ -124,6 +132,35 @@ func TestOpenConfigStruct(t *testing.T) {
 	}
 	if db.dialect != PG {
 		t.Fatalf("Open(Config) 未知驱动应回退到 PG，实际 %v", db.dialect)
+	}
+	if err := db.exec.(*sql.DB).Close(); err != nil {
+		t.Fatalf("关闭 DB 错误: %v", err)
+	}
+}
+
+func TestHooksConfigAndLifecycle(t *testing.T) {
+	hook := &testHook{}
+	db, err := Open(Config{Driver: "ormmock", Hooks: []Hook{hook}})
+	if err != nil {
+		t.Fatalf("Open(Config{Hooks}) 返回错误: %v", err)
+	}
+	if err := Insert(context.Background(), db, &User{Name: "alice", Age: 30}); err != nil {
+		t.Fatalf("Insert 触发 hook 失败: %v", err)
+	}
+	if len(hook.events) < 2 {
+		t.Fatalf("期望至少触发 before/after 两个 hook 事件，实际 %d", len(hook.events))
+	}
+	seenBefore, seenAfter := false, false
+	for _, e := range hook.events {
+		if e.Kind == HookKindExec && e.Phase == HookPhaseBefore {
+			seenBefore = true
+		}
+		if e.Kind == HookKindExec && e.Phase == HookPhaseAfter {
+			seenAfter = true
+		}
+	}
+	if !seenBefore || !seenAfter {
+		t.Fatalf("hook 生命周期不完整: %+v", hook.events)
 	}
 	if err := db.exec.(*sql.DB).Close(); err != nil {
 		t.Fatalf("关闭 DB 错误: %v", err)
@@ -303,18 +340,18 @@ func TestCRUDSQL(t *testing.T) {
 
 func TestComputePageMeta(t *testing.T) {
 	cases := []struct {
-		page, size   int
-		total        int64
-		wantPages    int
-		wantHasNext  bool
-		wantHasPrev  bool
+		page, size  int
+		total       int64
+		wantPages   int
+		wantHasNext bool
+		wantHasPrev bool
 	}{
-		{1, 10, 0, 0, false, false},    // 无数据
-		{1, 10, 5, 1, false, false},    // 不足一页
-		{1, 10, 25, 3, true, false},    // 第一页，有下一页
-		{2, 10, 25, 3, true, true},     // 中间页
-		{3, 10, 25, 3, false, true},    // 最后一页
-		{5, 10, 25, 3, false, true},    // 越界页，归正后仍无下一页
+		{1, 10, 0, 0, false, false}, // 无数据
+		{1, 10, 5, 1, false, false}, // 不足一页
+		{1, 10, 25, 3, true, false}, // 第一页，有下一页
+		{2, 10, 25, 3, true, true},  // 中间页
+		{3, 10, 25, 3, false, true}, // 最后一页
+		{5, 10, 25, 3, false, true}, // 越界页，归正后仍无下一页
 	}
 	for _, c := range cases {
 		pages, hasNext, hasPrev := computePageMeta(c.page, c.size, c.total)
