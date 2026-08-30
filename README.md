@@ -28,6 +28,10 @@
 - 🛡 **三层防注入**：值参数化绑定 + 列名仅取自结构体 tag 白名单 + 表名白名单校验与引号转义。
 - ⚡ **原生 SQL 出口**：`RawQuery / RawOne / RawExec` 执行任意 SQL 并自动扫描结果，支持字段别名与非表 DTO 接收（对标 MP 交给 XML 的复杂查询）。
 - ⚙️ **结构体配置**：`orm.Open(orm.Config{...})` 具名传参一次配齐驱动 / 前缀 / 日志 / 连接池，也兼容 `Open(driver, dsn)` 旧写法。
+- 🔗 **联表查询（JOIN）**：`Join / LeftJoin / RightJoin`（+ `As` 别名变体）+ 主表 `Alias()`，表名白名单校验，ON 条件原文拼接；`Select` 支持 `u.name` 带别名列。
+- 🔁 **Upsert（插入或更新）**：`Upsert / BatchUpsert`，方言分发——Postgres / SQLite 走 `ON CONFLICT ... DO UPDATE`，MySQL 走 `ON DUPLICATE KEY UPDATE`；冲突键默认主键，可覆盖。
+- 🎯 **部分更新（多字段 / map）**：`Query.Set(col, val)` 链式 + `UpdateSets`，或 `UpdatePartial / UpdateByIdSets` 以 `map[string]any` 指定字段；强制带 WHERE，禁止全表更新。
+- 🔐 **乐观锁**：`db:"version,version"`（或 `Config.OptimisticField` 约定）标记版本列；`UpdateById / UpdateByIdSets` 自动 `WHERE version = ?` 并 `SET version = version + 1`，冲突时返回 `ErrOptimisticLock`。
 
 ---
 
@@ -836,6 +840,69 @@ q := orm.NewQuery[Doc]().Nearest(embCol, vec, 10).WithinDistance(embCol, vec, 0.
 
 ---
 
+## 联表 / Upsert / 部分更新 / 乐观锁
+
+### 联表查询（JOIN）
+
+`Join / LeftJoin / RightJoin` 各对应 SQL 的 `INNER/LEFT/RIGHT JOIN`；带 `As` 的变体（如 `LeftJoinAs(table, alias, on)`）可给被联接表起别名。主表用 `Alias()` 起别名后，即可在 ON 与 `Select` 里用 `u.name` 形式引用。
+
+```go
+// 左联部门表，取用户名与部门名（ON 为原文拼接，跨表列无法用 Col[T] 表示）
+list, err := orm.SelectList(ctx, db, orm.NewQuery[User]().
+    Alias("u").
+    LeftJoin("departments", `"u"."dept_id" = "departments"."id"`).
+    Select("u.name", "departments.dept_name").
+    Eq(orm.Col[User](func(u *User) *int { return &u.Age }), 18),
+)
+```
+
+> ⚠️ **ON 条件为原文拼接**，框架只校验表名（白名单 + 引号），不解析 ON 内的列引用。请按当前方言使用正确的引号（PG `"col"`、MySQL `` `col` ``），勿拼接任何用户输入，否则有注入风险。结果集出现同名列时务必用别名消歧（如 `SELECT u.id, d.id AS dept_id`）。
+
+### Upsert（插入或更新）
+
+`Upsert / BatchUpsert` 一套 API 适配三种方言；冲突键**默认主键**，也可经可变参数 `conflictCols ...string` 覆盖（需对应唯一索引）。更新列 = 全部可写列减去冲突键；无可更新列时退化为 `DO NOTHING`（PG/SQLite）或等价无操作（MySQL）。
+
+```go
+// PG: INSERT ... ON CONFLICT ("id") DO UPDATE SET "name" = EXCLUDED."name", ...
+// MySQL: INSERT ... ON DUPLICATE KEY UPDATE `name` = VALUES(`name`), ...
+err := orm.Upsert(ctx, db, &User{Id: 1, Name: "neo", Age: 30})
+```
+
+### 部分更新（多字段 / map）
+
+不想整行更新时，用 `Query.Set(col, val)` 链式 + `UpdateSets`，或以 `map[string]any` 传 `UpdatePartial` / `UpdateByIdSets`。**强制带 WHERE 条件，禁止全表更新**；向量列同样自动序列化绑定。
+
+```go
+// 链式：只改 name / age
+_, _ = orm.UpdateSets(ctx, db, orm.NewQuery[User]().
+    Eq(orm.Col[User](func(u *User) *int64 { return &u.Id }), 1).
+    Set(orm.Col[User](func(u *User) *string { return &u.Name }), "bob").
+    Set(orm.Col[User](func(u *User) *int { return &u.Age }), 30))
+
+// map：按主键改部分字段
+_, _ = orm.UpdateByIdSets[User](ctx, db, int64(1), map[string]any{"name": "bob"})
+```
+
+### 乐观锁
+
+实体加 `db:"version,version"`（或 `orm.Open` 配 `OptimisticField: "version"` 约定）标记版本列。`UpdateById / UpdateByIdSets` 自动追加 `WHERE version = ?` 并在 `SET` 里 `version = version + 1`；若期望版本与数据库当前值不一致（被别的事务改过），受影响行数为 0，返回 `ErrOptimisticLock`，调用方据此重试或提示。
+
+```go
+type Order struct {
+    Id      int64  `db:"id,pk,autoincrement"`
+    Status  string `db:"status"`
+    Version int    `db:"version,version"` // 乐观锁版本列
+}
+
+// 并发修改：只有 version 仍为 5 时才更新成功
+err := orm.UpdateById(ctx, db, &Order{Id: 1, Status: "paid", Version: 5})
+if err == orm.ErrOptimisticLock {
+    // 版本冲突，记录已被他人修改，需重试
+}
+```
+
+---
+
 ## 安全与防注入
 
 `gobreath-orm` 在三层都做了处理：
@@ -860,13 +927,13 @@ q := orm.NewQuery[Doc]().Nearest(embCol, vec, 10).WithinDistance(embCol, vec, 0.
 
 ## 路线图（Phase 2+）
 
-- `Join`（联表查询；当前可先用 `RawQuery` + DTO 兜底）
 - `RawQuery` 体验增强：`IN` 占位符批量展开（slice → `(?, ?, ...)`）、`map[string]any` 结果集、流式游标（大结果集分批读取）
-- Upsert（`ON CONFLICT` / `ON DUPLICATE KEY`）
-- 软删除（`deleted_at` 自动过滤）
 - 钩子（`BeforeCreate / AfterUpdate` 等）
-- 乐观锁（`version` 字段）
 - 投影 `Select` 强类型化与聚合结果映射
+- 关联预加载 / 关联映射（relation preload / association mapping）
+- 查询拦截器 / 插件（query interceptor / plugin）
+- 数据库迁移（migration）
+- 读写分离 / 多数据源（read-write split / multi-datasource）
 
 ---
 

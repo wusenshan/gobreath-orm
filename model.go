@@ -22,6 +22,7 @@ type fieldInfo struct {
 	vector  bool    // true 表示字段为向量列（db tag 含 ",vector"），读写时序列化为文本 [..]
 	logic   bool    // true 表示该字段是逻辑删除列（db tag 含 ",logic"）
 	nologic bool    // true 表示显式退出约定软删除匹配（db tag 含 ",nologic"）
+	version bool    // true 表示该字段是乐观锁版本列（db tag 含 ",version"）
 	typ     reflect.Type
 }
 
@@ -34,6 +35,7 @@ type modelMeta struct {
 	pk            *fieldInfo
 	logicCol      *fieldInfo // 逻辑删除列（db tag 含 ",logic" 时非空）
 	logicIsTime   bool       // true 表示逻辑列是 time.Time/*time.Time，未删除判定为 IS NULL；否则 = 0
+	versionCol    *fieldInfo // 乐观锁版本列（db tag 含 ",version" 时非空）
 }
 
 var metaCache sync.Map
@@ -94,6 +96,8 @@ func parseMeta(typ reflect.Type) *modelMeta {
 					fi.logic = true
 				case "nologic":
 					fi.nologic = true
+				case "version":
+					fi.version = true
 				}
 			}
 		}
@@ -108,6 +112,9 @@ func parseMeta(typ reflect.Type) *modelMeta {
 		if fi.logic {
 			m.logicCol = &m.fields[len(m.fields)-1]
 			m.logicIsTime = isTimeType(f.Type)
+		}
+		if fi.version {
+			m.versionCol = &m.fields[len(m.fields)-1]
 		}
 	}
 	if m.pk == nil {

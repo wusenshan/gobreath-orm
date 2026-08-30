@@ -28,6 +28,13 @@ type Dialect interface {
 	// VectorBind 返回「绑定一个文本向量参数」的占位符包裹形式，用于 INSERT/UPDATE 向量列。
 	// PG/SQLite 直接返回 ph（驱动/列类型自行解析文本）；MySQL 包裹为 STRING_TO_VECTOR(ph)。
 	VectorBind(ph string) string
+	// UpsertSuffix 返回 INSERT ... 之后的「冲突处理」后缀片段（upsert 方言差异核心）。
+	// conflictCols 为冲突键（通常 PK / 唯一索引列），updateCols 为需要更新的列（已排除冲突键）。
+	//   - PG / SQLite： ON CONFLICT (conflict) DO UPDATE SET col = EXCLUDED.col, ...
+	//     若 updateCols 为空 → ON CONFLICT (conflict) DO NOTHING（避免 DO UPDATE SET 空列表语法错误）；
+	//   - MySQL：      ON DUPLICATE KEY UPDATE col = VALUES(col), ...（忽略 conflictCols，依唯一键自动判定）；
+	//     若 updateCols 为空 → ON DUPLICATE KEY UPDATE <conflict[0]> = <conflict[0]>（无操作占位，避免语法错误）。
+	UpsertSuffix(conflictCols, updateCols []string) string
 }
 
 type postgresDialect struct{}
@@ -68,6 +75,16 @@ func (d postgresDialect) VectorDistance(col, ph string, m VectorMetric) string {
 	}
 }
 func (postgresDialect) VectorBind(ph string) string { return ph }
+func (d postgresDialect) UpsertSuffix(conflict, update []string) string {
+	if len(update) == 0 {
+		return fmt.Sprintf("ON CONFLICT (%s) DO NOTHING", quoteCols(conflict, d))
+	}
+	sets := make([]string, len(update))
+	for i, c := range update {
+		sets[i] = d.QuoteIdent(c) + " = EXCLUDED." + d.QuoteIdent(c)
+	}
+	return fmt.Sprintf("ON CONFLICT (%s) DO UPDATE SET %s", quoteCols(conflict, d), strings.Join(sets, ", "))
+}
 
 type mysqlDialect struct{}
 
@@ -98,6 +115,16 @@ func (d mysqlDialect) VectorDistance(col, ph string, m VectorMetric) string {
 	return fmt.Sprintf("VECTOR_DISTANCE(%s, STRING_TO_VECTOR(%s), '%s')", d.QuoteIdent(col), ph, metric)
 }
 func (mysqlDialect) VectorBind(ph string) string { return "STRING_TO_VECTOR(" + ph + ")" }
+func (d mysqlDialect) UpsertSuffix(conflict, update []string) string {
+	if len(update) == 0 {
+		return fmt.Sprintf("ON DUPLICATE KEY UPDATE %s = %s", d.QuoteIdent(conflict[0]), d.QuoteIdent(conflict[0]))
+	}
+	sets := make([]string, len(update))
+	for i, c := range update {
+		sets[i] = d.QuoteIdent(c) + " = VALUES(" + d.QuoteIdent(c) + ")"
+	}
+	return "ON DUPLICATE KEY UPDATE " + strings.Join(sets, ", ")
+}
 
 type sqliteDialect struct{}
 
@@ -126,6 +153,16 @@ func (d sqliteDialect) VectorDistance(col, ph string, m VectorMetric) string {
 	}
 }
 func (sqliteDialect) VectorBind(ph string) string { return ph }
+func (d sqliteDialect) UpsertSuffix(conflict, update []string) string {
+	if len(update) == 0 {
+		return fmt.Sprintf("ON CONFLICT(%s) DO NOTHING", quoteCols(conflict, d))
+	}
+	sets := make([]string, len(update))
+	for i, c := range update {
+		sets[i] = d.QuoteIdent(c) + " = excluded." + d.QuoteIdent(c)
+	}
+	return fmt.Sprintf("ON CONFLICT(%s) DO UPDATE SET %s", quoteCols(conflict, d), strings.Join(sets, ", "))
+}
 
 // 内置方言实例，开箱即用。
 var (

@@ -25,6 +25,7 @@ type DB struct {
 	slowThreshold time.Duration // 慢查询阈值；>0 且超过则按 Warn 输出
 
 	softDeleteField string // 约定软删除字段名；实体未用 ,logic tag 声明时按此字段名匹配（列名或 Go 字段名）
+	optimisticField string // 约定乐观锁字段名；实体未用 ,version tag 声明时按此字段名匹配（列名或 Go 字段名）
 }
 
 // Config 用于配置数据库连接。推荐方式是按结构体传入，避免参数顺序写错。
@@ -49,6 +50,13 @@ type Config struct {
 	// 单表优先级：,logic tag 显式声明 > 本约定；不匹配或类型不支持则物理删除；
 	// 可用 ,nologic tag 显式退出约定匹配。
 	SoftDeleteField string
+
+	// OptimisticField 约定乐观锁字段名（如 "version" 或 "revision"）。
+	// 实体未用 db:"...,version" tag 显式声明时，只要存在列名或 Go 字段名
+	// 等于该值的字段即自动启用乐观锁：UpdateById / UpdateByIdSets 会追加
+	// "WHERE version = ?" 并在 SET 中 "version = version + 1"，
+	// 受影响行数为 0 时返回 ErrOptimisticLock。
+	OptimisticField string
 }
 
 // Open 用标准 database/sql 打开连接，并按驱动名选择方言。
@@ -101,6 +109,9 @@ func Open(args ...any) (*DB, error) {
 	}
 	if cfg.SoftDeleteField != "" {
 		db = db.WithSoftDeleteField(cfg.SoftDeleteField)
+	}
+	if cfg.OptimisticField != "" {
+		db = db.WithOptimisticField(cfg.OptimisticField)
 	}
 	return db, nil
 }
@@ -158,6 +169,7 @@ func (db *DB) WithExecutor(e Executor) *DB {
 		logLevel:        db.logLevel,
 		slowThreshold:   db.slowThreshold,
 		softDeleteField: db.softDeleteField,
+		optimisticField: db.optimisticField,
 	}
 }
 
@@ -172,6 +184,7 @@ func (db *DB) WithPrefix(prefix string) *DB {
 		logLevel:        db.logLevel,
 		slowThreshold:   db.slowThreshold,
 		softDeleteField: db.softDeleteField,
+		optimisticField: db.optimisticField,
 	}
 }
 
@@ -187,6 +200,23 @@ func (db *DB) WithSoftDeleteField(name string) *DB {
 		logLevel:        db.logLevel,
 		slowThreshold:   db.slowThreshold,
 		softDeleteField: name,
+		optimisticField: db.optimisticField,
+	}
+}
+
+// WithOptimisticField 设置约定乐观锁字段名（链式调用，不修改原实例）。
+// 实体未用 ,version tag 声明时，列名或 Go 字段名等于该值的字段
+// 自动启用乐观锁；详见 Config.OptimisticField 文档。
+func (db *DB) WithOptimisticField(name string) *DB {
+	return &DB{
+		exec:            db.exec,
+		dialect:         db.dialect,
+		prefix:          db.prefix,
+		logger:          db.logger,
+		logLevel:        db.logLevel,
+		slowThreshold:   db.slowThreshold,
+		softDeleteField: db.softDeleteField,
+		optimisticField: name,
 	}
 }
 
@@ -200,6 +230,7 @@ func (db *DB) WithLogger(f LogFunc) *DB {
 		logLevel:        db.logLevel,
 		slowThreshold:   db.slowThreshold,
 		softDeleteField: db.softDeleteField,
+		optimisticField: db.optimisticField,
 	}
 }
 
@@ -213,19 +244,21 @@ func (db *DB) WithLogLevel(l LogLevel) *DB {
 		logLevel:        l,
 		slowThreshold:   db.slowThreshold,
 		softDeleteField: db.softDeleteField,
+		optimisticField: db.optimisticField,
 	}
 }
 
 // WithSlowThreshold 设置慢查询阈值；执行耗时超过它（且 >0）时按 Warn 级别输出。
 func (db *DB) WithSlowThreshold(d time.Duration) *DB {
 	return &DB{
-		exec:          db.exec,
-		dialect:       db.dialect,
-		prefix:        db.prefix,
-		logger:        db.logger,
-		logLevel:      db.logLevel,
+		exec:            db.exec,
+		dialect:         db.dialect,
+		prefix:          db.prefix,
+		logger:          db.logger,
+		logLevel:        db.logLevel,
 		slowThreshold:   d,
 		softDeleteField: db.softDeleteField,
+		optimisticField: db.optimisticField,
 	}
 }
 
