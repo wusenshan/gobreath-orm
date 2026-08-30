@@ -195,7 +195,53 @@ func TestSQLAccessorNil(t *testing.T) {
 	}
 }
 
+func TestReadWriteRouterUsesReplicaForReadsAndPrimaryForWrites(t *testing.T) {
+	primary := &spyExecutor{name: "primary"}
+	replica := &spyExecutor{name: "replica"}
+	db := &DB{
+		exec: primary,
+		readWrite: &readWriteRouter{
+			primary:  primary,
+			replicas: []Executor{replica},
+		},
+	}
+
+	if _, err := db.queryContext(context.Background(), "SELECT * FROM users"); err != nil {
+		t.Fatalf("read query 执行错误: %v", err)
+	}
+	if primary.queryCount != 0 || replica.queryCount != 1 {
+		t.Fatalf("SELECT 应命中 replica，primary=%d replica=%d", primary.queryCount, replica.queryCount)
+	}
+
+	if _, err := db.execContext(context.Background(), "INSERT INTO users(name) VALUES (?)", "alice"); err != nil {
+		t.Fatalf("write query 执行错误: %v", err)
+	}
+	if primary.execCount != 1 || replica.execCount != 0 {
+		t.Fatalf("INSERT 应命中 primary，primary=%d replica=%d", primary.execCount, replica.execCount)
+	}
+}
+
 type stubExecutor struct{}
+
+type spyExecutor struct {
+	name       string
+	queryCount int
+	execCount  int
+}
+
+func (e *spyExecutor) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	e.queryCount++
+	return nil, nil
+}
+func (e *spyExecutor) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	e.execCount++
+	return stubResult{}, nil
+}
+
+type stubResult struct{}
+
+func (stubResult) LastInsertId() (int64, error) { return 0, nil }
+func (stubResult) RowsAffected() (int64, error) { return 0, nil }
 
 func (stubExecutor) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
 	return nil, fmt.Errorf("stub")

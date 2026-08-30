@@ -118,6 +118,7 @@ type Config struct {
 // 兼容两种调用方式：
 //   - orm.Open("mysql", dsn)
 //   - orm.Open(orm.Config{Driver: "mysql", DSN: dsn})
+//
 // driver 支持：postgres/pgx → PG；mysql → MySQL；sqlite/sqlite3 → SQLite。
 func Open(args ...any) (*DB, error) {
 	cfg, err := parseOpenConfig(args...)
@@ -491,11 +492,15 @@ func (db *DB) notifyHooks(event HookEvent) {
 
 // execContext 执行写操作并记录日志（包装底层 Executor.ExecContext）。
 func (db *DB) execContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	exec := db.exec
+	if db.readWrite != nil {
+		exec = db.readWrite.choose(query)
+	}
 	if len(db.hooks) > 0 {
 		db.notifyHooks(HookEvent{Kind: HookKindExec, Phase: HookPhaseBefore, Query: query, Args: append([]any(nil), args...)})
 	}
 	start := time.Now()
-	res, err := db.exec.ExecContext(ctx, query, args...)
+	res, err := exec.ExecContext(ctx, query, args...)
 	duration := time.Since(start)
 	db.logSlowOrErr(query, args, duration, err)
 	if len(db.hooks) > 0 {
@@ -506,11 +511,15 @@ func (db *DB) execContext(ctx context.Context, query string, args ...any) (sql.R
 
 // queryContext 执行查询并记录日志（包装底层 Executor.QueryContext）。
 func (db *DB) queryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	exec := db.exec
+	if db.readWrite != nil {
+		exec = db.readWrite.choose(query)
+	}
 	if len(db.hooks) > 0 {
 		db.notifyHooks(HookEvent{Kind: HookKindQuery, Phase: HookPhaseBefore, Query: query, Args: append([]any(nil), args...)})
 	}
 	start := time.Now()
-	rows, err := db.exec.QueryContext(ctx, query, args...)
+	rows, err := exec.QueryContext(ctx, query, args...)
 	duration := time.Since(start)
 	db.logSlowOrErr(query, args, duration, err)
 	if len(db.hooks) > 0 {
