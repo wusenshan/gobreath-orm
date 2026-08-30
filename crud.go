@@ -28,7 +28,11 @@ func Insert[T any](ctx context.Context, db *DB, entity *T) error {
 			return err
 		}
 		args = append(args, v)
-		phs = append(phs, nextPh())
+		ph := nextPh()
+		if fi := fieldInfoForCol(meta, c); fi != nil && fi.vector {
+			ph = db.dialect.VectorBind(ph)
+		}
+		phs = append(phs, ph)
 	}
 	sqlStr := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
 		quoteTable(meta.finalTable(db.prefix), db.dialect), quoteCols(cols, db.dialect), strings.Join(phs, ", "))
@@ -69,12 +73,128 @@ func BatchInsert[T any](ctx context.Context, db *DB, entities []T) error {
 				return err
 			}
 			args = append(args, v)
-			phs = append(phs, nextPh())
+			ph := nextPh()
+			if fi := fieldInfoForCol(meta, c); fi != nil && fi.vector {
+				ph = db.dialect.VectorBind(ph)
+			}
+			phs = append(phs, ph)
 		}
 		valueRows = append(valueRows, "("+strings.Join(phs, ", ")+")")
 	}
 	sqlStr := fmt.Sprintf("INSERT INTO %s (%s) VALUES %s",
 		quoteTable(meta.finalTable(db.prefix), db.dialect), quoteCols(cols, db.dialect), strings.Join(valueRows, ", "))
+	_, err := db.execContext(ctx, sqlStr, args...)
+	return err
+}
+
+// bindVal 返回部分更新 / map 更新时字段应绑定的参数值；向量列序列化为文本 [..]。
+func bindVal(meta *modelMeta, col string, val any) any {
+	if fi := fieldInfoForCol(meta, col); fi != nil && fi.vector {
+		return serializeVector(val)
+	}
+	return val
+}
+
+// ---- Upsert（插入或更新，方言分发）----
+
+// Upsert 插入单条记录；若发生冲突键（默认主键，可经 conflictCols 覆盖）已存在，则更新其余列。
+// 方言差异由 Dialect.UpsertSuffix 处理：
+//   - Postgres / SQLite：INSERT ... ON CONFLICT (key) DO UPDATE SET col = EXCLUDED.col
+//   - MySQL：           INSERT ... ON DUPLICATE KEY UPDATE col = VALUES(col)
+//
+// 冲突键需对应表中的主键或唯一索引，否则数据库会报约束错误。更新列 = 全部可写列减去冲突键；
+// 若无可更新列（仅冲突键一列），退化为 DO NOTHING（PG/SQLite）或等价无操作（MySQL）。
+func Upsert[T any](ctx context.Context, db *DB, entity *T, conflictCols ...string) error {
+	meta := getMeta[T]()
+	cols := writableCols(meta)
+	if len(cols) == 0 {
+		return fmt.Errorf("orm: %s 无可写字段", meta.table)
+	}
+	cc := conflictCols
+	if len(cc) == 0 {
+		if meta.pk == nil {
+			return fmt.Errorf("orm: %s 无主键且未指定冲突键，无法 Upsert", meta.table)
+		}
+		cc = []string{meta.pk.colName}
+	}
+	updateCols := make([]string, 0, len(cols))
+	for _, c := range cols {
+		if !contains(cc, c) {
+			updateCols = append(updateCols, c)
+		}
+	}
+	phIdx := 0
+	nextPh := func() string { phIdx++; return db.dialect.Placeholder(phIdx) }
+	ev := reflect.ValueOf(entity).Elem()
+	phs := make([]string, 0, len(cols))
+	args := make([]any, 0, len(cols))
+	for _, c := range cols {
+		v, err := argFor(meta, ev, c)
+		if err != nil {
+			return err
+		}
+		args = append(args, v)
+		ph := nextPh()
+		if fi := fieldInfoForCol(meta, c); fi != nil && fi.vector {
+			ph = db.dialect.VectorBind(ph)
+		}
+		phs = append(phs, ph)
+	}
+	sqlStr := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s) %s",
+		quoteTable(meta.finalTable(db.prefix), db.dialect), quoteCols(cols, db.dialect),
+		strings.Join(phs, ", "), db.dialect.UpsertSuffix(cc, updateCols))
+	_, err := db.execContext(ctx, sqlStr, args...)
+	return err
+}
+
+// BatchUpsert 批量 upsert 切片实体，复用 Upsert 的冲突键与方言策略（多行 VALUES）。
+func BatchUpsert[T any](ctx context.Context, db *DB, entities []T, conflictCols ...string) error {
+	n := len(entities)
+	if n == 0 {
+		return nil
+	}
+	meta := getMeta[T]()
+	cols := writableCols(meta)
+	if len(cols) == 0 {
+		return fmt.Errorf("orm: %s 无可写字段", meta.table)
+	}
+	cc := conflictCols
+	if len(cc) == 0 {
+		if meta.pk == nil {
+			return fmt.Errorf("orm: %s 无主键且未指定冲突键，无法 BatchUpsert", meta.table)
+		}
+		cc = []string{meta.pk.colName}
+	}
+	updateCols := make([]string, 0, len(cols))
+	for _, c := range cols {
+		if !contains(cc, c) {
+			updateCols = append(updateCols, c)
+		}
+	}
+	phIdx := 0
+	nextPh := func() string { phIdx++; return db.dialect.Placeholder(phIdx) }
+	args := make([]any, 0, n*len(cols))
+	valueRows := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		ev := reflect.ValueOf(&entities[i]).Elem()
+		phs := make([]string, 0, len(cols))
+		for _, c := range cols {
+			v, err := argFor(meta, ev, c)
+			if err != nil {
+				return err
+			}
+			args = append(args, v)
+			ph := nextPh()
+			if fi := fieldInfoForCol(meta, c); fi != nil && fi.vector {
+				ph = db.dialect.VectorBind(ph)
+			}
+			phs = append(phs, ph)
+		}
+		valueRows = append(valueRows, "("+strings.Join(phs, ", ")+")")
+	}
+	sqlStr := fmt.Sprintf("INSERT INTO %s (%s) VALUES %s %s",
+		quoteTable(meta.finalTable(db.prefix), db.dialect), quoteCols(cols, db.dialect),
+		strings.Join(valueRows, ", "), db.dialect.UpsertSuffix(cc, updateCols))
 	_, err := db.execContext(ctx, sqlStr, args...)
 	return err
 }
@@ -90,7 +210,7 @@ func SelectById[T any](ctx context.Context, db *DB, id any) (*T, error) {
 	sqlStr := fmt.Sprintf("SELECT * FROM %s WHERE %s = %s",
 		quoteTable(meta.finalTable(db.prefix), db.dialect),
 		db.dialect.QuoteIdent(meta.pk.colName), db.dialect.Placeholder(1))
-	if s := logicSuffix(meta, db.dialect, false); s != "" {
+	if s := logicSuffix(resolveLogic(meta, db), db.dialect, false); s != "" {
 		sqlStr += " AND " + s
 	}
 	rows, err := db.queryContext(ctx, sqlStr, id)
@@ -113,7 +233,7 @@ func SelectById[T any](ctx context.Context, db *DB, id any) (*T, error) {
 
 // SelectList 按查询构造器返回列表。自动过滤已逻辑删除的行（Unscoped 例外）。
 func SelectList[T any](ctx context.Context, db *DB, q *Query[T]) ([]T, error) {
-	sqlStr, args := q.applyLogic(getMeta[T]()).WithDialect(db.dialect).WithPrefix(db.prefix).Build()
+	sqlStr, args := q.applyLogic(getMeta[T](), db).WithDialect(db.dialect).WithPrefix(db.prefix).Build()
 	rows, err := db.queryContext(ctx, sqlStr, args...)
 	if err != nil {
 		return nil, err
@@ -132,7 +252,7 @@ func SelectList[T any](ctx context.Context, db *DB, q *Query[T]) ([]T, error) {
 
 // SelectOne 返回列表首条；空结果返回 ErrNotFound。自动过滤已逻辑删除的行。
 func SelectOne[T any](ctx context.Context, db *DB, q *Query[T]) (*T, error) {
-	list, err := SelectList(ctx, db, q.applyLogic(getMeta[T]()).Limit(1))
+	list, err := SelectList(ctx, db, q.applyLogic(getMeta[T](), db).Limit(1))
 	if err != nil {
 		return nil, err
 	}
@@ -149,7 +269,7 @@ func Count[T any](ctx context.Context, db *DB, q *Query[T]) (int64, error) {
 	idx := 0
 	add := func(v any) int { idx++; args = append(args, v); return idx }
 	w := whereSQL(q.groups, db.dialect, add)
-	if s := logicSuffix(meta, db.dialect, q.unscoped); s != "" {
+	if s := logicSuffix(resolveLogic(meta, db), db.dialect, q.unscoped); s != "" {
 		if w == "" {
 			w = s
 		} else {
@@ -243,17 +363,29 @@ func UpdateById[T any](ctx context.Context, db *DB, entity *T) error {
 		return fmt.Errorf("orm: %s 无可更新字段", meta.table)
 	}
 	ev := reflect.ValueOf(entity).Elem()
+	vi := resolveVersion(meta, db)
 	phIdx := 0
 	nextPh := func() string { phIdx++; return db.dialect.Placeholder(phIdx) }
-	setParts := make([]string, 0, len(cols))
-	args := make([]any, 0, len(cols)+1)
+	setParts := make([]string, 0, len(cols)+1)
+	args := make([]any, 0, len(cols)+2)
 	for _, c := range cols {
+		if vi != nil && c == vi.colName {
+			continue // 版本列由「自增 + WHERE 旧值」处理，不按实体值赋值
+		}
 		v, err := argFor(meta, ev, c)
 		if err != nil {
 			return err
 		}
 		args = append(args, v)
-		setParts = append(setParts, fmt.Sprintf("%s = %s", db.dialect.QuoteIdent(c), nextPh()))
+		ph := nextPh()
+		if fi := fieldInfoForCol(meta, c); fi != nil && fi.vector {
+			ph = db.dialect.VectorBind(ph)
+		}
+		setParts = append(setParts, fmt.Sprintf("%s = %s", db.dialect.QuoteIdent(c), ph))
+	}
+	if vi != nil {
+		// 乐观锁：SET version = version + 1
+		setParts = append(setParts, fmt.Sprintf("%s = %s + 1", db.dialect.QuoteIdent(vi.colName), db.dialect.QuoteIdent(vi.colName)))
 	}
 	pkVal, err := argFor(meta, ev, meta.pk.colName)
 	if err != nil {
@@ -263,11 +395,28 @@ func UpdateById[T any](ctx context.Context, db *DB, entity *T) error {
 	sqlStr := fmt.Sprintf("UPDATE %s SET %s WHERE %s = %s",
 		quoteTable(meta.finalTable(db.prefix), db.dialect), strings.Join(setParts, ", "),
 		db.dialect.QuoteIdent(meta.pk.colName), nextPh())
-	if s := logicSuffix(meta, db.dialect, false); s != "" {
+	if vi != nil {
+		// 乐观锁：WHERE version = 期望的旧值
+		oldVer, err := argFor(meta, ev, vi.colName)
+		if err != nil {
+			return err
+		}
+		sqlStr += fmt.Sprintf(" AND %s = %s", db.dialect.QuoteIdent(vi.colName), nextPh())
+		args = append(args, oldVer)
+	}
+	if s := logicSuffix(resolveLogic(meta, db), db.dialect, false); s != "" {
 		sqlStr += " AND " + s
 	}
-	_, err = db.execContext(ctx, sqlStr, args...)
-	return err
+	res, err := db.execContext(ctx, sqlStr, args...)
+	if err != nil {
+		return err
+	}
+	if vi != nil {
+		if n, e := res.RowsAffected(); e == nil && n == 0 {
+			return ErrOptimisticLock
+		}
+	}
+	return nil
 }
 
 // Update 按查询条件更新，使用 entity 的非主键字段作为新值。自动跳过已逻辑删除的行。
@@ -288,7 +437,11 @@ func Update[T any](ctx context.Context, db *DB, q *Query[T], entity *T) error {
 			return err
 		}
 		args = append(args, v)
-		setParts = append(setParts, fmt.Sprintf("%s = %s", db.dialect.QuoteIdent(c), nextPh()))
+		ph := nextPh()
+		if fi := fieldInfoForCol(meta, c); fi != nil && fi.vector {
+			ph = db.dialect.VectorBind(ph)
+		}
+		setParts = append(setParts, fmt.Sprintf("%s = %s", db.dialect.QuoteIdent(c), ph))
 	}
 	idx := phIdx
 	add := func(v any) int { idx++; args = append(args, v); return idx }
@@ -298,16 +451,134 @@ func Update[T any](ctx context.Context, db *DB, q *Query[T], entity *T) error {
 	}
 	sqlStr := fmt.Sprintf("UPDATE %s SET %s WHERE %s",
 		quoteTable(meta.finalTable(db.prefix), db.dialect), strings.Join(setParts, ", "), w)
-	if s := logicSuffix(meta, db.dialect, q.unscoped); s != "" {
+	if s := logicSuffix(resolveLogic(meta, db), db.dialect, q.unscoped); s != "" {
 		sqlStr += " AND " + s
 	}
 	_, err := db.execContext(ctx, sqlStr, args...)
 	return err
 }
 
+// ---- 部分更新（多字段 / map）----
+
+// UpdateSets 按查询条件更新 q.sets 中的字段（与 Query.Set 链式配合）。
+// 自动跳过已逻辑删除的行（Unscoped 例外）；必须有 WHERE 条件，禁止全表更新；
+// q.sets 为空则报错。返回受影响行数。
+//
+// 例：
+//
+//	orm.UpdateSets(ctx, db, orm.NewQuery[User]().
+//	  Eq(orm.Col[User](func(u *User) *int64 { return &u.Id }), 1).
+//	  Set("name", "bob").Set("age", 30))
+func UpdateSets[T any](ctx context.Context, db *DB, q *Query[T]) (int64, error) {
+	meta := getMeta[T]()
+	if len(q.sets) == 0 {
+		return 0, fmt.Errorf("orm: UpdateSets 至少需要 Set 一个字段")
+	}
+	d := db.dialect
+	phIdx := 0
+	nextPh := func() string { phIdx++; return d.Placeholder(phIdx) }
+	setParts := make([]string, 0, len(q.sets))
+	args := make([]any, 0, len(q.sets))
+	for col, val := range q.sets {
+		args = append(args, bindVal(meta, col, val))
+		ph := nextPh()
+		if fi := fieldInfoForCol(meta, col); fi != nil && fi.vector {
+			ph = d.VectorBind(ph)
+		}
+		setParts = append(setParts, fmt.Sprintf("%s = %s", d.QuoteIdent(col), ph))
+	}
+	idx := phIdx
+	add := func(v any) int { idx++; args = append(args, v); return idx }
+	w := whereSQL(q.groups, d, add)
+	if w == "" {
+		return 0, fmt.Errorf("orm: UpdateSets 必须有条件，禁止全表更新")
+	}
+	sqlStr := fmt.Sprintf("UPDATE %s SET %s WHERE %s",
+		quoteTable(meta.finalTable(db.prefix), d), strings.Join(setParts, ", "), w)
+	if s := logicSuffix(resolveLogic(meta, db), d, q.unscoped); s != "" {
+		sqlStr += " AND " + s
+	}
+	res, err := db.execContext(ctx, sqlStr, args...)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// UpdatePartial 是 UpdateSets 的 map 入口：直接以 sets map 指定待更新字段，
+// 条件仍来自 q（Eq/In 等链式方法）。返回受影响行数。
+func UpdatePartial[T any](ctx context.Context, db *DB, q *Query[T], sets map[string]any) (int64, error) {
+	q.sets = sets
+	return UpdateSets(ctx, db, q)
+}
+
+// UpdateByIdSets 按主键更新 sets 中的字段（map 形式的部分更新）。
+// 自动跳过已逻辑删除的行（Unscoped 例外）。若 sets 含乐观锁版本列，则
+// 自动追加 "WHERE version = ?" 并 "SET version = version + 1"，受影响行数为 0
+// 时返回 ErrOptimisticLock。返回受影响行数。
+func UpdateByIdSets[T any](ctx context.Context, db *DB, id any, sets map[string]any) (int64, error) {
+	meta := getMeta[T]()
+	if meta.pk == nil {
+		return 0, fmt.Errorf("orm: %s 无主键，无法 UpdateByIdSets", meta.table)
+	}
+	if len(sets) == 0 {
+		return 0, fmt.Errorf("orm: UpdateByIdSets 至少需要一个字段")
+	}
+	d := db.dialect
+	vi := resolveVersion(meta, db)
+	hasVersion := vi != nil
+	if hasVersion {
+		if _, ok := sets[vi.colName]; !ok {
+			hasVersion = false // sets 未带版本值时不强行乐观锁
+		}
+	}
+	phIdx := 0
+	nextPh := func() string { phIdx++; return d.Placeholder(phIdx) }
+	setParts := make([]string, 0, len(sets)+1)
+	args := make([]any, 0, len(sets)+2)
+	for col, val := range sets {
+		if hasVersion && col == vi.colName {
+			continue // 版本列由「自增 + WHERE 旧值」处理
+		}
+		args = append(args, bindVal(meta, col, val))
+		ph := nextPh()
+		if fi := fieldInfoForCol(meta, col); fi != nil && fi.vector {
+			ph = d.VectorBind(ph)
+		}
+		setParts = append(setParts, fmt.Sprintf("%s = %s", d.QuoteIdent(col), ph))
+	}
+	if vi != nil {
+		setParts = append(setParts, fmt.Sprintf("%s = %s + 1", d.QuoteIdent(vi.colName), d.QuoteIdent(vi.colName)))
+	}
+	args = append(args, id)
+	sqlStr := fmt.Sprintf("UPDATE %s SET %s WHERE %s = %s",
+		quoteTable(meta.finalTable(db.prefix), d), strings.Join(setParts, ", "),
+		d.QuoteIdent(meta.pk.colName), nextPh())
+	if hasVersion {
+		oldVer := sets[vi.colName]
+		sqlStr += fmt.Sprintf(" AND %s = %s", d.QuoteIdent(vi.colName), nextPh())
+		args = append(args, oldVer)
+	}
+	if s := logicSuffix(resolveLogic(meta, db), d, false); s != "" {
+		sqlStr += " AND " + s
+	}
+	res, err := db.execContext(ctx, sqlStr, args...)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if hasVersion && n == 0 {
+		return 0, ErrOptimisticLock
+	}
+	return n, nil
+}
+
 // ---- 删除 ----
 
-// DeleteById 按主键「逻辑删除」（若模型定义了逻辑删除列），否则物理删除。
+// DeleteById 按主键「逻辑删除」（若模型存在生效的逻辑删除列），否则物理删除。
 // 软删时只更新逻辑列（不触碰已删除行），如需物理删除请使用 ForceDeleteById。
 func DeleteById[T any](ctx context.Context, db *DB, id any) error {
 	meta := getMeta[T]()
@@ -315,13 +586,13 @@ func DeleteById[T any](ctx context.Context, db *DB, id any) error {
 		return fmt.Errorf("orm: %s 无主键，无法 DeleteById", meta.table)
 	}
 	d := db.dialect
-	if meta.logicCol != nil {
+	if li := resolveLogic(meta, db); li != nil {
 		sqlStr := fmt.Sprintf("UPDATE %s SET %s = %s WHERE %s = %s",
 			quoteTable(meta.finalTable(db.prefix), d),
-			d.QuoteIdent(meta.logicCol.colName), d.Placeholder(1),
+			d.QuoteIdent(li.col), d.Placeholder(1),
 			d.QuoteIdent(meta.pk.colName), d.Placeholder(2))
-		args := []any{logicDeletedValue(meta), id}
-		if s := logicSuffix(meta, d, false); s != "" {
+		args := []any{li.deletedValue(), id}
+		if s := logicSuffix(li, d, false); s != "" {
 			sqlStr += " AND " + s
 		}
 		_, err := db.execContext(ctx, sqlStr, args...)
@@ -334,7 +605,7 @@ func DeleteById[T any](ctx context.Context, db *DB, id any) error {
 	return err
 }
 
-// Delete 按查询条件「逻辑删除」（若模型定义了逻辑删除列且未 Unscoped），否则物理删除；禁止无条件全表删除。
+// Delete 按查询条件「逻辑删除」（若模型存在生效的逻辑删除列且未 Unscoped），否则物理删除；禁止无条件全表删除。
 func Delete[T any](ctx context.Context, db *DB, q *Query[T]) error {
 	meta := getMeta[T]()
 	d := db.dialect
@@ -345,10 +616,10 @@ func Delete[T any](ctx context.Context, db *DB, q *Query[T]) error {
 	if w == "" {
 		return fmt.Errorf("orm: Delete 必须有条件，禁止全表删除")
 	}
-	if meta.logicCol != nil && !q.unscoped {
-		setPart := fmt.Sprintf("%s = %s", d.QuoteIdent(meta.logicCol.colName), d.Placeholder(add(logicDeletedValue(meta))))
+	if li := resolveLogic(meta, db); li != nil && !q.unscoped {
+		setPart := fmt.Sprintf("%s = %s", d.QuoteIdent(li.col), d.Placeholder(add(li.deletedValue())))
 		sqlStr := fmt.Sprintf("UPDATE %s SET %s WHERE %s", quoteTable(meta.finalTable(db.prefix), d), setPart, w)
-		if s := logicSuffix(meta, d, false); s != "" {
+		if s := logicSuffix(li, d, false); s != "" {
 			sqlStr += " AND " + s
 		}
 		_, err := db.execContext(ctx, sqlStr, args...)

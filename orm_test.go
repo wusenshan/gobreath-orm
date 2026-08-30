@@ -4,9 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
+	"time"
 )
 
 // ---- 测试用模型 ----
@@ -165,6 +167,43 @@ func TestHooksConfigAndLifecycle(t *testing.T) {
 	}
 }
 
+func TestOpenConfigPool(t *testing.T) {
+	db, err := Open(Config{
+		Driver:          "ormmock",
+		MaxOpenConns:    5,
+		MaxIdleConns:    2,
+		ConnMaxLifetime: time.Minute,
+		ConnMaxIdleTime: 30 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Open(Config) 返回错误: %v", err)
+	}
+	defer db.SQL().Close()
+
+	if got := db.SQL(); got == nil {
+		t.Fatal("SQL() 应返回底层 *sql.DB")
+	} else if got.Stats().MaxOpenConnections != 5 {
+		t.Fatalf("MaxOpenConns 应为 5，实际 %d", got.Stats().MaxOpenConnections)
+	}
+}
+
+func TestSQLAccessorNil(t *testing.T) {
+	// 底层执行器不是 *sql.DB 时，SQL() 应返回 nil。
+	db := NewDB(stubExecutor{}, SQLite)
+	if db.SQL() != nil {
+		t.Fatal("非 *sql.DB 底层时 SQL() 应返回 nil")
+	}
+}
+
+type stubExecutor struct{}
+
+func (stubExecutor) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	return nil, fmt.Errorf("stub")
+}
+func (stubExecutor) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	return nil, fmt.Errorf("stub")
+}
+
 // ---- 测试用例 ----
 
 func TestQueryBuildBasic(t *testing.T) {
@@ -301,18 +340,18 @@ func TestCRUDSQL(t *testing.T) {
 
 func TestComputePageMeta(t *testing.T) {
 	cases := []struct {
-		page, size   int
-		total        int64
-		wantPages    int
-		wantHasNext  bool
-		wantHasPrev  bool
+		page, size  int
+		total       int64
+		wantPages   int
+		wantHasNext bool
+		wantHasPrev bool
 	}{
-		{1, 10, 0, 0, false, false},    // 无数据
-		{1, 10, 5, 1, false, false},    // 不足一页
-		{1, 10, 25, 3, true, false},    // 第一页，有下一页
-		{2, 10, 25, 3, true, true},     // 中间页
-		{3, 10, 25, 3, false, true},    // 最后一页
-		{5, 10, 25, 3, false, true},    // 越界页，归正后仍无下一页
+		{1, 10, 0, 0, false, false}, // 无数据
+		{1, 10, 5, 1, false, false}, // 不足一页
+		{1, 10, 25, 3, true, false}, // 第一页，有下一页
+		{2, 10, 25, 3, true, true},  // 中间页
+		{3, 10, 25, 3, false, true}, // 最后一页
+		{5, 10, 25, 3, false, true}, // 越界页，归正后仍无下一页
 	}
 	for _, c := range cases {
 		pages, hasNext, hasPrev := computePageMeta(c.page, c.size, c.total)

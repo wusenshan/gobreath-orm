@@ -21,11 +21,13 @@ type DB struct {
 	dialect Dialect
 	prefix  string // 表前缀（如 "t_"）；仅作用于自动推导的表名，显式指定表名不叠加
 
-	logger        LogFunc       // SQL 日志回调；nil 表示不打印
-	logLevel      LogLevel      // 日志等级阈值，默认 Silent
-	slowThreshold time.Duration // 慢查询阈值；>0 且超过则按 Warn 输出
-	hooks         []Hook        // 可选 SQL 生命周期钩子；未显式配置则为 nil
-	readWrite     *readWriteRouter
+	logger          LogFunc       // SQL 日志回调；nil 表示不打印
+	logLevel        LogLevel      // 日志等级阈值，默认 Silent
+	slowThreshold   time.Duration // 慢查询阈值；>0 且超过则按 Warn 输出
+	hooks           []Hook        // 可选 SQL 生命周期钩子；未显式配置则为 nil
+	readWrite       *readWriteRouter
+	softDeleteField string // 约定软删除字段名；实体未用 ,logic tag 声明时按此字段名匹配（列名或 Go 字段名）
+	optimisticField string // 约定乐观锁字段名；实体未用 ,version tag 声明时按此字段名匹配（列名或 Go 字段名）
 }
 
 // DataSource 表示一个独立数据库连接源；只有显式配置后才创建并挂载。
@@ -79,6 +81,8 @@ type Hook interface {
 }
 
 // Config 用于配置数据库连接。推荐方式是按结构体传入，避免参数顺序写错。
+// 连接池参数为零值时不设置，保持 database/sql 默认行为
+// （MaxIdleConns 想显式设为 0 时请通过 db.SQL().SetMaxIdleConns(0) 设置）。
 type Config struct {
 	Driver        string
 	DSN           string
@@ -89,6 +93,25 @@ type Config struct {
 	Hooks         []Hook
 	ReadWrite     *ReadWriteConfig
 	MultiSource   *MultiSourceConfig
+
+	MaxOpenConns    int           // 最大打开连接数（0 = 不限制，默认）
+	MaxIdleConns    int           // 最大空闲连接数（0 = 保持默认值 2）
+	ConnMaxLifetime time.Duration // 连接最长存活时间（0 = 永不回收，默认；连 MySQL 建议小于 wait_timeout）
+	ConnMaxIdleTime time.Duration // 连接最长空闲时间（0 = 永不回收，默认）
+
+	// SoftDeleteField 约定软删除字段名（如 "deleted_at" 或 "deleted"）。
+	// 实体未用 db:"...,logic" tag 显式声明时，只要存在列名或 Go 字段名
+	// 等于该值的字段、且类型为 time/int/bool，即自动启用软删除。
+	// 单表优先级：,logic tag 显式声明 > 本约定；不匹配或类型不支持则物理删除；
+	// 可用 ,nologic tag 显式退出约定匹配。
+	SoftDeleteField string
+
+	// OptimisticField 约定乐观锁字段名（如 "version" 或 "revision"）。
+	// 实体未用 db:"...,version" tag 显式声明时，只要存在列名或 Go 字段名
+	// 等于该值的字段即自动启用乐观锁：UpdateById / UpdateByIdSets 会追加
+	// "WHERE version = ?" 并在 SET 中 "version = version + 1"，
+	// 受影响行数为 0 时返回 ErrOptimisticLock。
+	OptimisticField string
 }
 
 // Open 用标准 database/sql 打开连接，并按驱动名选择方言。
@@ -115,6 +138,20 @@ func Open(args ...any) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
+	if sqlDB, ok := primary.(*sql.DB); ok {
+		if cfg.MaxOpenConns != 0 {
+			sqlDB.SetMaxOpenConns(cfg.MaxOpenConns)
+		}
+		if cfg.MaxIdleConns != 0 {
+			sqlDB.SetMaxIdleConns(cfg.MaxIdleConns)
+		}
+		if cfg.ConnMaxLifetime != 0 {
+			sqlDB.SetConnMaxLifetime(cfg.ConnMaxLifetime)
+		}
+		if cfg.ConnMaxIdleTime != 0 {
+			sqlDB.SetConnMaxIdleTime(cfg.ConnMaxIdleTime)
+		}
+	}
 
 	db := NewDB(primary, dialectForDriver(cfg.Driver))
 	if cfg.ReadWrite != nil || cfg.MultiSource != nil {
@@ -133,6 +170,8 @@ func Open(args ...any) (*DB, error) {
 	}
 	if cfg.Logger != nil {
 		db = db.WithLogger(cfg.Logger)
+	} else if cfg.LogLevel != Silent {
+		db = db.WithLogger(DefaultLogger(nil))
 	}
 	if cfg.LogLevel != 0 {
 		db = db.WithLogLevel(cfg.LogLevel)
@@ -142,6 +181,12 @@ func Open(args ...any) (*DB, error) {
 	}
 	if len(cfg.Hooks) > 0 {
 		db = db.WithHooks(cfg.Hooks...)
+	}
+	if cfg.SoftDeleteField != "" {
+		db = db.WithSoftDeleteField(cfg.SoftDeleteField)
+	}
+	if cfg.OptimisticField != "" {
+		db = db.WithOptimisticField(cfg.OptimisticField)
 	}
 	return db, nil
 }
@@ -254,13 +299,16 @@ func NewDB(exec Executor, d Dialect) *DB {
 // WithHooks 返回带额外 SQL 生命周期钩子的 DB 副本；仅在显式注册后才生效。
 func (db *DB) WithHooks(hooks ...Hook) *DB {
 	cloned := &DB{
-		exec:          db.exec,
-		dialect:       db.dialect,
-		prefix:        db.prefix,
-		logger:        db.logger,
-		logLevel:      db.logLevel,
-		slowThreshold: db.slowThreshold,
-		hooks:         append(append([]Hook{}, db.hooks...), hooks...),
+		exec:            db.exec,
+		dialect:         db.dialect,
+		prefix:          db.prefix,
+		logger:          db.logger,
+		logLevel:        db.logLevel,
+		slowThreshold:   db.slowThreshold,
+		hooks:           append(append([]Hook{}, db.hooks...), hooks...),
+		readWrite:       db.readWrite,
+		softDeleteField: db.softDeleteField,
+		optimisticField: db.optimisticField,
 	}
 	return cloned
 }
@@ -269,14 +317,16 @@ func (db *DB) WithHooks(hooks ...Hook) *DB {
 // 日志配置、前缀与钩子一并继承。
 func (db *DB) WithExecutor(e Executor) *DB {
 	return &DB{
-		exec:          e,
-		dialect:       db.dialect,
-		prefix:        db.prefix,
-		logger:        db.logger,
-		logLevel:      db.logLevel,
-		slowThreshold: db.slowThreshold,
-		hooks:         append([]Hook{}, db.hooks...),
-		readWrite:     nil,
+		exec:            e,
+		dialect:         db.dialect,
+		prefix:          db.prefix,
+		logger:          db.logger,
+		logLevel:        db.logLevel,
+		slowThreshold:   db.slowThreshold,
+		hooks:           append([]Hook{}, db.hooks...),
+		readWrite:       nil,
+		softDeleteField: db.softDeleteField,
+		optimisticField: db.optimisticField,
 	}
 }
 
@@ -284,53 +334,111 @@ func (db *DB) WithExecutor(e Executor) *DB {
 // 例：db := orm.Open(...).WithPrefix("t_")，此后所有 CRUD 自动推导的表名都会带 t_。
 func (db *DB) WithPrefix(prefix string) *DB {
 	return &DB{
-		exec:          db.exec,
-		dialect:       db.dialect,
-		prefix:        prefix,
-		logger:        db.logger,
-		logLevel:      db.logLevel,
-		slowThreshold: db.slowThreshold,
-		hooks:         append([]Hook{}, db.hooks...),
+		exec:            db.exec,
+		dialect:         db.dialect,
+		prefix:          prefix,
+		logger:          db.logger,
+		logLevel:        db.logLevel,
+		slowThreshold:   db.slowThreshold,
+		hooks:           append([]Hook{}, db.hooks...),
+		readWrite:       db.readWrite,
+		softDeleteField: db.softDeleteField,
+		optimisticField: db.optimisticField,
+	}
+}
+
+// WithSoftDeleteField 设置约定软删除字段名（链式调用，不修改原实例）。
+// 实体未用 ,logic tag 声明时，列名或 Go 字段名等于该值的 time/int/bool 字段
+// 自动启用软删除；详见 Config.SoftDeleteField 文档。
+func (db *DB) WithSoftDeleteField(name string) *DB {
+	return &DB{
+		exec:            db.exec,
+		dialect:         db.dialect,
+		prefix:          db.prefix,
+		logger:          db.logger,
+		logLevel:        db.logLevel,
+		slowThreshold:   db.slowThreshold,
+		hooks:           append([]Hook{}, db.hooks...),
+		readWrite:       db.readWrite,
+		softDeleteField: name,
+		optimisticField: db.optimisticField,
+	}
+}
+
+// WithOptimisticField 设置约定乐观锁字段名（链式调用，不修改原实例）。
+// 实体未用 ,version tag 声明时，列名或 Go 字段名等于该值的字段
+// 自动启用乐观锁；详见 Config.OptimisticField 文档。
+func (db *DB) WithOptimisticField(name string) *DB {
+	return &DB{
+		exec:            db.exec,
+		dialect:         db.dialect,
+		prefix:          db.prefix,
+		logger:          db.logger,
+		logLevel:        db.logLevel,
+		slowThreshold:   db.slowThreshold,
+		hooks:           append([]Hook{}, db.hooks...),
+		readWrite:       db.readWrite,
+		softDeleteField: db.softDeleteField,
+		optimisticField: name,
 	}
 }
 
 // WithLogger 设置 SQL 日志回调（详见 LogFunc 文档）。
 func (db *DB) WithLogger(f LogFunc) *DB {
 	return &DB{
-		exec:          db.exec,
-		dialect:       db.dialect,
-		prefix:        db.prefix,
-		logger:        f,
-		logLevel:      db.logLevel,
-		slowThreshold: db.slowThreshold,
-		hooks:         append([]Hook{}, db.hooks...),
+		exec:            db.exec,
+		dialect:         db.dialect,
+		prefix:          db.prefix,
+		logger:          f,
+		logLevel:        db.logLevel,
+		slowThreshold:   db.slowThreshold,
+		hooks:           append([]Hook{}, db.hooks...),
+		readWrite:       db.readWrite,
+		softDeleteField: db.softDeleteField,
+		optimisticField: db.optimisticField,
 	}
 }
 
 // WithLogLevel 设置日志等级阈值（Silent / Info / Warn / Error），默认 Silent（不打印）。
 func (db *DB) WithLogLevel(l LogLevel) *DB {
 	return &DB{
-		exec:          db.exec,
-		dialect:       db.dialect,
-		prefix:        db.prefix,
-		logger:        db.logger,
-		logLevel:      l,
-		slowThreshold: db.slowThreshold,
-		hooks:         append([]Hook{}, db.hooks...),
+		exec:            db.exec,
+		dialect:         db.dialect,
+		prefix:          db.prefix,
+		logger:          db.logger,
+		logLevel:        l,
+		slowThreshold:   db.slowThreshold,
+		hooks:           append([]Hook{}, db.hooks...),
+		readWrite:       db.readWrite,
+		softDeleteField: db.softDeleteField,
+		optimisticField: db.optimisticField,
 	}
 }
 
 // WithSlowThreshold 设置慢查询阈值；执行耗时超过它（且 >0）时按 Warn 级别输出。
 func (db *DB) WithSlowThreshold(d time.Duration) *DB {
 	return &DB{
-		exec:          db.exec,
-		dialect:       db.dialect,
-		prefix:        db.prefix,
-		logger:        db.logger,
-		logLevel:      db.logLevel,
-		slowThreshold: d,
-		hooks:         append([]Hook{}, db.hooks...),
+		exec:            db.exec,
+		dialect:         db.dialect,
+		prefix:          db.prefix,
+		logger:          db.logger,
+		logLevel:        db.logLevel,
+		slowThreshold:   d,
+		hooks:           append([]Hook{}, db.hooks...),
+		readWrite:       db.readWrite,
+		softDeleteField: db.softDeleteField,
+		optimisticField: db.optimisticField,
 	}
+}
+
+// SQL 返回底层的 *sql.DB，用于设置连接池参数（SetMaxOpenConns 等）、
+// 获取统计信息（Stats()）或 Ping 验活等逃逸操作。
+// 底层不是 *sql.DB（如事务副本绑定 *sql.Tx）时返回 nil。
+func (db *DB) SQL() *sql.DB {
+	if sqlDB, ok := db.exec.(*sql.DB); ok {
+		return sqlDB
+	}
+	return nil
 }
 
 // Transaction 在事务中执行 fn；fn 内使用传入的 tx *DB（已绑定 *sql.Tx，且继承日志配置与前缀）。

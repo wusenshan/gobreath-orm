@@ -1,6 +1,9 @@
 package orm
 
-import "context"
+import (
+	"context"
+	"database/sql"
+)
 
 // Repo 把 *DB 与实体类型 T 绑定，提供免类型参数的 CRUD 方法（类似 DAO / Repository 模式）。
 //
@@ -68,6 +71,31 @@ func (r *Repo[T]) Update(ctx context.Context, q *Query[T], entity *T) error {
 	return Update[T](ctx, r.db, q, entity)
 }
 
+// Upsert 插入或按冲突键更新单条记录（方言分发：PG/SQLite ON CONFLICT、MySQL ON DUPLICATE KEY）。
+func (r *Repo[T]) Upsert(ctx context.Context, entity *T, conflictCols ...string) error {
+	return Upsert[T](ctx, r.db, entity, conflictCols...)
+}
+
+// BatchUpsert 批量 upsert 切片实体。
+func (r *Repo[T]) BatchUpsert(ctx context.Context, entities []T, conflictCols ...string) error {
+	return BatchUpsert[T](ctx, r.db, entities, conflictCols...)
+}
+
+// UpdateSets 按查询条件更新 q 中 Set 的字段（链式部分更新）。
+func (r *Repo[T]) UpdateSets(ctx context.Context, q *Query[T]) (int64, error) {
+	return UpdateSets[T](ctx, r.db, q)
+}
+
+// UpdatePartial 按查询条件更新 map 指定的字段。
+func (r *Repo[T]) UpdatePartial(ctx context.Context, q *Query[T], sets map[string]any) (int64, error) {
+	return UpdatePartial[T](ctx, r.db, q, sets)
+}
+
+// UpdateByIdSets 按主键更新 map 指定的字段（支持乐观锁版本列）。
+func (r *Repo[T]) UpdateByIdSets(ctx context.Context, id any, sets map[string]any) (int64, error) {
+	return UpdateByIdSets[T](ctx, r.db, id, sets)
+}
+
 func (r *Repo[T]) DeleteById(ctx context.Context, id any) error {
 	return DeleteById[T](ctx, r.db, id)
 }
@@ -92,4 +120,20 @@ func (r *Repo[T]) Transaction(ctx context.Context, fn func(tx *Repo[T]) error) e
 	return r.db.Transaction(ctx, func(txDB *DB) error {
 		return fn(&Repo[T]{db: txDB})
 	})
+}
+
+// RawQuery / RawOne / RawExec 透传原生 SQL 能力（绑定到本 Repo 的 T 与 db）。
+// 结果类型不是 T 时（JOIN 出来的 DTO），请改用包级函数：
+//
+//	vos, err := orm.RawQuery[UserDeptVO](ctx, repo.DB(), "SELECT ... JOIN ...")
+func (r *Repo[T]) RawQuery(ctx context.Context, query string, args ...any) ([]T, error) {
+	return RawQuery[T](ctx, r.db, query, args...)
+}
+
+func (r *Repo[T]) RawOne(ctx context.Context, query string, args ...any) (T, error) {
+	return RawOne[T](ctx, r.db, query, args...)
+}
+
+func (r *Repo[T]) RawExec(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	return RawExec(ctx, r.db, query, args...)
 }

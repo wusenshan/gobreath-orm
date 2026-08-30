@@ -18,8 +18,12 @@ type fieldInfo struct {
 	pk      bool
 	autoInc bool
 	ignore  bool
-	json    bool // true 表示字段以 JSON 形式读写（db tag 含 ",json"）
-	logic   bool // true 表示该字段是逻辑删除列（db tag 含 ",logic"）
+	json    bool    // true 表示字段以 JSON 形式读写（db tag 含 ",json"）
+	vector  bool    // true 表示字段为向量列（db tag 含 ",vector"），读写时序列化为文本 [..]
+	logic   bool    // true 表示该字段是逻辑删除列（db tag 含 ",logic"）
+	nologic bool    // true 表示显式退出约定软删除匹配（db tag 含 ",nologic"）
+	version bool    // true 表示该字段是乐观锁版本列（db tag 含 ",version"）
+	typ     reflect.Type
 }
 
 // modelMeta 一张表的模型元数据（字段、列、主键）。
@@ -31,6 +35,7 @@ type modelMeta struct {
 	pk            *fieldInfo
 	logicCol      *fieldInfo // 逻辑删除列（db tag 含 ",logic" 时非空）
 	logicIsTime   bool       // true 表示逻辑列是 time.Time/*time.Time，未删除判定为 IS NULL；否则 = 0
+	versionCol    *fieldInfo // 乐观锁版本列（db tag 含 ",version" 时非空）
 }
 
 var metaCache sync.Map
@@ -73,7 +78,7 @@ func parseMeta(typ reflect.Type) *modelMeta {
 			m.fields = append(m.fields, fieldInfo{goName: f.Name, ignore: true})
 			continue
 		}
-		fi := fieldInfo{goName: f.Name}
+		fi := fieldInfo{goName: f.Name, typ: f.Type}
 		if tag != "" {
 			parts := strings.Split(tag, ",")
 			fi.colName = parts[0]
@@ -85,8 +90,14 @@ func parseMeta(typ reflect.Type) *modelMeta {
 					fi.autoInc = true
 				case "json":
 					fi.json = true
+				case "vector":
+					fi.vector = true
 				case "logic":
 					fi.logic = true
+				case "nologic":
+					fi.nologic = true
+				case "version":
+					fi.version = true
 				}
 			}
 		}
@@ -101,6 +112,9 @@ func parseMeta(typ reflect.Type) *modelMeta {
 		if fi.logic {
 			m.logicCol = &m.fields[len(m.fields)-1]
 			m.logicIsTime = isTimeType(f.Type)
+		}
+		if fi.version {
+			m.versionCol = &m.fields[len(m.fields)-1]
 		}
 	}
 	if m.pk == nil {
@@ -372,6 +386,9 @@ func argFor(meta *modelMeta, ev reflect.Value, col string) (any, error) {
 	if fi != nil && fi.json {
 		return json.Marshal(fv.Interface())
 	}
+	if fi != nil && fi.vector {
+		return serializeVector(fv.Interface()), nil
+	}
 	return fv.Interface(), nil
 }
 
@@ -405,6 +422,27 @@ func isTimeType(t reflect.Type) bool {
 		t = t.Elem()
 	}
 	return t == reflect.TypeOf(time.Time{})
+}
+
+// isBoolType 判断字段类型是否为 bool（含指针形式）。
+func isBoolType(t reflect.Type) bool {
+	for t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+	return t.Kind() == reflect.Bool
+}
+
+// isIntType 判断字段类型是否为整数（含指针形式）。
+func isIntType(t reflect.Type) bool {
+	for t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+	switch t.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return true
+	}
+	return false
 }
 
 func quoteCols(cols []string, d Dialect) string {

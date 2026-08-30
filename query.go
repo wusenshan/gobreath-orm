@@ -26,6 +26,16 @@ type order struct {
 	vec bool
 }
 
+// join 一条联表子句。kind 为 INNER/LEFT/RIGHT；table 为被联接表名（白名单校验）；
+// alias 为表别名（可选）；on 为 ON 条件原文——因跨表列无法用 T 的 Col[T] 表示，
+// 故 ON 为可信列引用的原文拼接，调用方需自行使用正确的引号（PG 用 "col"，MySQL 用 `col`）。
+type join struct {
+	kind  string
+	table string
+	alias string
+	on    string
+}
+
 // Query[T] 泛型查询构造器，对标 MyBatis-Plus 的 LambdaQueryWrapper。
 // 字段通过 Col[T](picker) 选择，条件方法链调用，自动处理占位符与 AND/OR 拼接。
 type Query[T any] struct {
@@ -49,6 +59,10 @@ type Query[T any] struct {
 	vector        any
 	vecFilterOn   bool
 	vecFilter     float64
+	vectorMetric  VectorMetric // 向量距离度量，默认 L2
+	alias         string       // 主表别名（FROM "users" u），便于在 ON / 条件里引用
+	joins         []join       // 联表子句（JOIN ... ON ...）
+	sets          map[string]any // 部分更新字段（UpdateSets / UpdatePartial 使用）
 }
 
 // NewQuery 创建针对类型 T 对应表的查询构造器。
@@ -82,6 +96,61 @@ func (q *Query[T]) finalTable() string {
 // WithDialect 设置方言（Postgres/MySQL/SQLite），影响引号与占位符。
 func (q *Query[T]) WithDialect(d Dialect) *Query[T] {
 	q.dialect = d
+	return q
+}
+
+// Alias 给主表设置别名（FROM "users" u），便于在 JOIN 的 ON 或条件里引用。
+// 别名只能由字母/数字/下划线组成，非法值直接 panic（属编程期错误）。
+func (q *Query[T]) Alias(alias string) *Query[T] {
+	if !identRe.MatchString(alias) {
+		panic(fmt.Sprintf("orm: 非法表别名 %q：只能由字母/数字/下划线组成", alias))
+	}
+	q.alias = alias
+	return q
+}
+
+// Join 系列：联表查询（对标 SQL 的 JOIN ... ON ...）。表名经白名单校验并引用；
+// ON 条件为原文拼接（跨表列无法用 T 的 Col[T] 表示），调用方需自行使用正确引号。
+//   - Join / LeftJoin / RightJoin(table, on)：被联接表无别名；
+//   - JoinAs / LeftJoinAs / RightJoinAs(table, alias, on)：被联接表带别名（如 "d"）。
+//
+// 例：
+//
+//	orm.NewQuery[User]().
+//	  LeftJoin("departments", `"users"."dept_id" = "departments"."id"`).
+//	  Select("users.name", "departments.dept_name")
+func (q *Query[T]) Join(table, on string) *Query[T]    { return q.join("INNER", table, "", on) }
+func (q *Query[T]) LeftJoin(table, on string) *Query[T] { return q.join("LEFT", table, "", on) }
+func (q *Query[T]) RightJoin(table, on string) *Query[T] { return q.join("RIGHT", table, "", on) }
+func (q *Query[T]) JoinAs(table, alias, on string) *Query[T] { return q.join("INNER", table, alias, on) }
+func (q *Query[T]) LeftJoinAs(table, alias, on string) *Query[T] { return q.join("LEFT", table, alias, on) }
+func (q *Query[T]) RightJoinAs(table, alias, on string) *Query[T] { return q.join("RIGHT", table, alias, on) }
+
+func (q *Query[T]) join(kind, table, alias, on string) *Query[T] {
+	if !identRe.MatchString(table) {
+		panic(fmt.Sprintf("orm: 非法表名 %q：表名只能由字母/数字/下划线组成，且不能以数字开头", table))
+	}
+	if alias != "" && !identRe.MatchString(alias) {
+		panic(fmt.Sprintf("orm: 非法表别名 %q：只能由字母/数字/下划线组成", alias))
+	}
+	if strings.TrimSpace(on) == "" {
+		panic("orm: Join 的 ON 条件不能为空")
+	}
+	q.joins = append(q.joins, join{kind: kind, table: table, alias: alias, on: on})
+	return q
+}
+
+// Set 为「部分更新」设置单个字段值（与 UpdateSets / UpdatePartial 配合）。
+// 同一字段多次 Set 后者覆盖前者；条件（WHERE）仍由 Eq/In 等链式方法提供。
+//
+// 例：
+//
+//	orm.UpdateSets(ctx, db, orm.NewQuery[User]().Eq(orm.Col[User](func(u *User) *int64 { return &u.Id }), 1).Set("name", "bob"))
+func (q *Query[T]) Set(col ColExpr, val any) *Query[T] {
+	if q.sets == nil {
+		q.sets = make(map[string]any)
+	}
+	q.sets[col.name] = val
 	return q
 }
 
@@ -222,7 +291,8 @@ func (q *Query[T]) Having(col ColExpr, op string, val any) *Query[T] {
 	return q
 }
 
-// Nearest 向量近邻检索：ORDER BY <embedding> <-> $1 LIMIT k（Postgres 语法，其它库需适配）。
+// Nearest 向量近邻检索：按默认度量（L2 欧几里得）生成距离排序并 LIMIT k。
+// 文本语义相似度检索（如 RAG）建议改用 NearestBy(..., Cosine)。
 func (q *Query[T]) Nearest(col ColExpr, vec any, k int) *Query[T] {
 	q.hasVector = true
 	q.vecCol = col.name
@@ -232,7 +302,20 @@ func (q *Query[T]) Nearest(col ColExpr, vec any, k int) *Query[T] {
 	return q
 }
 
-// WithinDistance 增加向量距离阈值过滤：<embedding> <-> $1 < threshold。
+// NearestBy 与 Nearest 相同，但显式指定距离度量（Cosine / L2 / InnerProduct / L1）。
+func (q *Query[T]) NearestBy(col ColExpr, vec any, k int, m VectorMetric) *Query[T] {
+	q.vectorMetric = m
+	return q.Nearest(col, vec, k)
+}
+
+// WithVectorMetric 设置后续向量检索（Nearest / WithinDistance）使用的距离度量，默认 L2。
+func (q *Query[T]) WithVectorMetric(m VectorMetric) *Query[T] {
+	q.vectorMetric = m
+	return q
+}
+
+// WithinDistance 增加向量距离阈值过滤（默认 L2）：仅返回距离小于 threshold 的行。
+// 常与 Nearest 连用，既限制召回范围又按距离排序。
 func (q *Query[T]) WithinDistance(col ColExpr, vec any, threshold float64) *Query[T] {
 	q.hasVector = true
 	q.vecCol = col.name
@@ -240,6 +323,12 @@ func (q *Query[T]) WithinDistance(col ColExpr, vec any, threshold float64) *Quer
 	q.vecFilterOn = true
 	q.vecFilter = threshold
 	return q
+}
+
+// WithinDistanceBy 与 WithinDistance 相同，但显式指定距离度量。
+func (q *Query[T]) WithinDistanceBy(col ColExpr, vec any, threshold float64, m VectorMetric) *Query[T] {
+	q.vectorMetric = m
+	return q.WithinDistance(col, vec, threshold)
 }
 
 func (q *Query[T]) Limit(n int) *Query[T]  { q.limit = n; return q }
@@ -270,42 +359,130 @@ func (q *Query[T]) Unscoped() *Query[T] {
 	return q
 }
 
-// applyLogic 若模型定义了逻辑删除列且未显式 Unscoped，返回一个追加了「未删除」过滤条件的新查询。
+// applyLogic 若模型存在生效的软删除列且未显式 Unscoped，返回一个追加了「未删除」过滤条件的新查询。
 // 条件作为独立的 AND 组追加，与原条件正确衔接；新查询标记 unscoped 以防重复叠加。
-func (q *Query[T]) applyLogic(meta *modelMeta) *Query[T] {
-	if meta.logicCol == nil || q.unscoped {
+func (q *Query[T]) applyLogic(meta *modelMeta, db *DB) *Query[T] {
+	li := resolveLogic(meta, db)
+	if li == nil || q.unscoped {
 		return q
-	}
-	op := "IS NULL"
-	if !meta.logicIsTime {
-		op = "= 0"
 	}
 	c := *q
 	c.groups = append(append([][]where{}, q.groups...), []where{{
-		col: meta.logicCol.colName, op: op, raw: true,
+		col: li.col, op: li.notDeletedCond(), raw: true,
 	}})
 	c.unscoped = true
 	return &c
 }
 
-// logicSuffix 返回逻辑删除列的「未删除」判定片段（不含 AND 前缀）。
-// time 类型 → "col IS NULL"；int 类型 → "col = 0"；无逻辑列或已 Unscoped 时返回空串。
-func logicSuffix(meta *modelMeta, d Dialect, unscoped bool) string {
-	if meta.logicCol == nil || unscoped {
-		return ""
-	}
-	if meta.logicIsTime {
-		return d.QuoteIdent(meta.logicCol.colName) + " IS NULL"
-	}
-	return d.QuoteIdent(meta.logicCol.colName) + " = 0"
+// logicInfo 解析后实际生效的软删除列信息。
+type logicInfo struct {
+	col    string
+	isTime bool // time.Time/*time.Time：未删除判定 IS NULL，软删写当前时间
+	isBool bool // bool：未删除判定 = false，软删写 true
+	// 其余（int 系列）：未删除判定 = 0，软删写 1
 }
 
-// logicDeletedValue 返回软删除时写入逻辑列的值：time 类型写当前时间，int 类型写 1。
-func logicDeletedValue(meta *modelMeta) any {
-	if meta.logicIsTime {
+// notDeletedCond 返回「未删除」判定的 SQL 片段（不含列名）。
+func (li *logicInfo) notDeletedCond() string {
+	if li.isTime {
+		return "IS NULL"
+	}
+	if li.isBool {
+		return "= false"
+	}
+	return "= 0"
+}
+
+// deletedValue 返回软删除时写入逻辑列的值。
+func (li *logicInfo) deletedValue() any {
+	if li.isTime {
 		return time.Now()
 	}
+	if li.isBool {
+		return true
+	}
 	return 1
+}
+
+// resolveLogic 解析模型实际生效的软删除列，优先级：
+//  1. db:"...,logic" tag 显式声明（单表级别，不依赖全局配置，总是生效）；
+//  2. DB 的约定字段名（Config.SoftDeleteField）：列名或 Go 字段名与其相等、
+//     且类型为 time/int/bool 的字段自动启用；类型不支持则不启用（保守处理，
+//     可用 ,nologic tag 显式退出匹配）；
+//  3. 都不满足 → 返回 nil，即物理删除。
+func resolveLogic(meta *modelMeta, db *DB) *logicInfo {
+	if meta.logicCol != nil {
+		return &logicInfo{col: meta.logicCol.colName, isTime: meta.logicIsTime, isBool: isBoolType(meta.logicCol.typ)}
+	}
+	name := db.softDeleteField
+	if name == "" {
+		return nil
+	}
+	for i := range meta.fields {
+		f := &meta.fields[i]
+		if f.ignore || f.autoInc || f.nologic {
+			continue
+		}
+		if f.colName != name && f.goName != name {
+			continue
+		}
+		switch {
+		case isTimeType(f.typ):
+			return &logicInfo{col: f.colName, isTime: true}
+		case isBoolType(f.typ):
+			return &logicInfo{col: f.colName, isBool: true}
+		case isIntType(f.typ):
+			return &logicInfo{col: f.colName}
+		default:
+			return nil
+		}
+	}
+	return nil
+}
+
+// logicSuffix 返回逻辑删除列的「未删除」判定片段（不含 AND 前缀）。
+// time 类型 → "col IS NULL"；bool → "col = false"；int → "col = 0"；
+// 无生效逻辑列或已 Unscoped 时返回空串。
+func logicSuffix(li *logicInfo, d Dialect, unscoped bool) string {
+	if li == nil || unscoped {
+		return ""
+	}
+	return d.QuoteIdent(li.col) + " " + li.notDeletedCond()
+}
+
+// resolveVersion 解析模型实际生效的乐观锁版本列，优先级：
+//  1. db:"...,version" tag 显式声明（单表级别，不依赖全局配置，总是生效）；
+//  2. DB 的约定字段名（Config.OptimisticField）：列名或 Go 字段名与其相等的字段，
+//     类型不限（通常为 int），自动启用乐观锁。
+//  3. 都不满足 → 返回 nil，即不启用乐观锁。
+func resolveVersion(meta *modelMeta, db *DB) *fieldInfo {
+	if meta.versionCol != nil {
+		return meta.versionCol
+	}
+	name := db.optimisticField
+	if name == "" {
+		return nil
+	}
+	for i := range meta.fields {
+		f := &meta.fields[i]
+		if f.ignore {
+			continue
+		}
+		if f.colName == name || f.goName == name {
+			return f
+		}
+	}
+	return nil
+}
+
+// contains 判断字符串切片是否包含目标串。
+func contains(ss []string, s string) bool {
+	for _, x := range ss {
+		if x == s {
+			return true
+		}
+	}
+	return false
 }
 
 // Build 生成最终 SQL 与参数。向量（若有）恒为第一个占位符。
@@ -320,33 +497,44 @@ func (q *Query[T]) Build() (string, []any) {
 	}
 
 	if q.hasVector {
-		add(q.vector)
+		add(serializeVector(q.vector))
 	}
 
 	sel := "*"
 	if len(q.selects) > 0 {
 		quoted := make([]string, len(q.selects))
 		for i, c := range q.selects {
-			quoted[i] = d.QuoteIdent(c)
+			quoted[i] = quoteIdentPath(d, c)
 		}
 		sel = strings.Join(quoted, ", ")
 	}
 	if q.hasVector {
-		dist := fmt.Sprintf("%s <-> %s AS dist", d.QuoteIdent(q.vecCol), d.Placeholder(1))
+		dist := fmt.Sprintf("%s AS dist", d.VectorDistance(q.vecCol, d.Placeholder(1), q.vectorMetric))
 		if sel == "*" {
-			sel = dist
+			sel = "*" + ", " + dist
 		} else {
 			sel = sel + ", " + dist
 		}
 	}
-	sql := fmt.Sprintf("SELECT %s FROM %s", sel, quoteTable(q.finalTable(), d))
+	from := quoteTable(q.finalTable(), d)
+	if q.alias != "" {
+		from += " " + d.QuoteIdent(q.alias)
+	}
+	for _, j := range q.joins {
+		from += fmt.Sprintf(" %s JOIN %s", j.kind, quoteTable(j.table, d))
+		if j.alias != "" {
+			from += " " + d.QuoteIdent(j.alias)
+		}
+		from += " ON " + j.on
+	}
+	sql := fmt.Sprintf("SELECT %s FROM %s", sel, from)
 
 	if w := whereSQL(q.groups, d, add); w != "" {
 		sql += " WHERE " + w
 	}
 
 	if q.hasVector && q.vecFilterOn {
-		clause := fmt.Sprintf("%s <-> %s < %s", d.QuoteIdent(q.vecCol), d.Placeholder(1), d.Placeholder(add(q.vecFilter)))
+		clause := fmt.Sprintf("%s < %s", d.VectorDistance(q.vecCol, d.Placeholder(1), q.vectorMetric), d.Placeholder(add(q.vecFilter)))
 		if len(q.groups) > 0 {
 			sql += " AND " + clause
 		} else {
@@ -374,14 +562,14 @@ func (q *Query[T]) Build() (string, []any) {
 		ords := make([]string, 0, len(q.orders))
 		for _, o := range q.orders {
 			if o.vec {
-				ords = append(ords, fmt.Sprintf("%s <-> %s %s", d.QuoteIdent(q.vecCol), d.Placeholder(1), ascDesc(o.asc)))
-			} else {
-				ords = append(ords, fmt.Sprintf("%s %s", d.QuoteIdent(o.col), ascDesc(o.asc)))
-			}
+			ords = append(ords, fmt.Sprintf("%s %s", d.VectorDistance(q.vecCol, d.Placeholder(1), q.vectorMetric), ascDesc(o.asc)))
+		} else {
+			ords = append(ords, fmt.Sprintf("%s %s", d.QuoteIdent(o.col), ascDesc(o.asc)))
 		}
-		sql += " ORDER BY " + strings.Join(ords, ", ")
+	}
+	sql += " ORDER BY " + strings.Join(ords, ", ")
 	} else if q.hasVector {
-		sql += fmt.Sprintf(" ORDER BY %s <-> %s", d.QuoteIdent(q.vecCol), d.Placeholder(1))
+		sql += fmt.Sprintf(" ORDER BY %s", d.VectorDistance(q.vecCol, d.Placeholder(1), q.vectorMetric))
 	}
 
 	if q.limit > 0 {
@@ -467,4 +655,13 @@ func quoteTable(name string, d Dialect) string {
 		parts[i] = d.QuoteIdent(p)
 	}
 	return strings.Join(parts, ".")
+}
+
+// quoteIdentPath 引用可能带表/别名前缀的列名（如 "u.name" / "d.dept_name"），
+// 逐段加引号后用 "." 连接；无前缀时退化为单段 QuoteIdent。用于 JOIN 场景的 SELECT 列。
+func quoteIdentPath(d Dialect, name string) string {
+	if i := strings.LastIndex(name, "."); i >= 0 {
+		return d.QuoteIdent(name[:i]) + "." + d.QuoteIdent(name[i+1:])
+	}
+	return d.QuoteIdent(name)
 }

@@ -1,6 +1,7 @@
 package orm
 
 import (
+	"fmt"
 	"reflect"
 	"strings"
 )
@@ -20,6 +21,28 @@ type ColExpr struct {
 // 或运行期（tag 拼错）立刻暴露，而不是生成一条错误 SQL。
 func Col[T any, F any](picker func(*T) *F) ColExpr {
 	return ColExpr{name: resolveColumn(picker)}
+}
+
+// ColOf 按结构体字段名直接取列名表达式。用于代码生成场景：生成器把字段名
+// 写成结构体字段，调用点仍然是 `UserCols.Age` 这种类型安全的形式，但底层
+// 不再依赖手写闭包。
+//
+// 匹配规则：优先 Go 字段名（大小写敏感），其次 db tag 中的列名。未匹配会 panic。
+func ColOf[T any](fieldName string) ColExpr {
+	meta := getMeta[T]()
+	for i := range meta.fields {
+		f := meta.fields[i]
+		if f.goName == fieldName {
+			return ColExpr{name: f.colName}
+		}
+	}
+	for i := range meta.fields {
+		f := meta.fields[i]
+		if f.colName == fieldName {
+			return ColExpr{name: f.colName}
+		}
+	}
+	panic(fmt.Sprintf("orm: 类型 %s 中不存在字段 %q", meta.table, fieldName))
 }
 
 // resolveColumn 用反射从 picker 闭包反查其指向的结构体字段，读出 db tag。
