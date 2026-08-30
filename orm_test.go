@@ -109,6 +109,14 @@ func newMockDB(t *testing.T) *DB {
 	return NewDB(sqlDB, SQLite)
 }
 
+type testHook struct {
+	events []HookEvent
+}
+
+func (h *testHook) On(event HookEvent) {
+	h.events = append(h.events, event)
+}
+
 func TestOpenConfigStruct(t *testing.T) {
 	db, err := Open(Config{Driver: "ormmock", DSN: ""})
 	if err != nil {
@@ -122,6 +130,35 @@ func TestOpenConfigStruct(t *testing.T) {
 	}
 	if db.dialect != PG {
 		t.Fatalf("Open(Config) 未知驱动应回退到 PG，实际 %v", db.dialect)
+	}
+	if err := db.exec.(*sql.DB).Close(); err != nil {
+		t.Fatalf("关闭 DB 错误: %v", err)
+	}
+}
+
+func TestHooksConfigAndLifecycle(t *testing.T) {
+	hook := &testHook{}
+	db, err := Open(Config{Driver: "ormmock", Hooks: []Hook{hook}})
+	if err != nil {
+		t.Fatalf("Open(Config{Hooks}) 返回错误: %v", err)
+	}
+	if err := Insert(context.Background(), db, &User{Name: "alice", Age: 30}); err != nil {
+		t.Fatalf("Insert 触发 hook 失败: %v", err)
+	}
+	if len(hook.events) < 2 {
+		t.Fatalf("期望至少触发 before/after 两个 hook 事件，实际 %d", len(hook.events))
+	}
+	seenBefore, seenAfter := false, false
+	for _, e := range hook.events {
+		if e.Kind == HookKindExec && e.Phase == HookPhaseBefore {
+			seenBefore = true
+		}
+		if e.Kind == HookKindExec && e.Phase == HookPhaseAfter {
+			seenAfter = true
+		}
+	}
+	if !seenBefore || !seenAfter {
+		t.Fatalf("hook 生命周期不完整: %+v", hook.events)
 	}
 	if err := db.exec.(*sql.DB).Close(); err != nil {
 		t.Fatalf("关闭 DB 错误: %v", err)
