@@ -2,12 +2,15 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/)。
 
-## Unreleased
+## v0.1.6 (2026-08-30)
 
 - **联表查询（JOIN）**：`Query` 新增 `Join / LeftJoin / RightJoin`（+ `As` 别名变体）与 `Alias()`；表名白名单校验、ON 原文拼接（文档标注注入风险）；`Select` 支持 `u.name` 带别名列（`quoteIdentPath`）。
 - **Upsert（插入或更新）**：新增 `Upsert / BatchUpsert`，方言分发——PG/SQLite 走 `ON CONFLICT (key) DO UPDATE SET col = EXCLUDED.col`（无可更新列退化为 `DO NOTHING`），MySQL 走 `ON DUPLICATE KEY UPDATE col = VALUES(col)`；冲突键默认主键，可经 `conflictCols ...string` 覆盖。
 - **部分更新（多字段 / map）**：新增 `Query.Set(col, val)` 链式 + `UpdateSets`，及 `UpdatePartial` / `UpdateByIdSets`（以 `map[string]any` 指定字段）；强制带 WHERE，禁止全表更新；向量列同样自动序列化绑定。
 - **乐观锁**：新增 `,version` 模型 tag 与 `Config.OptimisticField` 约定；`UpdateById` / `UpdateByIdSets` 自动 `WHERE version = ?` 并 `SET version = version + 1`，受影响行数为 0 时返回 `ErrOptimisticLock`（`errors.go` 新增）。
+- **SQL 生命周期钩子（Hook）**：新增 `Hook` 接口（`On(HookEvent)`）与 `Config.Hooks` / `db.WithHooks(...)`；每次 `exec` / `query` 的 before / after 阶段触发，可用于审计 / 限流 / 链路追踪；未注册零开销。（来自 PR #2）
+- **读写分离 / 多数据源**：新增 `Config.ReadWrite`（及等价的 `MultiSourceConfig` 别名）与 `readWriteRouter`；按 SQL 前缀自动写走主库、读 round-robin 走副本，事务内回落主库。（来自 PR #2）
+- **修复**：读写分离路由此前未在 `execContext` / `queryContext` 接线（`readWriteRouter.choose` 定义后未被调用），导致配置副本永不命中、功能实际失效；现已接入查询 / 写入路径，并为 `choose` 的 round-robin 加 `sync.Mutex` 保证并发安全。
 
 ## v0.1.5 (2026-08-29)
 

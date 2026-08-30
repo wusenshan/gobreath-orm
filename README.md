@@ -32,6 +32,8 @@
 - 🔁 **Upsert（插入或更新）**：`Upsert / BatchUpsert`，方言分发——Postgres / SQLite 走 `ON CONFLICT ... DO UPDATE`，MySQL 走 `ON DUPLICATE KEY UPDATE`；冲突键默认主键，可覆盖。
 - 🎯 **部分更新（多字段 / map）**：`Query.Set(col, val)` 链式 + `UpdateSets`，或 `UpdatePartial / UpdateByIdSets` 以 `map[string]any` 指定字段；强制带 WHERE，禁止全表更新。
 - 🔐 **乐观锁**：`db:"version,version"`（或 `Config.OptimisticField` 约定）标记版本列；`UpdateById / UpdateByIdSets` 自动 `WHERE version = ?` 并 `SET version = version + 1`，冲突时返回 `ErrOptimisticLock`。
+- 🪝 **SQL 生命周期钩子（Hook）**：`Config.Hooks` 或 `db.WithHooks(...)` 注册实现 `Hook` 接口的对象；每次 `exec` / `query` 的 before / after 阶段都会触发 `On(HookEvent)`，可零侵入地做审计、限流、链路追踪。未配置则不触发、零开销。
+- 🌐 **读写分离 / 多数据源**：`Config.ReadWrite`（或等价的 `Config.MultiSource`）声明主库 + 只读副本；框架按 SQL 前缀自动把写操作路由主库、读操作 round-robin 到副本，事务内自动回落主库。`*readWriteRouter` 内部加锁，并发安全。
 
 ---
 
@@ -903,6 +905,54 @@ if err == orm.ErrOptimisticLock {
 
 ---
 
+## SQL 生命周期钩子（Hook）
+
+`Hook` 是一个接口，实现 `On(HookEvent)` 即可在每次 SQL 执行的前/后拿到查询、参数、耗时与错误：
+
+```go
+type Hook interface {
+    On(event HookEvent)
+}
+// HookEvent.Kind  : HookKindExec | HookKindQuery
+// HookEvent.Phase : HookPhaseBefore | HookPhaseAfter
+// HookEvent 字段   : Query / Args / Duration / Err
+```
+
+注册方式二选一：
+
+```go
+// 1) 打开时配置
+db, _ := orm.Open(orm.Config{Driver: "sqlite", DSN: "file.db", Hooks: []orm.Hook{&MyAuditHook{}}})
+
+// 2) 运行中追加（返回新 DB 副本，不修改原实例）
+db = db.WithHooks(&MyAuditHook{})
+```
+
+`Args` 在触发时已被框架拷贝，钩子内读取安全；未注册任何 Hook 时完全不触发、不分配，零运行时开销。
+
+## 读写分离 / 多数据源
+
+声明主库与只读副本，框架自动按 SQL 类型路由：
+
+```go
+db, _ := orm.Open(orm.Config{
+    Driver: "mysql", DSN: "user:pass@tcp(primary:3306)/app",
+    ReadWrite: &orm.ReadWriteConfig{
+        Replicas: []orm.DataSource{
+            {Driver: "mysql", DSN: "user:pass@tcp(replica1:3306)/app"},
+            {Driver: "mysql", DSN: "user:pass@tcp(replica2:3306)/app"},
+        },
+    },
+})
+```
+
+- 写操作（`INSERT/UPDATE/DELETE/...`）走 `Primary`；读操作（`SELECT`）round-robin 走 `Replicas`。
+- 副本为空时所有请求回落主库；`MultiSourceConfig` 与本配置**完全等价**（仅别名），当前统一走同一套路由。
+- 事务内（`db.Transaction`）自动回落主库，避免读副本造成的不一致。
+- 路由选择内部加锁（`sync.Mutex`），并发安全。
+
+---
+
 ## 安全与防注入
 
 `gobreath-orm` 在三层都做了处理：
@@ -928,12 +978,10 @@ if err == orm.ErrOptimisticLock {
 ## 路线图（Phase 2+）
 
 - `RawQuery` 体验增强：`IN` 占位符批量展开（slice → `(?, ?, ...)`）、`map[string]any` 结果集、流式游标（大结果集分批读取）
-- 钩子（`BeforeCreate / AfterUpdate` 等）
+- 钩子（`BeforeCreate / AfterUpdate` 等，实体级回调——当前 `Hook` 是 SQL 生命周期级，二者定位不同，后续可扩展）
 - 投影 `Select` 强类型化与聚合结果映射
 - 关联预加载 / 关联映射（relation preload / association mapping）
-- 查询拦截器 / 插件（query interceptor / plugin）
 - 数据库迁移（migration）
-- 读写分离 / 多数据源（read-write split / multi-datasource）
 
 ---
 
