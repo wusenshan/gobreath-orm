@@ -8,15 +8,17 @@
 
 > 用了这个 ORM，查询数据就像呼吸一样简单。
 
-`gobreath-orm` 是一个极简、类型安全、零魔法字符串的 Go ORM。它借鉴 MyBatis-Plus 的 `LambdaQueryWrapper` 风格：
-**字段选择靠闭包 + 反射，调用点绝不出现手写列名 / 关键字 / 占位符**，从根本上避免拼 SQL 时写错字段、写错 `AND` 位置、出现 SQL 注入等常见问题。
+`gobreath-orm` 是一个 **AI 原生（AI-ready）、类型安全、零魔法字符串** 的 Go ORM——**内置向量检索，让 RAG / 语义搜索开箱即用**，同时保留 MyBatis-Plus 式 `LambdaQueryWrapper` 的零字段名查询体验：调用点绝不出现手写列名 / 关键字 / 占位符，从根本上避免拼 SQL 写错字段、写错 `AND` 位置、出现 SQL 注入等常见问题。
 
-支持 Postgres / MySQL / SQLite 三种方言，开箱即用。
+支持 Postgres（pgvector）/ MySQL 9+（原生 VECTOR）/ SQLite 三种方言；**向量一套 API 跨库通用、零额外依赖**（不引入 pgvector-go）。想直接用上向量能力，看 [向量检索专文档 →](VECTOR.md)。
+
+> 🤖 **为 AI / RAG 而生**：只要你的业务要做「知识库问答 / 语义搜索 / 相似推荐 / 文本去重」，第一步就是把文本变成向量存进数据库再近邻检索。`gobreath-orm` 把这一步做成一行 `NearestBy(...)`，Postgres 与 MySQL 同一套代码——向量逻辑、检索效果与接入 AI 向量模型的布置，见 [VECTOR.md](VECTOR.md)。
 
 ---
 
 ## 特性
 
+- 🌟 **AI 原生 · 向量检索（核心卖点）**：内置 `Nearest / WithinDistance`，**一套 API 同时适配 Postgres(pgvector) 与 MySQL 9+**，支持 Cosine/L2/InnerProduct/L1 四种度量；零依赖、无需 `pgvector-go`，`[]float32` 自动序列化为 `[..]`。让 RAG 检索、语义搜索、相似推荐、文本去重直接落地——完整逻辑、效果演示与接入 AI 向量模型的布置见 [VECTOR.md](VECTOR.md)。
 - 🦭 **零字段名字符串**：用 `orm.Col[T](func(u *T) *F { return &u.Name })` 选字段，列名从结构体 `db` tag 自动推导；配合 `ormgen` 代码生成器可进一步缩成 `UserCols.Age`，编译期就能发现字段用错。
 - 🧩 **泛型 + 链式条件**：`Eq / Ne / Gt / Ge / Lt / Le / Like / In / NotIn / Between / IsNull / IsNotNull`，自动处理 `AND/OR` 拼接与占位符。
 - 🪄 **MyBatis-Plus 式条件块**：`Or()` 与 `If(cond, func(q))` 对标 MP 的 `.or()` 与三参数条件（Go 不支持重载，用条件块统一实现）。
@@ -24,7 +26,6 @@
 - 🧱 **完整 CRUD**：`Insert / BatchInsert / SelectById / SelectList / SelectOne / Count / Exists / Page / UpdateById / Update / DeleteById / Delete`，自增主键自动回填。
 - 🔒 **原生事务**：`db.Transaction(ctx, func(tx *orm.DB) error)`。
 - 📦 **JSON 字段**：`db:"meta,json"` 即可把结构体字段（map / struct）自动与 JSON 列互转；支持按路径查询与 `JSON_CONTAINS / @>` 包含查询，三方言全适配。
-- 🔍 **向量检索（AI/RAG 核心卖点）**：`Nearest / WithinDistance` 一套 API 适配 **Postgres(pgvector) 与 MySQL 9+**，支持 Cosine/L2/InnerProduct/L1 四种度量；零依赖、无需 `pgvector-go`，`[]float32` 自动序列化为 `[..]`。
 - 🛡 **三层防注入**：值参数化绑定 + 列名仅取自结构体 tag 白名单 + 表名白名单校验与引号转义。
 - ⚡ **原生 SQL 出口**：`RawQuery / RawOne / RawExec` 执行任意 SQL 并自动扫描结果，支持字段别名与非表 DTO 接收（对标 MP 交给 XML 的复杂查询）。
 - ⚙️ **结构体配置**：`orm.Open(orm.Config{...})` 具名传参一次配齐驱动 / 前缀 / 日志 / 连接池，也兼容 `Open(driver, dsn)` 旧写法。
@@ -796,6 +797,8 @@ db := orm.Open("mysql", dsn).WithLogger(func(level orm.LogLevel, query string, a
 ---
 
 ## 向量检索（AI / RAG 场景的核心卖点）
+
+> 完整的能力说明、距离度量数学直觉、检索效果演示，以及「如何接入 OpenAI / Ollama 等 AI 向量模型」的端到端布置，单独写在 [VECTOR.md](VECTOR.md)——建议先读它再回来对照下面这段速览。
 
 gobreath-orm 内置向量近邻检索，**一套 API 同时适配 Postgres（pgvector）与 MySQL 9+（原生 VECTOR 类型）**——SQL 由方言自动分发，业务代码不用关心底层差异：
 
