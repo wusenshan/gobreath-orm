@@ -1,7 +1,12 @@
 # 向量检索（AI / RAG 原生支持）
 
 > 一份文档讲清楚三件事：**向量在数据库里是怎么存的（逻辑）**、**它能带来什么效果**、**怎么接入一个 AI 向量模型把它跑起来**。
-> 配套可运行示例见 [`examples/vector-search`](examples/vector-search)（无需装数据库即可看到两套方言生成的 SQL）。
+> 配套可运行示例见 [`examples/vector-search`](examples/vector-search)：
+> - `main.go` 离线看 Postgres / MySQL 两套方言 SQL
+> - `pg/main.go` · `mysql/main.go` 各自完整实例（含两库差异、坑、维度不一致报错原文）
+> - `qwen/main.go` 阿里千问（百炼）向量模型接入，**国内可用**，替代 OpenAI
+> - `en/main.go` 英文注释版
+> 子目录 `README.md` 有一份「Postgres vs MySQL 差异速查」与坑清单。
 
 ---
 
@@ -54,7 +59,11 @@ type Article struct {
 | MySQL 9+ | `embedding VECTOR(1536)` | 9.0+ 原生支持 |
 | SQLite | 无原生向量类型 | 仅能离线拼 SQL，真实检索请用 PG / MySQL |
 
-> ⚠️ **维度必须一致**：模型输出多少维，列就建多少维，入库的向量也必须是同一维度，否则写入 / 检索会报错。
+> ⚠️ **维度必须一致**：模型输出多少维，列就建多少维，入库的向量也必须是同一维度，**否则写入 / 检索会硬报错**（两库都不会静默截断）：
+> - Postgres(pgvector)：`ERROR: expected N dimensions, not M`
+> - MySQL 9+：`ERROR 3535 (HY000): Vector dimension mismatch: expected N, got M`（文案随版本略有差异）
+>
+> 列维度在建表时固定、不可直接 `ALTER` 成别的固定值；换模型导致维度变了要新建列/新表并重灌数据。详见 `examples/vector-search` 的 `pg`/`mysql` 示例与 README。
 
 ---
 
@@ -153,9 +162,14 @@ CREATE VECTOR INDEX idx_articles_embedding ON articles(embedding);
 
 | 模型 | 维度 | 获取方式 |
 |---|---|---|
-| OpenAI `text-embedding-3-small` | 1536 | 云端 API（需 key） |
+| **阿里千问 `text-embedding-v3`** ✅ 国内可用 | **1024（默认）**，也支持 768/512/256/128/64 | 百炼云端 API（需 key），兼容 OpenAI 接口，见 `qwen/main.go` |
+| 阿里千问 `text-embedding-v4`（Qwen3-Embedding） | 2048/1536/**1024(默认)**/768/512/256/128/64 | 同上 |
+| OpenAI `text-embedding-3-small` | 1536 | 云端 API（需 key，国内网络不稳） |
 | OpenAI `text-embedding-3-large` | 3072 | 云端 API |
 | `nomic-embed-text` / `bge-m3` 等 | 各异 | 本地 Ollama，零成本、可离线 |
+
+> 🇨🇳 **国内优先用千问**：访问 `api.openai.com` 在国内网络不稳定且需境外支付；千问 `text-embedding-v3` 默认 1024 维、兼容 OpenAI `/v1/embeddings` 接口，零额外依赖接入（见 `examples/vector-search/qwen/main.go`）。
+> ⚠️ **迁移坑**：从 OpenAI（1536 维）切到千问（默认 1024 维）时，务必把列维度（`vector(N)`/`VECTOR(N)` 的 N）改成 1024，否则立刻触发上面的维度不匹配报错。
 
 ### 5.2 把文本变成 `[]float32`（OpenAI 兼容）
 
@@ -259,7 +273,7 @@ hits, _ := orm.SelectList(ctx, db,
 ## 6. 限制与注意
 
 - **SQLite 无原生向量类型**：框架仅能离线拼出 SQL，真实近邻检索请用 Postgres / MySQL。
-- **维度一致性**：见上文，维度不匹配会写入 / 检索失败。
+- **维度一致性**：见上文，维度不匹配会写入 / 检索**硬报错**（PG `ERROR: expected N dimensions, not M`；MySQL `Vector dimension mismatch: expected N, got M`），不会静默截断。建表维度 = 模型输出维度 = 入库向量维度，三者一致。
 - **度量选择**：用错度量（如对归一化向量用 L2 而非 Cosine）会劣化召回质量；语义检索默认 Cosine。
 - **阈值 `WithinDistance` 的量纲**：Cosine 距离在 `[0,2]`，L2/L1 在 `[0,+∞)`，设阈值前先了解所选度量的取值范围。
 - **索引**：百万级以上务必建 HNSW / VECTOR 索引（见 4.3），否则退化为全表扫描。
