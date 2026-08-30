@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
@@ -7,204 +7,43 @@
     <style>
       :root {
         --bg: #0b1220;
-        --panel: rgba(15, 23, 42, 0.8);
-        --card: #111827;
         --text: #e5eefb;
         --muted: #a8b7cf;
         --primary: #6ee7b7;
         --secondary: #7dd3fc;
-        --accent: #fbbf24;
         --border: rgba(148, 163, 184, 0.2);
       }
-
       * { box-sizing: border-box; }
-      body {
-        margin: 0;
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-        background: radial-gradient(circle at top, #13213d, var(--bg) 40%);
-        color: var(--text);
-        min-height: 100vh;
-      }
-
-      .container {
-        width: min(1100px, calc(100% - 32px));
-        margin: 0 auto;
-      }
-
-      header {
-        padding: 22px 0 10px;
-      }
-
-      .nav {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 18px;
-        padding: 14px 18px;
-        border: 1px solid var(--border);
-        background: rgba(15, 23, 42, 0.7);
-        border-radius: 18px;
-        backdrop-filter: blur(8px);
-      }
-
-      .brand {
-        font-size: 1.2rem;
-        font-weight: 700;
-        letter-spacing: 0.08em;
-      }
-
-      .links {
-        display: flex;
-        gap: 18px;
-        color: var(--muted);
-        font-size: 0.95rem;
-      }
-
-      .links a {
-        color: var(--muted);
-        text-decoration: none;
-      }
-
-      .hero {
-        padding: 64px 0 32px;
-      }
-
-      .hero-grid {
-        display: grid;
-        grid-template-columns: 1.2fr 0.8fr;
-        gap: 32px;
-        align-items: center;
-      }
-
-      h1 {
-        font-size: clamp(2.6rem, 5vw, 4.5rem);
-        line-height: 1.05;
-        margin: 0 0 18px;
-      }
-
-      .gradient {
-        background: linear-gradient(135deg, var(--primary), var(--secondary));
-        -webkit-background-clip: text;
-        background-clip: text;
-        color: transparent;
-      }
-
-      .lead {
-        color: var(--muted);
-        font-size: 1.08rem;
-        max-width: 650px;
-        line-height: 1.8;
-      }
-
-      .actions {
-        display: flex;
-        gap: 16px;
-        flex-wrap: wrap;
-        margin-top: 28px;
-      }
-
-      .button {
-        display: inline-block;
-        padding: 14px 22px;
-        border-radius: 12px;
-        text-decoration: none;
-        font-weight: 700;
-        border: 1px solid var(--border);
-      }
-
-      .button.primary {
-        background: linear-gradient(135deg, var(--primary), var(--secondary));
-        color: #06131d;
-      }
-
-      .button.secondary {
-        color: var(--text);
-        background: rgba(17, 24, 39, 0.7);
-      }
-
-      .panel {
-        background: rgba(17, 24, 39, 0.8);
-        border: 1px solid var(--border);
-        border-radius: 20px;
-        padding: 24px;
-        box-shadow: 0 18px 48px rgba(2, 6, 23, 0.35);
-      }
-
-      .code {
-        background: rgba(15, 23, 42, 0.95);
-        border: 1px solid var(--border);
-        border-radius: 12px;
-        color: var(--primary);
-        padding: 20px 18px;
-        font-family: "SFMono-Regular", Consolas, monospace;
-        font-size: 0.92rem;
-        line-height: 1.7;
-        overflow-x: auto;
-      }
-
-      .stats {
-        display: grid;
-        grid-template-columns: repeat(3, minmax(120px, 1fr));
-        gap: 18px;
-        margin-top: 30px;
-      }
-
-      .stat {
-        background: rgba(17, 24, 39, 0.65);
-        border: 1px solid var(--border);
-        border-radius: 16px;
-        padding: 18px 20px;
-      }
-
-      .stat strong {
-        display: block;
-        font-size: 1.5rem;
-        margin-bottom: 8px;
-      }
-
-      .section {
-        padding: 26px 0 40px;
-      }
-
-      .grid {
-        display: grid;
-        grid-template-columns: repeat(3, minmax(220px, 1fr));
-        gap: 20px;
-      }
-
-      .card {
-        background: rgba(17, 24, 39, 0.7);
-        border: 1px solid var(--border);
-        border-radius: 18px;
-        padding: 22px 20px;
-      }
-
-      .card h3 {
-        margin-top: 0;
-        font-size: 1.1rem;
-      }
-
-      .card p {
-        margin: 0;
-        color: var(--muted);
-        line-height: 1.7;
-      }
-
-      footer {
-        padding: 30px 0 50px;
-        color: var(--muted);
-        text-align: center;
-      }
-
-      @media (max-width: 760px) {
-        .hero-grid, .grid, .stats {
-          grid-template-columns: 1fr;
-        }
-
-        .links {
-          display: none;
-        }
-      }
+      body { margin:0; font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background:radial-gradient(circle at top, #13213d, var(--bg) 40%); color: var(--text); min-height:100vh; }
+      .container { width:min(1120px, calc(100% - 32px)); margin:0 auto; }
+      header { padding:22px 0 10px; }
+      .nav { display:flex; justify-content:space-between; align-items:center; padding:14px 18px; border:1px solid var(--border); border-radius:18px; background: rgba(15,23,42,0.7); backdrop-filter: blur(8px); }
+      .brand { font-size:1.2rem; font-weight:700; letter-spacing:0.08em; }
+      .links { display:flex; gap:18px; }
+      .links a { color: var(--muted); text-decoration:none; font-size:0.95rem; }
+      .hero { padding:64px 0 28px; }
+      .hero-grid { display:grid; grid-template-columns: 1.2fr 0.8fr; gap:32px; align-items:center; }
+      h1 { font-size: clamp(2.6rem, 5vw, 4.6rem); line-height:1.05; margin:0 0 18px; }
+      .gradient { background: linear-gradient(135deg, var(--primary), var(--secondary)); -webkit-background-clip:text; background-clip:text; color: transparent; }
+      .lead { color: var(--muted); font-size:1.08rem; line-height:1.8; max-width:650px; }
+      .actions { display:flex; gap:16px; flex-wrap:wrap; margin-top:28px; }
+      .button { display:inline-block; padding:14px 22px; border-radius:12px; text-decoration:none; font-weight:700; border:1px solid var(--border); }
+      .button.primary { background: linear-gradient(135deg, var(--primary), var(--secondary)); color:#06131d; }
+      .button.secondary { color:var(--text); background: rgba(17,24,39,0.7); }
+      .panel { background: rgba(17,24,39,0.8); border:1px solid var(--border); border-radius:20px; padding:24px; box-shadow:0 18px 48px rgba(2,6,23,0.35); }
+      .code { background: rgba(15,23,42,0.95); border:1px solid var(--border); border-radius:12px; color:var(--primary); padding:20px 18px; font-family:"SFMono-Regular", Consolas, monospace; font-size:0.92rem; line-height:1.7; overflow-x:auto; }
+      .stats { display:grid; grid-template-columns: repeat(3, minmax(120px,1fr)); gap:18px; margin-top:30px; }
+      .stat { background: rgba(17,24,39,0.65); border:1px solid var(--border); border-radius:16px; padding:18px 20px; }
+      .stat strong { display:block; font-size:1.5rem; margin-bottom:8px; }
+      .section { padding:26px 0 40px; }
+      .grid { display:grid; grid-template-columns: repeat(3, minmax(220px, 1fr)); gap:20px; }
+      .card { background: rgba(17,24,39,0.7); border:1px solid var(--border); border-radius:18px; padding:22px 20px; }
+      .card h3 { margin-top:0; }
+      .card p { margin:0; color:var(--muted); line-height:1.7; }
+      .ecosystem { margin-top:18px; display:flex; flex-wrap:wrap; gap:12px; }
+      .pill { padding:8px 12px; border:1px solid var(--border); border-radius:999px; color: var(--muted); background: rgba(15,23,42,0.75); }
+      footer { padding:30px 0 50px; color: var(--muted); text-align:center; }
+      @media (max-width:760px) { .hero-grid, .grid, .stats { grid-template-columns:1fr; } .links { display:none; } }
     </style>
   </head>
   <body>
@@ -214,70 +53,50 @@
           <div class="brand">gobreath</div>
           <div class="links">
             <a href="#features">Features</a>
-            <a href="#docs">Docs</a>
-            <a href="#github">GitHub</a>
+            <a href="docs/">Docs</a>
+            <a href="es/">gobreath-es</a>
+            <a href="https://github.com/wusenshan/gobreath-orm" target="_blank" rel="noreferrer">GitHub</a>
           </div>
         </div>
       </header>
-
       <main>
         <section class="hero">
-          <div class="hero-grid">
-            <div>
-              <h1><span class="gradient">gobreath-orm</span></h1>
-              <p class="lead">
-                一个面向 Go 工程的极简 ORM。用结构体配置连接，显式开启高级能力，保持默认行为简单、可控、易维护。
-              </p>
-              <div class="actions">
-                <a class="button primary" href="https://github.com/wusenshan/gobreath-orm" target="_blank" rel="noreferrer">GitHub</a>
-                <a class="button secondary" href="#features">查看特性</a>
-              </div>
-              <div class="stats">
-                <div class="stat">
-                  <strong>Config</strong>
-                  结构体配置入口
-                </div>
-                <div class="stat">
-                  <strong>Opt-in</strong>
-                  高级能力显式开启
-                </div>
-                <div class="stat">
-                  <strong>Go</strong>
-                  现代 Go 生态
-                </div>
-              </div>
+          <div>
+            <h1><span class="gradient">gobreath-orm</span></h1>
+            <p class="lead">一个面向 Go 工程的极简 ORM。采用结构体配置连接，显式开启高级能力，默认保持简单、可控、易维护。</p>
+            <div class="actions">
+              <a class="button primary" href="https://github.com/wusenshan/gobreath-orm" target="_blank" rel="noreferrer">GitHub</a>
+              <a class="button secondary" href="docs/">Docs</a>
             </div>
-
-            <div class="panel">
-              <div class="code">db, err := orm.Open(orm.Config{
+            <div class="stats">
+              <div class="stat"><strong>Config</strong>结构体配置入口</div>
+              <div class="stat"><strong>Opt-in</strong>高级能力显式开启</div>
+              <div class="stat"><strong>Go</strong>现代 Go 生态</div>
+            </div>
+            <div class="ecosystem">
+              <span class="pill">MySQL</span>
+              <span class="pill">PostgreSQL</span>
+              <span class="pill">SQLite</span>
+              <span class="pill">Hooks</span>
+              <span class="pill">Read/Write Split</span>
+            </div>
+          </div>
+          <div class="panel">
+            <div class="code">db, err := orm.Open(orm.Config{
     Driver: "mysql",
     DSN:    "user:pass@tcp(localhost:3306)/demo",
 })</div>
-            </div>
           </div>
         </section>
-
         <section id="features" class="section">
           <div class="grid">
-            <div class="card">
-              <h3>清晰连接配置</h3>
-              <p>推荐结构体参数写法，避免 Driver / DSN 位置写错，适用于 MySQL / PostgreSQL / SQLite。</p>
-            </div>
-            <div class="card">
-              <h3>显式功能门控</h3>
-              <p>Hooks、读写分离、多数据源等能力只有在配置开启时才生效，默认行为保持简单透明。</p>
-            </div>
-            <div class="card">
-              <h3>工程友好</h3>
-              <p>适合从小型项目走向中大型服务，默认不引入隐式魔法行为，便于维护和审计。</p>
-            </div>
+            <div class="card"><h3>清晰连接配置</h3><p>推荐结构体参数写法，避免 Driver / DSN 顺序写错，适用于 MySQL / PostgreSQL / SQLite。</p></div>
+            <div class="card"><h3>显式功能门控</h3><p>Hooks、读写分离、多数据源等能力只有在配置开启时才生效，默认行为保持简单透明。</p></div>
+            <div class="card"><h3>工程友好</h3><p>适合从小型项目走向中大型服务，默认不引入隐式魔法行为，便于维护和审计。</p></div>
           </div>
         </section>
       </main>
-
-      <footer>
-        © 2026 gobreath • Temporary GitHub Pages preview
-      </footer>
+      <footer>© 2026 gobreath • GitHub Pages preview</footer>
     </div>
   </body>
 </html>
