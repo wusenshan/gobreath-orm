@@ -24,7 +24,7 @@
 - 🧱 **完整 CRUD**：`Insert / BatchInsert / SelectById / SelectList / SelectOne / Count / Exists / Page / UpdateById / Update / DeleteById / Delete`，自增主键自动回填。
 - 🔒 **原生事务**：`db.Transaction(ctx, func(tx *orm.DB) error)`。
 - 📦 **JSON 字段**：`db:"meta,json"` 即可把结构体字段（map / struct）自动与 JSON 列互转；支持按路径查询与 `JSON_CONTAINS / @>` 包含查询，三方言全适配。
-- 🔍 **向量检索**：`Nearest / WithinDistance` 生成 `<embedding> <-> $1` 距离排序（Postgres 语法，需数据库支持向量类型）。
+- 🔍 **向量检索（AI/RAG 核心卖点）**：`Nearest / WithinDistance` 一套 API 适配 **Postgres(pgvector) 与 MySQL 9+**，支持 Cosine/L2/InnerProduct/L1 四种度量；零依赖、无需 `pgvector-go`，`[]float32` 自动序列化为 `[..]`。
 - 🛡 **三层防注入**：值参数化绑定 + 列名仅取自结构体 tag 白名单 + 表名白名单校验与引号转义。
 - ⚡ **原生 SQL 出口**：`RawQuery / RawOne / RawExec` 执行任意 SQL 并自动扫描结果，支持字段别名与非表 DTO 接收（对标 MP 交给 XML 的复杂查询）。
 - ⚙️ **结构体配置**：`orm.Open(orm.Config{...})` 具名传参一次配齐驱动 / 前缀 / 日志 / 连接池，也兼容 `Open(driver, dsn)` 旧写法。
@@ -789,27 +789,50 @@ db := orm.Open("mysql", dsn).WithLogger(func(level orm.LogLevel, query string, a
 
 ---
 
-## 向量检索（进阶）
+## 向量检索（AI / RAG 场景的核心卖点）
 
-需数据库支持向量类型（如 Postgres + pgvector）。`Nearest` / `WithinDistance` 会生成 `<embedding> <-> $1` 距离排序与阈值过滤，用 `SelectList` 执行即可：
+gobreath-orm 内置向量近邻检索，**一套 API 同时适配 Postgres（pgvector）与 MySQL 9+（原生 VECTOR 类型）**——SQL 由方言自动分发，业务代码不用关心底层差异：
+
+| 数据库 | 启用方式 | 框架生成的检索语法 |
+|---|---|---|
+| **Postgres + pgvector** | `CREATE EXTENSION vector;` + `vector(N)` 列 | `"embedding" <=> $1`（运算符 `<=>`/`<->`/`<#>`/`<+>`） |
+| **MySQL 9+** | `VECTOR(N)` 列 | `VECTOR_DISTANCE(\`embedding\`, STRING_TO_VECTOR(?), 'COSINE')` |
+
+向量字段用 `[]float32` / `[]float64` 即可，框架自动序列化为 `[..]` 文本参数化绑定——**无需引入 `pgvector-go` 之类的第三方包**，零额外依赖。
 
 ```go
 type Doc struct {
-    ID        int64     `db:"id,pk,autoincrement"`
+    Id        int64     `db:"id,pk,autoincrement"`
     Title     string    `db:"title"`
-    Embedding []float32 `db:"embedding"`
+    Embedding []float32 `db:"embedding,vector"` // ,vector 标记向量列（Insert/Update 自动序列化）
 }
 
 embCol := orm.Col[Doc](func(d *Doc) *[]float32 { return &d.Embedding })
 
-// 取与 vec 最相似的 5 条
+// 余弦近邻（文本语义相似度首选，RAG 检索默认就用它）
 list, err := orm.SelectList(ctx, db,
-    orm.NewQuery[Doc]().Nearest(embCol, vec, 5),
+    orm.NewQuery[Doc]().NearestBy(embCol, vec, 5, orm.Cosine),
 )
 
-// 再叠加距离阈值：距离 < 0.3 才返回
+// 欧几里得（默认度量，等价于旧版 Nearest）+ 距离阈值：距离 < 0.3 才返回
 q := orm.NewQuery[Doc]().Nearest(embCol, vec, 10).WithinDistance(embCol, vec, 0.3)
 ```
+
+**距离度量**（`orm.VectorMetric`，默认 `L2`）：
+
+| 度量 | 常量 | Postgres 运算符 | MySQL 度量名 | 典型用途 |
+|---|---|---|---|---|
+| 欧几里得 | `orm.L2` | `<->` | `EUCLIDEAN` | 图像/音频等已归一化前的几何距离 |
+| 余弦 | `orm.Cosine` | `<=>` | `COSINE` | **文本嵌入相似度（推荐）** |
+| 内积 | `orm.InnerProduct` | `<#>`（负内积） | `DOT` | 向量已归一化时最快 |
+| 曼哈顿 | `orm.L1` | `<+>` | `MANHATTAN`（MySQL 9.7+） | 稀疏向量 |
+
+> **注意**：`Nearest` / `WithinDistance` 不指定度量时沿用旧版默认 `L2`；做语义检索请显式 `NearestBy(..., orm.Cosine)`。
+> SQLite 无原生向量类型，仅能生成语法（用于离线拼 SQL），真正检索请换 PG / MySQL。
+
+**完整可运行示例**：见 [`examples/vector-search`](examples/vector-search)，无需装数据库即可看到 PG / MySQL 两种方言生成的 SQL。
+
+**性能提示**：百万级向量请用向量索引——PG `CREATE INDEX ON docs USING hnsw (embedding vector_cosine_ops);`，MySQL `CREATE VECTOR INDEX idx ON docs(embedding);`。框架生成的 `ORDER BY 距离 ASC LIMIT k` 能直接命中这些索引。
 
 ---
 
@@ -827,11 +850,11 @@ q := orm.NewQuery[Doc]().Nearest(embCol, vec, 10).WithinDistance(embCol, vec, 0.
 
 | 数据库 | `Open` 驱动名 | 默认方言 | 备注 |
 |---|---|---|---|
-| Postgres | `postgres` / `pgx` | Postgres | 默认；支持 jsonb、向量 `<->` |
-| MySQL | `mysql` | MySQL | 支持 `JSON_CONTAINS` |
-| SQLite | `sqlite` / `sqlite3` | SQLite | 支持 `json_extract` / `json_contains` |
+| Postgres | `postgres` / `pgx` | Postgres | 默认；支持 jsonb、向量 `<->`（pgvector） |
+| MySQL | `mysql` | MySQL | 支持 `JSON_CONTAINS`、向量 `VECTOR_DISTANCE`（MySQL 9+） |
+| SQLite | `sqlite` / `sqlite3` | SQLite | 支持 `json_extract` / `json_contains`；无原生向量类型 |
 
-新增方言只需实现 `Dialect` 接口（`QuoteIdent` / `Placeholder` / `JsonPath` / `JsonContains`）并在 `dialectForDriver` 注册。
+新增方言只需实现 `Dialect` 接口（`QuoteIdent` / `Placeholder` / `JsonPath` / `JsonContains` / `VectorDistance` / `VectorBind`）并在 `dialectForDriver` 注册。
 
 ---
 

@@ -19,6 +19,7 @@ type fieldInfo struct {
 	autoInc bool
 	ignore  bool
 	json    bool    // true 表示字段以 JSON 形式读写（db tag 含 ",json"）
+	vector  bool    // true 表示字段为向量列（db tag 含 ",vector"），读写时序列化为文本 [..]
 	logic   bool    // true 表示该字段是逻辑删除列（db tag 含 ",logic"）
 	nologic bool    // true 表示显式退出约定软删除匹配（db tag 含 ",nologic"）
 	typ     reflect.Type
@@ -87,6 +88,8 @@ func parseMeta(typ reflect.Type) *modelMeta {
 					fi.autoInc = true
 				case "json":
 					fi.json = true
+				case "vector":
+					fi.vector = true
 				case "logic":
 					fi.logic = true
 				case "nologic":
@@ -375,6 +378,9 @@ func argFor(meta *modelMeta, ev reflect.Value, col string) (any, error) {
 	fv := fieldByCol(ev, meta, col)
 	if fi != nil && fi.json {
 		return json.Marshal(fv.Interface())
+	}
+	if fi != nil && fi.vector {
+		return serializeVector(fv.Interface()), nil
 	}
 	return fv.Interface(), nil
 }

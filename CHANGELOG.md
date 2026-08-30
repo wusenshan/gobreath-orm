@@ -2,6 +2,13 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/)。
 
+## v0.1.5 (2026-08-29)
+
+- **向量检索统一 API + 方言分发（AI/RAG 核心卖点）**：`Nearest` / `WithinDistance` 一套 API 同时适配 Postgres(pgvector) 与 MySQL 9+，SQL 由 `Dialect` 接口新增的 `VectorDistance` / `VectorBind` 方法自动分发——PG 生成 `<=>/<->/<#>/<+>` 运算符，MySQL 9 生成 `VECTOR_DISTANCE(col, STRING_TO_VECTOR(?), 'COSINE'|'EUCLIDEAN'|'DOT'|'MANHATTAN')`。
+- 新增距离度量 `orm.VectorMetric`：**Cosine / L2 / InnerProduct / L1**；新增 `NearestBy` / `WithinDistanceBy` / `WithVectorMetric`；`Nearest` / `WithinDistance` 不指定时沿用默认 `L2`（兼容旧版 `<->` 行为）。
+- 向量字段零依赖：新增 `,vector` 模型 tag，`Insert` / `BatchInsert` / `Update` / `UpdateById` 自动将 `[]float32` / `[]float64` 序列化为 `[..]` 文本并参数化绑定（MySQL 自动包裹 `STRING_TO_VECTOR(?)`），**无需引入 `pgvector-go`**。
+- 新增 `examples/vector-search`：离线打印 PG / MySQL 两种方言生成的向量检索 SQL，含真实用法注释块。
+
 ## v0.1.4 (2026-08-29)
 
 - 增强软删除：新增「约定软删除字段名」`Config.SoftDeleteField`（/ `WithSoftDeleteField`），实体列名或 Go 字段名命中且类型为 time/int/bool 即自动启用软删除，免写 `,logic` tag；优先级 `,logic` > 约定 > 物理删除。

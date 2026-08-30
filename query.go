@@ -49,6 +49,7 @@ type Query[T any] struct {
 	vector        any
 	vecFilterOn   bool
 	vecFilter     float64
+	vectorMetric  VectorMetric // 向量距离度量，默认 L2
 }
 
 // NewQuery 创建针对类型 T 对应表的查询构造器。
@@ -222,7 +223,8 @@ func (q *Query[T]) Having(col ColExpr, op string, val any) *Query[T] {
 	return q
 }
 
-// Nearest 向量近邻检索：ORDER BY <embedding> <-> $1 LIMIT k（Postgres 语法，其它库需适配）。
+// Nearest 向量近邻检索：按默认度量（L2 欧几里得）生成距离排序并 LIMIT k。
+// 文本语义相似度检索（如 RAG）建议改用 NearestBy(..., Cosine)。
 func (q *Query[T]) Nearest(col ColExpr, vec any, k int) *Query[T] {
 	q.hasVector = true
 	q.vecCol = col.name
@@ -232,7 +234,20 @@ func (q *Query[T]) Nearest(col ColExpr, vec any, k int) *Query[T] {
 	return q
 }
 
-// WithinDistance 增加向量距离阈值过滤：<embedding> <-> $1 < threshold。
+// NearestBy 与 Nearest 相同，但显式指定距离度量（Cosine / L2 / InnerProduct / L1）。
+func (q *Query[T]) NearestBy(col ColExpr, vec any, k int, m VectorMetric) *Query[T] {
+	q.vectorMetric = m
+	return q.Nearest(col, vec, k)
+}
+
+// WithVectorMetric 设置后续向量检索（Nearest / WithinDistance）使用的距离度量，默认 L2。
+func (q *Query[T]) WithVectorMetric(m VectorMetric) *Query[T] {
+	q.vectorMetric = m
+	return q
+}
+
+// WithinDistance 增加向量距离阈值过滤（默认 L2）：仅返回距离小于 threshold 的行。
+// 常与 Nearest 连用，既限制召回范围又按距离排序。
 func (q *Query[T]) WithinDistance(col ColExpr, vec any, threshold float64) *Query[T] {
 	q.hasVector = true
 	q.vecCol = col.name
@@ -240,6 +255,12 @@ func (q *Query[T]) WithinDistance(col ColExpr, vec any, threshold float64) *Quer
 	q.vecFilterOn = true
 	q.vecFilter = threshold
 	return q
+}
+
+// WithinDistanceBy 与 WithinDistance 相同，但显式指定距离度量。
+func (q *Query[T]) WithinDistanceBy(col ColExpr, vec any, threshold float64, m VectorMetric) *Query[T] {
+	q.vectorMetric = m
+	return q.WithinDistance(col, vec, threshold)
 }
 
 func (q *Query[T]) Limit(n int) *Query[T]  { q.limit = n; return q }
@@ -373,7 +394,7 @@ func (q *Query[T]) Build() (string, []any) {
 	}
 
 	if q.hasVector {
-		add(q.vector)
+		add(serializeVector(q.vector))
 	}
 
 	sel := "*"
@@ -385,9 +406,9 @@ func (q *Query[T]) Build() (string, []any) {
 		sel = strings.Join(quoted, ", ")
 	}
 	if q.hasVector {
-		dist := fmt.Sprintf("%s <-> %s AS dist", d.QuoteIdent(q.vecCol), d.Placeholder(1))
+		dist := fmt.Sprintf("%s AS dist", d.VectorDistance(q.vecCol, d.Placeholder(1), q.vectorMetric))
 		if sel == "*" {
-			sel = dist
+			sel = "*" + ", " + dist
 		} else {
 			sel = sel + ", " + dist
 		}
@@ -399,7 +420,7 @@ func (q *Query[T]) Build() (string, []any) {
 	}
 
 	if q.hasVector && q.vecFilterOn {
-		clause := fmt.Sprintf("%s <-> %s < %s", d.QuoteIdent(q.vecCol), d.Placeholder(1), d.Placeholder(add(q.vecFilter)))
+		clause := fmt.Sprintf("%s < %s", d.VectorDistance(q.vecCol, d.Placeholder(1), q.vectorMetric), d.Placeholder(add(q.vecFilter)))
 		if len(q.groups) > 0 {
 			sql += " AND " + clause
 		} else {
@@ -427,14 +448,14 @@ func (q *Query[T]) Build() (string, []any) {
 		ords := make([]string, 0, len(q.orders))
 		for _, o := range q.orders {
 			if o.vec {
-				ords = append(ords, fmt.Sprintf("%s <-> %s %s", d.QuoteIdent(q.vecCol), d.Placeholder(1), ascDesc(o.asc)))
-			} else {
-				ords = append(ords, fmt.Sprintf("%s %s", d.QuoteIdent(o.col), ascDesc(o.asc)))
-			}
+			ords = append(ords, fmt.Sprintf("%s %s", d.VectorDistance(q.vecCol, d.Placeholder(1), q.vectorMetric), ascDesc(o.asc)))
+		} else {
+			ords = append(ords, fmt.Sprintf("%s %s", d.QuoteIdent(o.col), ascDesc(o.asc)))
 		}
-		sql += " ORDER BY " + strings.Join(ords, ", ")
+	}
+	sql += " ORDER BY " + strings.Join(ords, ", ")
 	} else if q.hasVector {
-		sql += fmt.Sprintf(" ORDER BY %s <-> %s", d.QuoteIdent(q.vecCol), d.Placeholder(1))
+		sql += fmt.Sprintf(" ORDER BY %s", d.VectorDistance(q.vecCol, d.Placeholder(1), q.vectorMetric))
 	}
 
 	if q.limit > 0 {

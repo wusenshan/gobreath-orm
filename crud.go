@@ -28,7 +28,11 @@ func Insert[T any](ctx context.Context, db *DB, entity *T) error {
 			return err
 		}
 		args = append(args, v)
-		phs = append(phs, nextPh())
+		ph := nextPh()
+		if fi := fieldInfoForCol(meta, c); fi != nil && fi.vector {
+			ph = db.dialect.VectorBind(ph)
+		}
+		phs = append(phs, ph)
 	}
 	sqlStr := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
 		quoteTable(meta.finalTable(db.prefix), db.dialect), quoteCols(cols, db.dialect), strings.Join(phs, ", "))
@@ -69,7 +73,11 @@ func BatchInsert[T any](ctx context.Context, db *DB, entities []T) error {
 				return err
 			}
 			args = append(args, v)
-			phs = append(phs, nextPh())
+			ph := nextPh()
+			if fi := fieldInfoForCol(meta, c); fi != nil && fi.vector {
+				ph = db.dialect.VectorBind(ph)
+			}
+			phs = append(phs, ph)
 		}
 		valueRows = append(valueRows, "("+strings.Join(phs, ", ")+")")
 	}
@@ -253,7 +261,11 @@ func UpdateById[T any](ctx context.Context, db *DB, entity *T) error {
 			return err
 		}
 		args = append(args, v)
-		setParts = append(setParts, fmt.Sprintf("%s = %s", db.dialect.QuoteIdent(c), nextPh()))
+		ph := nextPh()
+		if fi := fieldInfoForCol(meta, c); fi != nil && fi.vector {
+			ph = db.dialect.VectorBind(ph)
+		}
+		setParts = append(setParts, fmt.Sprintf("%s = %s", db.dialect.QuoteIdent(c), ph))
 	}
 	pkVal, err := argFor(meta, ev, meta.pk.colName)
 	if err != nil {
@@ -288,7 +300,11 @@ func Update[T any](ctx context.Context, db *DB, q *Query[T], entity *T) error {
 			return err
 		}
 		args = append(args, v)
-		setParts = append(setParts, fmt.Sprintf("%s = %s", db.dialect.QuoteIdent(c), nextPh()))
+		ph := nextPh()
+		if fi := fieldInfoForCol(meta, c); fi != nil && fi.vector {
+			ph = db.dialect.VectorBind(ph)
+		}
+		setParts = append(setParts, fmt.Sprintf("%s = %s", db.dialect.QuoteIdent(c), ph))
 	}
 	idx := phIdx
 	add := func(v any) int { idx++; args = append(args, v); return idx }

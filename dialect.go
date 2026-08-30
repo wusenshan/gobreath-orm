@@ -19,6 +19,15 @@ type Dialect interface {
 	// ForUpdateClause 返回悲观锁子句（SELECT 末尾）。PG/MySQL 为 " FOR UPDATE"；
 	// SQLite 不支持行级锁（锁在连接/事务级别），返回空串以避免老版本直接报错。
 	ForUpdateClause() string
+	// VectorDistance 返回向量距离表达式，用于 ORDER BY / 阈值过滤 / 距离投影。
+	// col 为已加引号的列名，ph 为占位符（向量参数恒为第一个占位符），m 为距离度量。
+	// PG：   "<col>" <=> <ph> / "<col>" <-> <ph> / "<col>" <#> <ph> / "<col>" <+> <ph>
+	// MySQL：VECTOR_DISTANCE(`col`, STRING_TO_VECTOR(<ph>), 'COSINE'|'EUCLIDEAN'|'DOT'|'MANHATTAN')
+	// SQLite：无原生向量类型，返回与 PG 同形表达式（仅供 SQL 生成，运行时需换 PG/MySQL）。
+	VectorDistance(col, ph string, m VectorMetric) string
+	// VectorBind 返回「绑定一个文本向量参数」的占位符包裹形式，用于 INSERT/UPDATE 向量列。
+	// PG/SQLite 直接返回 ph（驱动/列类型自行解析文本）；MySQL 包裹为 STRING_TO_VECTOR(ph)。
+	VectorBind(ph string) string
 }
 
 type postgresDialect struct{}
@@ -46,6 +55,19 @@ func (d postgresDialect) JsonContains(col, ph string) string {
 	return d.QuoteIdent(col) + " @> " + ph + "::jsonb"
 }
 func (postgresDialect) ForUpdateClause() string { return " FOR UPDATE" }
+func (d postgresDialect) VectorDistance(col, ph string, m VectorMetric) string {
+	switch m {
+	case Cosine:
+		return d.QuoteIdent(col) + " <=> " + ph
+	case InnerProduct:
+		return d.QuoteIdent(col) + " <#> " + ph
+	case L1:
+		return d.QuoteIdent(col) + " <+> " + ph
+	default: // L2
+		return d.QuoteIdent(col) + " <-> " + ph
+	}
+}
+func (postgresDialect) VectorBind(ph string) string { return ph }
 
 type mysqlDialect struct{}
 
@@ -61,6 +83,21 @@ func (d mysqlDialect) JsonContains(col, ph string) string {
 	return fmt.Sprintf("JSON_CONTAINS(%s, %s)", d.QuoteIdent(col), ph)
 }
 func (mysqlDialect) ForUpdateClause() string { return " FOR UPDATE" }
+func (d mysqlDialect) VectorDistance(col, ph string, m VectorMetric) string {
+	var metric string
+	switch m {
+	case Cosine:
+		metric = "COSINE"
+	case InnerProduct:
+		metric = "DOT"
+	case L1:
+		metric = "MANHATTAN"
+	default: // L2
+		metric = "EUCLIDEAN"
+	}
+	return fmt.Sprintf("VECTOR_DISTANCE(%s, STRING_TO_VECTOR(%s), '%s')", d.QuoteIdent(col), ph, metric)
+}
+func (mysqlDialect) VectorBind(ph string) string { return "STRING_TO_VECTOR(" + ph + ")" }
 
 type sqliteDialect struct{}
 
@@ -76,6 +113,19 @@ func (d sqliteDialect) JsonContains(col, ph string) string {
 	return fmt.Sprintf("json_contains(%s, %s)", d.QuoteIdent(col), ph)
 }
 func (sqliteDialect) ForUpdateClause() string { return "" }
+func (d sqliteDialect) VectorDistance(col, ph string, m VectorMetric) string {
+	switch m {
+	case Cosine:
+		return d.QuoteIdent(col) + " <=> " + ph
+	case InnerProduct:
+		return d.QuoteIdent(col) + " <#> " + ph
+	case L1:
+		return d.QuoteIdent(col) + " <+> " + ph
+	default: // L2
+		return d.QuoteIdent(col) + " <-> " + ph
+	}
+}
+func (sqliteDialect) VectorBind(ph string) string { return ph }
 
 // 内置方言实例，开箱即用。
 var (
