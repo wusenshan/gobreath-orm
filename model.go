@@ -20,9 +20,12 @@ type fieldInfo struct {
 	ignore  bool
 	json    bool    // true 表示字段以 JSON 形式读写（db tag 含 ",json"）
 	vector  bool    // true 表示字段为向量列（db tag 含 ",vector"），读写时序列化为文本 [..]
+	vectorDim int   // 向量维度（db tag 含 ",vector(N)" 时解析出 N；0 表示未指定维度）
 	logic   bool    // true 表示该字段是逻辑删除列（db tag 含 ",logic"）
 	nologic bool    // true 表示显式退出约定软删除匹配（db tag 含 ",nologic"）
 	version bool    // true 表示该字段是乐观锁版本列（db tag 含 ",version"）
+	unique  bool    // true 表示该列需唯一约束（db tag 含 ",unique"），仅 AutoMigrate 使用
+	index   bool    // true 表示该列需二级索引（db tag 含 ",index"），仅 AutoMigrate 使用
 	typ     reflect.Type
 }
 
@@ -83,6 +86,13 @@ func parseMeta(typ reflect.Type) *modelMeta {
 			parts := strings.Split(tag, ",")
 			fi.colName = parts[0]
 			for _, p := range parts[1:] {
+				if strings.HasPrefix(p, "vector") {
+					fi.vector = true
+					if n := parseVectorDim(p); n > 0 {
+						fi.vectorDim = n
+					}
+					continue
+				}
 				switch p {
 				case "pk":
 					fi.pk = true
@@ -90,14 +100,16 @@ func parseMeta(typ reflect.Type) *modelMeta {
 					fi.autoInc = true
 				case "json":
 					fi.json = true
-				case "vector":
-					fi.vector = true
 				case "logic":
 					fi.logic = true
 				case "nologic":
 					fi.nologic = true
 				case "version":
 					fi.version = true
+				case "unique":
+					fi.unique = true
+				case "index":
+					fi.index = true
 				}
 			}
 		}
@@ -414,6 +426,22 @@ func updateCols(meta *modelMeta) []string {
 		cols = append(cols, f.colName)
 	}
 	return cols
+}
+
+// parseVectorDim 从 db tag 的分段（如 "vector(1536)"）解析向量维度；
+// 无括号或非数字时返回 0（表示未指定维度）。
+func parseVectorDim(seg string) int {
+	seg = strings.TrimSpace(seg)
+	open := strings.Index(seg, "(")
+	close := strings.Index(seg, ")")
+	if open < 0 || close < open+1 {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(seg[open+1 : close]))
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
 }
 
 // isTimeType 判断字段类型是否为 time.Time（含指针形式），用于决定逻辑删除的「未删除」判定。

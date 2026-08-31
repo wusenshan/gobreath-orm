@@ -2,6 +2,13 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/)。
 
+## v0.1.7 (2026-08-30)
+
+- **AutoMigrate（数据库迁移）**：新增 `db.AutoMigrate(ctx, &User{}, ...)`，幂等建表（`CREATE TABLE IF NOT EXISTS`）+ 二级索引（`CREATE INDEX IF NOT EXISTS`）；自动识别 `,vector(N)`（PG `vector(N)` / MySQL `VECTOR(N)` / SQLite `TEXT`）、`,json`（PG `JSONB` / MySQL `JSON` / SQLite `TEXT`）、`,unique` / `,index`；主键 + 自增按方言生成（PG `BIGSERIAL` / MySQL `AUTO_INCREMENT` / SQLite `INTEGER PRIMARY KEY AUTOINCREMENT`）。不扩展 `Dialect` 接口，用方言类型 switch 生成 DDL，三方言全适配（`migrate.go`）。
+- **关联预加载（Preload）**：新增 `orm.Preload / PreloadOne`，通过反射一次性批量加载 **has_many / has_one / belongs_to** 关联，避免 N+1；默认外键约定 `<类型名>_id`（已修复：此前误为 `<类型名>id`，如 `User` 会得到 `userid` 而非 `user_id`），可用 `orm:"has_many;fk:user_id"` / `orm:"belongs_to;fk:xxx"` 覆盖；软删除过滤对子查询同样生效（`preload.go`）。
+- **Distinct 去重查询**：`Query.Distinct()` 生成 `SELECT DISTINCT`，与 `Select` / 条件 / 排序 / 分页完全兼容（`query.go`）。
+- **测试**：新增 `migrate_test.go`（三方言 DDL 断言 + 向量列 + 前缀 + mock 执行）、`preload_test.go`（has_many / has_one / belongs_to / 单对象 / 未知关系 / 默认外键约定）、`distinct_test.go`（MySQL / PG 向量）。
+
 ## v0.1.6 (2026-08-30)
 
 - **联表查询（JOIN）**：`Query` 新增 `Join / LeftJoin / RightJoin`（+ `As` 别名变体）与 `Alias()`；表名白名单校验、ON 原文拼接（文档标注注入风险）；`Select` 支持 `u.name` 带别名列（`quoteIdentPath`）。

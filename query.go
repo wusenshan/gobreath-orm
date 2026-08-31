@@ -54,6 +54,7 @@ type Query[T any] struct {
 	forUpdate     bool   // 悲观锁：SELECT 末尾追加 FOR UPDATE（SQLite 自动降级为空）
 	last          string // 自定义 SQL 结尾（原样拼接，对标 MyBatis-Plus 的 last()）
 	unscoped      bool   // true 时关闭逻辑删除自动过滤（Unscoped / 物理删除逃生通道）
+	distinct      bool   // true 时 SELECT 改为 SELECT DISTINCT
 	hasVector     bool
 	vecCol        string
 	vector        any
@@ -334,6 +335,10 @@ func (q *Query[T]) WithinDistanceBy(col ColExpr, vec any, threshold float64, m V
 func (q *Query[T]) Limit(n int) *Query[T]  { q.limit = n; return q }
 func (q *Query[T]) Offset(n int) *Query[T] { q.offset = n; return q }
 
+// Distinct 让本次查询使用 SELECT DISTINCT 去重（对标 SQL 的 SELECT DISTINCT）。
+// 常与 GroupBy / 聚合场景配合；向量检索（hasVector）时仅作用于普通列，距离列 dist 不受影响。
+func (q *Query[T]) Distinct() *Query[T] { q.distinct = true; return q }
+
 // ForUpdate 在 SELECT 末尾追加悲观行锁（FOR UPDATE），用于「先查后改」防并发覆盖。
 // 方言感知：Postgres / MySQL 生成 " FOR UPDATE"；SQLite 无行级锁，自动降级为空串（避免报错）。
 // 注意：FOR UPDATE 必须在事务中才真正生效，建议配合 db.Transaction 使用。
@@ -527,7 +532,11 @@ func (q *Query[T]) Build() (string, []any) {
 		}
 		from += " ON " + j.on
 	}
-	sql := fmt.Sprintf("SELECT %s FROM %s", sel, from)
+	kw := "SELECT"
+	if q.distinct {
+		kw = "SELECT DISTINCT"
+	}
+	sql := fmt.Sprintf("%s %s FROM %s", kw, sel, from)
 
 	if w := whereSQL(q.groups, d, add); w != "" {
 		sql += " WHERE " + w

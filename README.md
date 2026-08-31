@@ -35,6 +35,9 @@
 - 🔐 **乐观锁**：`db:"version,version"`（或 `Config.OptimisticField` 约定）标记版本列；`UpdateById / UpdateByIdSets` 自动 `WHERE version = ?` 并 `SET version = version + 1`，冲突时返回 `ErrOptimisticLock`。
 - 🪝 **SQL 生命周期钩子（Hook）**：`Config.Hooks` 或 `db.WithHooks(...)` 注册实现 `Hook` 接口的对象；每次 `exec` / `query` 的 before / after 阶段都会触发 `On(HookEvent)`，可零侵入地做审计、限流、链路追踪。未配置则不触发、零开销。
 - 🌐 **读写分离 / 多数据源**：`Config.ReadWrite`（或等价的 `Config.MultiSource`）声明主库 + 只读副本；框架按 SQL 前缀自动把写操作路由主库、读操作 round-robin 到副本，事务内自动回落主库。`*readWriteRouter` 内部加锁，并发安全。
+- 🗃 **AutoMigrate（数据库迁移）**：`db.AutoMigrate(ctx, &User{}, &Order{})` 幂等建表（`CREATE TABLE IF NOT EXISTS`）+ 二级索引（`CREATE INDEX IF NOT EXISTS`），三方言自动生成 DDL；自动识别 `,vector(N)`（PG `vector(N)` / MySQL `VECTOR(N)` / SQLite `TEXT`）与 `,json`（PG `JSONB` / MySQL `JSON` / SQLite `TEXT`）、`,unique` / `,index`；无需引入迁移工具即可让表结构与结构体对齐。
+- 🔗 **关联预加载（Preload）**：`orm.Preload(ctx, db, &users, "Articles")` 一次性批量加载 **has_many / has_one / belongs_to** 关联，避免 N+1 查询；默认外键约定 `<类型名>_id`（如 `User` → `user_id`），可用 `orm:"has_many;fk:user_id"` / `orm:"belongs_to;fk:xxx"` 覆盖；软删除过滤对子查询同样生效。
+- ⋇ **Distinct 去重查询**：`orm.NewQuery[T]().Distinct()` 生成 `SELECT DISTINCT`，可搭配 `Select` / 条件 / 排序 / 分页照常使用。
 
 ---
 
@@ -956,6 +959,115 @@ db, _ := orm.Open(orm.Config{
 
 ---
 
+## AutoMigrate（数据库迁移）
+
+`AutoMigrate` 让表结构与 Go 结构体保持一致，**幂等、可重复执行**：先 `CREATE TABLE IF NOT EXISTS` 建表，再按需补 `CREATE INDEX IF NOT EXISTS` 二级索引。它直接读结构体的 `db` tag，**不扩展 `Dialect` 接口**（用方言类型 switch 生成 DDL），三方言（PG / MySQL / SQLite）都能正确产出对应语法。
+
+```go
+type Product struct {
+    Id        int64           `db:"id,pk,autoincrement"`
+    SKU       string          `db:"sku,unique"`              // 唯一索引
+    Name      string          `db:"name,index"`              // 普通二级索引
+    Meta      map[string]any  `db:"meta,json"`               // JSON 列
+    Embedding []float32       `db:"embedding,vector(1536)"` // 向量列（带维度）
+}
+
+ctx := context.Background()
+// 幂等：表/索引用 IF NOT EXISTS，重复执行安全（不删列、不重建）
+if err := db.AutoMigrate(ctx, &Product{}, &User{}, &Order{}); err != nil {
+    panic(err)
+}
+```
+
+- **向量列**：`db:"embedding,vector(1536)"` → PG 生成 `embedding vector(1536)`；MySQL 生成 `embedding VECTOR(1536)`；SQLite 无原生向量类型，退化为 `TEXT`（仍保留数据，检索请换 PG / MySQL）。
+- **JSON 列**：PG → `JSONB`，MySQL → `JSON`，SQLite → `TEXT`。
+- **主键 + 自增**：PG `BIGSERIAL PRIMARY KEY`；MySQL `BIGINT AUTO_INCREMENT PRIMARY KEY`；SQLite `INTEGER PRIMARY KEY AUTOINCREMENT`。
+- **索引**：`,unique` 生成唯一索引，`,index` 生成普通二级索引；列类型未显式声明维度时向量默认 1536。
+
+> 当前 AutoMigrate 负责「建表 + 建索引」，**不会删除结构体里已移除的列**（保守策略，避免误删数据）；需要改列类型 / 删列请走原生 SQL（`RawExec`）或专业迁移工具。
+
+---
+
+## 关联预加载（Preload）
+
+`Preload` 一次性批量加载父子 / 主从关联，**避免逐对象查询造成的 N+1 问题**。支持三类关系：
+
+| 关系 | 父字段形态 | 默认外键列 | 含义 |
+|---|---|---|---|
+| `has_many` | 切片 `[]Child` | `<父类型名>_id`（如 `User` → `user_id`） | 子表持有指向父主键的外键 |
+| `has_one` | 结构体 / 指针 | 同上 | 同 has_many，每个父最多一个 |
+| `belongs_to` | 结构体 / 指针 | `<子类型名>_id`（如 `Account` → `account_id`） | 父表上持有指向子表主键的外键 |
+
+```go
+type User struct {
+    Id       int64      `db:"id,pk,autoincrement"`
+    Name     string     `db:"name"`
+    Articles []Article  `db:"-" orm:"has_many"`          // 子表含 user_id 列
+    Profile  *Profile   `db:"-" orm:"has_one;fk:user_id"` // 显式指定外键列
+}
+func (User) TableName() string { return "users" }
+
+type Article struct {
+    Id     int64  `db:"id,pk,autoincrement"`
+    Title  string `db:"title"`
+    UserId int64  `db:"user_id"`
+}
+func (Article) TableName() string { return "articles" }
+
+// 批量预加载：一次性把 users 的 Articles / Profile 都挂好
+users := []User{{Id: 1}, {Id: 2}}
+if err := orm.Preload(ctx, db, &users, "Articles", "Profile"); err != nil {
+    panic(err)
+}
+
+// 单对象版本
+u := &User{Id: 1}
+if err := orm.PreloadOne(ctx, db, u, "Articles"); err != nil {
+    panic(err)
+}
+```
+
+`belongs_to` 示例（父表持有外键，指向子表主键）：
+
+```go
+type Comment struct {
+    Id     int64  `db:"id,pk,autoincrement"`
+    Body   string `db:"body"`
+    UserId int64  `db:"user_id"`
+    Author *User  `db:"-" orm:"belongs_to;fk:user_id"` // 指向 User 主键
+}
+func (Comment) TableName() string { return "comments" }
+
+comments := []Comment{{Id: 10, UserId: 1}, {Id: 11, UserId: 2}}
+orm.Preload(ctx, db, &comments, "Author") // 每个 Comment.Author 被填充
+```
+
+约定与注意：
+
+- ⚠️ **关联字段务必用 `db:"-"` 标记**，否则会同时参与 CRUD 而报错。
+- 外键列默认 `<类型名>_id`（如 `User` → `user_id`、`Account` → `account_id`）；与默认不符时用 `orm:"has_many;fk:user_id"` / `orm:"belongs_to;fk:xxx"` 覆盖。
+- 子查询**同样应用软删除过滤**，不会加载已逻辑删除的子对象。
+- `Preload` / `PreloadOne` 在 `Repo[T]` 上同名透传（`repo.Preload(ctx, &list, "Articles")`）。
+
+---
+
+## Distinct 去重查询
+
+`Distinct()` 在 `SELECT` 后追加 `DISTINCT`，常用于「按某列去重后统计 / 列举取值」：
+
+```go
+cityCol := orm.Col[User](func(u *User) *string { return &u.City })
+
+// SELECT DISTINCT city FROM users WHERE age > ?
+cities, err := orm.SelectList(ctx, db,
+    orm.NewQuery[User]().Distinct().Select("city").Gt(ageCol, 18),
+)
+```
+
+`Distinct()` 与 `Select` / `Eq` / `OrderBy` / `Limit` / `Page` 等链式条件完全兼容，顺序随意。
+
+---
+
 ## 安全与防注入
 
 `gobreath-orm` 在三层都做了处理：
@@ -983,8 +1095,8 @@ db, _ := orm.Open(orm.Config{
 - `RawQuery` 体验增强：`IN` 占位符批量展开（slice → `(?, ?, ...)`）、`map[string]any` 结果集、流式游标（大结果集分批读取）
 - 钩子（`BeforeCreate / AfterUpdate` 等，实体级回调——当前 `Hook` 是 SQL 生命周期级，二者定位不同，后续可扩展）
 - 投影 `Select` 强类型化与聚合结果映射
-- 关联预加载 / 关联映射（relation preload / association mapping）
-- 数据库迁移（migration）
+- ✅ 关联预加载 / 关联映射（relation preload / association mapping）—— 已在 v0.1.7 通过 `Preload` / `PreloadOne` 落地
+- ✅ 数据库迁移（migration）—— 已在 v0.1.7 通过 `AutoMigrate` 落地（建表 + 二级索引，暂不含删列 / 改列类型）
 
 ---
 
