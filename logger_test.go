@@ -77,6 +77,10 @@ func (e *logExec) QueryContext(_ context.Context, q string, _ ...any) (*sql.Rows
 	e.queries = append(e.queries, q)
 	return nil, errors.New("logger test: query not supported")
 }
+func (e *logExec) QueryRowContext(_ context.Context, q string, _ ...any) *sql.Row {
+	e.queries = append(e.queries, q)
+	return nil
+}
 
 type logRow struct {
 	ID   int64  `db:"id,pk"`

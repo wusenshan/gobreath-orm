@@ -16,6 +16,9 @@ func (s *stubExec) ExecContext(ctx context.Context, q string, args ...any) (sql.
 func (s *stubExec) QueryContext(ctx context.Context, q string, args ...any) (*sql.Rows, error) {
 	return nil, nil
 }
+func (s *stubExec) QueryRowContext(ctx context.Context, q string, args ...any) *sql.Row {
+	return nil
+}
 
 type stubResult struct{}
 

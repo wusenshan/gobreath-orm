@@ -36,6 +36,20 @@ func Insert[T any](ctx context.Context, db *DB, entity *T) error {
 	}
 	sqlStr := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
 		quoteTable(meta.finalTable(db.prefix), db.dialect), quoteCols(cols, db.dialect), strings.Join(phs, ", "))
+
+	// 自增主键回填：PostgreSQL（pgx 经 database/sql）不支持 sql.Result.LastInsertId()，
+	// 会返回 error，故改用 INSERT ... RETURNING "id" + 扫描单行回填；MySQL / SQLite
+	// 走标准 LastInsertId() 路径。
+	if meta.pk != nil && meta.pk.autoInc && !db.dialect.SupportsLastInsertID() {
+		sqlStr += db.dialect.InsertReturning(meta.pk.colName)
+		var id int64
+		if err := db.queryRowContext(ctx, sqlStr, args...).Scan(&id); err != nil {
+			return err
+		}
+		setFieldValue(fieldByCol(ev, meta, meta.pk.colName), id)
+		return nil
+	}
+
 	res, err := db.execContext(ctx, sqlStr, args...)
 	if err != nil {
 		return err

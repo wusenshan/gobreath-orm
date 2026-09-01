@@ -93,6 +93,10 @@ func (r *mockRows) Next(dest []driver.Value) error {
 var mockRegistry = map[string]*mockRows{}
 
 func mockRowsFor(query string) driver.Rows {
+	// PostgreSQL 自增主键回填走 INSERT ... RETURNING "id"，优先匹配并返回单行单列 id。
+	if strings.Contains(strings.ToUpper(query), "RETURNING") {
+		return &mockRows{cols: []string{"id"}, data: [][]driver.Value{{driver.Value(int64(1))}}}
+	}
 	for k, v := range mockRegistry {
 		if strings.Contains(query, k) {
 			return v
@@ -199,6 +203,9 @@ type stubExecutor struct{}
 
 func (stubExecutor) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
 	return nil, fmt.Errorf("stub")
+}
+func (stubExecutor) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	return nil
 }
 func (stubExecutor) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
 	return nil, fmt.Errorf("stub")

@@ -4,6 +4,7 @@
 
 ## v0.1.8 (unreleased)
 
+- **PostgreSQL 自增主键回填修复（重要 bugfix）**：此前 `Insert` 仅靠 `sql.Result.LastInsertId()` 回填自增主键，但 **pgx 经 `database/sql` 不支持 `LastInsertId()`**（返回 error 后被静默吞掉），导致 PG 下 `u.Id` 始终为 `0`。现给 `Dialect` 接口新增 `SupportsLastInsertID() bool` 与 `InsertReturning(pkCol string) string`：MySQL / SQLite 维持 `LastInsertId()` 路径；PostgreSQL 自动改用 `INSERT ... RETURNING "id"` + 扫描单行回填，对调用方透明。另新增 `Executor.QueryRowContext`（及 `DB.queryRowContext`，按写操作 `HookKindExec` 上报日志/钩子）支撑该路径。`Insert` 现已三方言均正确回填主键（`crud.go` + `dialect.go` + `executor.go` + `pkwriteback_test.go`，含 mock 驱动验证 PG RETURNING 回填）。
 - **db tag 格式防呆（开关控制，默认关闭）**：`orm.Config` 新增 `StrictTagCheck bool`（默认 `false`）。开启后，模型解析阶段（`parseMeta` 及缓存命中补校验）会校验 `db` tag 是否使用标准引号格式；写成 `db:col,pk`（无引号）时 `reflect` 读不到 `db` key，导致 `pk` / `autoincrement` 等修饰符全部丢失，自增主键会被当成普通列写入 `0` 值且不报错——此时**直接 panic** 并给出明确提示（`orm: 结构体 X 字段 Y 的 db tag 格式错误：缺少引号，正确写法是 db:"col,pk,autoincrement"`）。默认关闭以兼容旧行为；一旦任一 `Open` 开启 `StrictTagCheck`，全局进入严格模式（`strictTagCheck` 包级 atomic，仅增不减，越严越安全）。`go vet` 也能静态拦截同类笔误，此开关作为运行时兜底（`model.go` + `executor.go` + `model_test.go`）。
 
 ## v0.1.7 (2026-08-30)

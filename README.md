@@ -284,6 +284,11 @@ if err := orm.Insert(ctx, db, u); err != nil {
 fmt.Println("new id =", u.ID)
 ```
 
+> 💡 **自增主键回填的方言差异**：MySQL / SQLite 走标准 `sql.Result.LastInsertId()` 回填；
+> **PostgreSQL（pgx 经 `database/sql`）不支持 `LastInsertId()`**，框架会自动改用
+> `INSERT ... RETURNING "id"` + 扫描单行回填，对调用方透明——无需任何额外代码。
+> 注意：`BatchInsert` 因签名为值切片（无法回写元素），不回填自增主键；单条 `Insert` 才回填。
+
 ### 批量新增（BatchInsert）
 
 ```go
@@ -1102,7 +1107,7 @@ cities, err := orm.SelectList(ctx, db,
 | MySQL | `mysql` | MySQL | 支持 `JSON_CONTAINS`、向量 `VECTOR_DISTANCE`（MySQL 9+） |
 | SQLite | `sqlite` / `sqlite3` | SQLite | 支持 `json_extract` / `json_contains`；无原生向量类型 |
 
-新增方言只需实现 `Dialect` 接口（`QuoteIdent` / `Placeholder` / `JsonPath` / `JsonContains` / `VectorDistance` / `VectorBind`）并在 `dialectForDriver` 注册。
+新增方言只需实现 `Dialect` 接口（`QuoteIdent` / `Placeholder` / `JsonPath` / `JsonContains` / `VectorDistance` / `VectorBind` / `UpsertSuffix` / `SupportsLastInsertID` / `InsertReturning`）并在 `dialectForDriver` 注册。
 
 ---
 

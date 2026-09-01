@@ -13,6 +13,7 @@ import (
 // 因此同一套 CRUD 既能跑在普通连接上，也能跑在事务里。
 type Executor interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 }
 
@@ -544,4 +545,27 @@ func (db *DB) queryContext(ctx context.Context, query string, args ...any) (*sql
 		db.notifyHooks(HookEvent{Kind: HookKindQuery, Phase: HookPhaseAfter, Query: query, Args: append([]any(nil), args...), Duration: duration, Err: err})
 	}
 	return rows, err
+}
+
+// queryRowContext 执行仅返回单行的查询（如 INSERT ... RETURNING）并记录日志。
+// 语义上仍按写操作（HookKindExec）上报，因为调用方用它做主键回填而非读取数据。
+// QueryRowContext 不在调用点返回 error，错误延迟到 Scan；此处按 nil 记录，由调用方捕获 Scan 错误。
+func (db *DB) queryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	exec := db.exec
+	if db.readWrite != nil {
+		if e := db.readWrite.choose(query); e != nil {
+			exec = e
+		}
+	}
+	if len(db.hooks) > 0 {
+		db.notifyHooks(HookEvent{Kind: HookKindExec, Phase: HookPhaseBefore, Query: query, Args: append([]any(nil), args...)})
+	}
+	start := time.Now()
+	row := exec.QueryRowContext(ctx, query, args...)
+	duration := time.Since(start)
+	db.logSlowOrErr(query, args, duration, nil)
+	if len(db.hooks) > 0 {
+		db.notifyHooks(HookEvent{Kind: HookKindExec, Phase: HookPhaseAfter, Query: query, Args: append([]any(nil), args...), Duration: duration, Err: nil})
+	}
+	return row
 }

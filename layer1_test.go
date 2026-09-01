@@ -185,6 +185,9 @@ type zeroAffectedExecutor struct{}
 func (zeroAffectedExecutor) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
 	return nil, driver.ErrSkip
 }
+func (zeroAffectedExecutor) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	return nil
+}
 func (zeroAffectedExecutor) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
 	return zeroResult{}, nil
 }

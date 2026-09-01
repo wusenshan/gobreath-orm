@@ -35,6 +35,13 @@ type Dialect interface {
 	//   - MySQL：      ON DUPLICATE KEY UPDATE col = VALUES(col), ...（忽略 conflictCols，依唯一键自动判定）；
 	//     若 updateCols 为空 → ON DUPLICATE KEY UPDATE <conflict[0]> = <conflict[0]>（无操作占位，避免语法错误）。
 	UpsertSuffix(conflictCols, updateCols []string) string
+	// SupportsLastInsertID 返回驱动是否支持 sql.Result.LastInsertId() 回填自增主键。
+	// MySQL / SQLite 支持；PostgreSQL（pgx 经 database/sql）不支持，须改用 INSERT ... RETURNING 子句。
+	SupportsLastInsertID() bool
+	// InsertReturning 返回 INSERT 用于回填自增主键的 RETURNING 子句（含前导空格）；
+	// 仅在不支持 LastInsertId 的方言（PostgreSQL）生效，如 ` RETURNING "id"`；
+	// 支持 LastInsertId 的方言（MySQL / SQLite）返回空串（走 LastInsertId 路径）。
+	InsertReturning(pkCol string) string
 }
 
 type postgresDialect struct{}
@@ -75,6 +82,10 @@ func (d postgresDialect) VectorDistance(col, ph string, m VectorMetric) string {
 	}
 }
 func (postgresDialect) VectorBind(ph string) string { return ph }
+func (postgresDialect) SupportsLastInsertID() bool { return false }
+func (d postgresDialect) InsertReturning(pkCol string) string {
+	return " RETURNING " + d.QuoteIdent(pkCol)
+}
 func (d postgresDialect) UpsertSuffix(conflict, update []string) string {
 	if len(update) == 0 {
 		return fmt.Sprintf("ON CONFLICT (%s) DO NOTHING", quoteCols(conflict, d))
@@ -115,6 +126,8 @@ func (d mysqlDialect) VectorDistance(col, ph string, m VectorMetric) string {
 	return fmt.Sprintf("VECTOR_DISTANCE(%s, STRING_TO_VECTOR(%s), '%s')", d.QuoteIdent(col), ph, metric)
 }
 func (mysqlDialect) VectorBind(ph string) string { return "STRING_TO_VECTOR(" + ph + ")" }
+func (mysqlDialect) SupportsLastInsertID() bool  { return true }
+func (mysqlDialect) InsertReturning(pkCol string) string { return "" }
 func (d mysqlDialect) UpsertSuffix(conflict, update []string) string {
 	if len(update) == 0 {
 		return fmt.Sprintf("ON DUPLICATE KEY UPDATE %s = %s", d.QuoteIdent(conflict[0]), d.QuoteIdent(conflict[0]))
@@ -153,6 +166,8 @@ func (d sqliteDialect) VectorDistance(col, ph string, m VectorMetric) string {
 	}
 }
 func (sqliteDialect) VectorBind(ph string) string { return ph }
+func (sqliteDialect) SupportsLastInsertID() bool  { return true }
+func (sqliteDialect) InsertReturning(pkCol string) string { return "" }
 func (d sqliteDialect) UpsertSuffix(conflict, update []string) string {
 	if len(update) == 0 {
 		return fmt.Sprintf("ON CONFLICT(%s) DO NOTHING", quoteCols(conflict, d))
