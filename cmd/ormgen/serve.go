@@ -23,6 +23,8 @@ type generateRequest struct {
 	Pkg        string `json:"pkg"`
 	Mode       string `json:"mode"`
 	StructName string `json:"structName"`
+	Example    bool   `json:"example"` // 附示例代码
+	Repo       bool   `json:"repo"`    // 附 Repo 脚手架
 }
 
 type generateResponse struct {
@@ -101,7 +103,7 @@ func generateHandler(w http.ResponseWriter, r *http.Request) {
 		} else {
 			resp.Detected = "DDL / " + dialectName(dt)
 		}
-		files, err := gen.FromDDL(req.Source, gen.Options{Package: pkg, Dialect: dt, Mode: om, StructName: req.StructName})
+		files, err := gen.FromDDL(req.Source, gen.Options{Package: pkg, Dialect: dt, Mode: om, StructName: req.StructName, Example: req.Example, Repo: req.Repo})
 		if err != nil {
 			resp.Error = err.Error()
 		} else {
@@ -109,7 +111,7 @@ func generateHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	case "json":
 		resp.Detected = "JSON 样例 / 推断 model"
-		files, err := gen.FromJSON(req.Source, gen.Options{Package: pkg, Mode: om, StructName: req.StructName})
+		files, err := gen.FromJSON(req.Source, gen.Options{Package: pkg, Mode: om, StructName: req.StructName, Example: req.Example, Repo: req.Repo})
 		if err != nil {
 			resp.Error = err.Error()
 		} else {

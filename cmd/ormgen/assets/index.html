@@ -118,6 +118,10 @@
         <select id="strict"><option value="off">关闭（默认）</option><option value="on">开启</option></select>
       </div>
     </div>
+    <div class="row" style="margin-top:6px">
+      <label><input type="checkbox" id="example" checked> 附示例代码（example.go）</label>
+      <label><input type="checkbox" id="repo"> 生成 Repo 脚手架（&lt;struct&gt;_repo.go）</label>
+    </div>
     <div class="cmd">
       <code id="cliCmd">go run github.com/wusenshan/gobreath-orm/cmd/ormgen -type User -dir ./generated</code>
       <button id="copyCli">复制命令</button>
@@ -215,7 +219,7 @@ async function generate(){
   updateCli(kind);
   try{
     const r=await fetch('/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({source:src,kind,dialect:$('dialect').value,pkg:$('pkg').value,mode:$('mode').value,structName:$('structName').value})});
+      body:JSON.stringify({source:src,kind,dialect:$('dialect').value,pkg:$('pkg').value,mode:$('mode').value,structName:$('structName').value,example:$('example').checked,repo:$('repo').checked})});
     const d=await r.json();
     if(d.error){ $('inHint').textContent='错误：'+d.error; $('inHint').className='hint warn'; return; }
     current.files=d.files; renderFiles();

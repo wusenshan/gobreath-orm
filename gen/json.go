@@ -146,5 +146,8 @@ func FromJSON(jsonStr string, opts Options) (map[string]string, error) {
 		}
 		files["models_gen.go"] = combined
 	}
+	if err := appendExtrasORM(files, tables, pkg, opts); err != nil {
+		return nil, err
+	}
 	return files, nil
 }

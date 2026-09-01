@@ -20,6 +20,8 @@ func main() {
 		pkg        = flag.String("pkg", "model", "生成代码的包名")
 		mode       = flag.String("mode", "perType", "DDL 输出方式：perType / twoFiles / singleFile")
 		tablePrefix = flag.String("table-prefix", "", "表前缀，仅作用于 TableName() 返回的物理表名")
+		example    = flag.Bool("example", true, "附带「生成物即所用」示例代码（example.go）")
+		repo       = flag.Bool("repo", false, "附带 Repo[T] 便捷构造脚手架（<struct>_repo.go）")
 		serve      = flag.Bool("serve", false, "启动本地 Web 生成器（ormgen serve）")
 		addr       = flag.String("addr", ":8080", "serve 监听地址")
 	)
@@ -31,12 +33,12 @@ func main() {
 	}
 
 	if *ddl != "" {
-		runDDL(*ddl, *dir, *pkg, *mode, *tablePrefix)
+		runDDL(*ddl, *dir, *pkg, *mode, *tablePrefix, *example, *repo)
 		return
 	}
 
 	if *jsonFile != "" {
-		runJSON(*jsonFile, *dir, *pkg, *mode)
+		runJSON(*jsonFile, *dir, *pkg, *mode, *example, *repo)
 		return
 	}
 
@@ -63,7 +65,7 @@ func main() {
 	fmt.Printf("ormgen: 已生成 %s/%s\n", *dir, outFile)
 }
 
-func runDDL(path, dir, pkg, mode string, tablePrefix string) {
+func runDDL(path, dir, pkg, mode string, tablePrefix string, example, repo bool) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ormgen: 读取 DDL 文件: %v\n", err)
@@ -81,6 +83,8 @@ func runDDL(path, dir, pkg, mode string, tablePrefix string) {
 		Dialect:     gen.TypeAuto,
 		Mode:        om,
 		TablePrefix: tablePrefix,
+		Example:     example,
+		Repo:        repo,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ormgen: %v\n", err)
@@ -100,7 +104,7 @@ func runDDL(path, dir, pkg, mode string, tablePrefix string) {
 	}
 }
 
-func runJSON(path, dir, pkg, mode string) {
+func runJSON(path, dir, pkg, mode string, example, repo bool) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ormgen: 读取 JSON 样例文件: %v\n", err)
@@ -116,6 +120,8 @@ func runJSON(path, dir, pkg, mode string) {
 	files, err := gen.FromJSON(string(data), gen.Options{
 		Package: pkg,
 		Mode:    om,
+		Example: example,
+		Repo:    repo,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ormgen: %v\n", err)
