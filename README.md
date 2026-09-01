@@ -139,6 +139,20 @@ func (User) TableName() string { return "users" }
 
 > 若字段名为 `ID` 或 `Id` 且未声明 `pk`，框架会自动把它当作主键。
 
+> ⚠️ **最常见的坑：`db` tag 必须用双引号包裹。**
+> 正确：`db:"id,pk,autoincrement"`（引号包裹）
+> 错误：`db:id,pk,autoincrement`（无引号）
+>
+> Go 的 struct tag 标准格式是 `key:"value"`。写成无引号的 `db:col,pk` 时，
+> `reflect` 读不到 `db` 这个 key，`Tag.Get("db")` 返回空字符串 —— 字段会退化成
+> 「只按字段名（蛇形）映射」，而你写的 `pk` / `autoincrement` 全部丢失。
+> 典型症状：**自增主键列被当成普通列、插入时写入 `0`**，SQL 形如
+> `INSERT INTO t (id, name) VALUES (0, 'x')`，且不会报任何错，极难排查。
+>
+> 从 v0.1.8 起，框架在解析模型时会**主动 panic 并给出明确提示**，不再静默退化：
+> `orm: 结构体 User 字段 Id 的 db tag 格式错误：缺少引号，正确写法是 db:"col,pk,autoincrement"`。
+> 升级后即可在启动第一时间发现这类笔误。
+
 ### 2. 打开连接
 
 推荐用结构体配置（`orm.Config`），字段具名、顺序无关，前缀 / 日志等一次性配齐：

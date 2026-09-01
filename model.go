@@ -77,6 +77,11 @@ func parseMeta(typ reflect.Type) *modelMeta {
 			continue
 		}
 		tag := f.Tag.Get("db")
+		// guard: db tag 必须用引号包裹（标准 struct tag 格式 `db:"col,pk"`）。
+		// 写成 `db:col,pk`（无引号）时 reflect 读不到 key，Tag.Get("db") 返回空，
+		// 字段会退化成「仅按字段名映射」，pk/autoincrement 等全部丢失，导致
+		// 自增主键被当成普通列写入 0 值 —— 这类问题很难排查，这里直接报错。
+		validateDbTag(string(f.Tag), typ.Name(), f.Name)
 		if tag == "-" {
 			m.fields = append(m.fields, fieldInfo{goName: f.Name, ignore: true})
 			continue
@@ -139,6 +144,19 @@ func parseMeta(typ reflect.Type) *modelMeta {
 		}
 	}
 	return m
+}
+
+// validateDbTag 检查 struct tag 原始字符串里是否出现了「无引号的 db tag」笔误。
+// 标准 struct tag 格式要求 `db:"col,pk"`（双引号包裹）；写成 `db:col,pk`（无引号）
+// 时 reflect 读不到 db key，Tag.Get("db") 返回空，pk/autoincrement 等修饰符全部
+// 丢失，自增主键会被当成普通列写入零值，且不会报任何错。这里在模型解析阶段直接 panic，
+// 把问题暴露在启动第一时间（go vet 也能静态拦这类笔误，但很多项目并不跑 vet）。
+func validateDbTag(raw, typeName, fieldName string) {
+	if raw == "" || !strings.Contains(raw, "db:") || strings.Contains(raw, `db:"`) {
+		return
+	}
+	panic(fmt.Errorf("orm: 结构体 %s 字段 %s 的 db tag 格式错误：缺少引号，正确写法是 `db:\"col,pk,autoincrement\"`，而不是 `db:col,pk`",
+		typeName, fieldName))
 }
 
 // resolveTable 返回逻辑表名，以及该表名是否来自 TableName() 显式指定。
