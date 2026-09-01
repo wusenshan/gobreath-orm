@@ -57,6 +57,14 @@
 
   <div class="toolbar">
     <span id="modeChip" class="badge" style="background:var(--info-bg);color:var(--info)">待识别</span>
+    <label>输入类型
+      <select id="kind">
+        <option value="auto">自动识别</option>
+        <option value="ddl">DDL 建表语句</option>
+        <option value="json">JSON 文档样例</option>
+        <option value="struct">Go 结构体</option>
+      </select>
+    </label>
     <label>方言
       <select id="dialect">
         <option value="auto">自动识别</option>
@@ -65,8 +73,8 @@
         <option value="sqlite">SQLite</option>
       </select>
     </label>
-    <label>上传 .go / .sql
-      <input type="file" id="upload" accept=".go,.sql,.txt">
+    <label>上传 .go / .sql / .json
+      <input type="file" id="upload" accept=".go,.sql,.json,.txt">
     </label>
   </div>
 
@@ -74,8 +82,8 @@
     <div class="col">
       <div class="card">
         <h2>输入 / Input</h2>
-        <textarea id="source" placeholder="粘贴 CREATE TABLE ... 或 type X struct { ... }"></textarea>
-        <div class="hint" id="inHint">支持多结构体 / 多表；自动识别 Go 与 DDL。</div>
+        <textarea id="source" placeholder="粘贴 CREATE TABLE ... / type X struct { ... } / JSON 文档样例"></textarea>
+        <div class="hint" id="inHint">支持多结构体 / 多表 / JSON 样例；自动识别 Go、DDL 与 JSON。</div>
       </div>
     </div>
     <div class="col">
@@ -105,6 +113,7 @@
         </select>
       </div>
       <div class="f"><label>表前缀</label><input type="text" id="prefix" value=""></div>
+      <div class="f"><label>结构体名（JSON/单表）</label><input type="text" id="structName" value="" placeholder="默认 Doc"></div>
       <div class="f"><label>严格 tag 校验</label>
         <select id="strict"><option value="off">关闭（默认）</option><option value="on">开启</option></select>
       </div>
@@ -146,6 +155,10 @@ const DEFAULT_DDL = `CREATE TABLE products (
 function detectKind(src){
   const low = src.toLowerCase();
   if (/create\s+table/.test(low)) return 'ddl';
+  const t = src.trim();
+  if(t.startsWith('{') || t.startsWith('[')){
+    try { JSON.parse(t); return 'json'; } catch(e){}
+  }
   if (/type\s+\w+\s+struct/.test(low) || /^package\s+/m.test(low)) return 'struct';
   return '';
 }
@@ -155,8 +168,9 @@ function refreshHint(){
   const chip = $('modeChip');
   if(!src){ chip.textContent='待识别'; return; }
   if(k==='ddl'){ chip.textContent='已识别：DDL'; }
+  else if(k==='json'){ chip.textContent='已识别：JSON 样例'; }
   else if(k==='struct'){ chip.textContent='已识别：Go struct'; }
-  else { chip.textContent='无法识别（请确认是 CREATE TABLE 或 Go struct）'; }
+  else { chip.textContent='无法识别（请确认是 CREATE TABLE / JSON 样例 / Go struct）'; }
 }
 $('source').addEventListener('input', refreshHint);
 
@@ -193,17 +207,20 @@ async function generate(){
   const now=Date.now();
   if(now-_lastGen<400) return;          // 防抖：避免点击「生成」按钮时 blur+click 双触发
   _lastGen=now;
-  const src=$('source').value; const kind=detectKind(src);
-  if(!kind){ $('inHint').textContent='无法识别输入类型，请粘贴 CREATE TABLE 或 Go struct。'; $('inHint').className='hint warn'; return; }
+  const src=$('source').value;
+  let kind=$('kind').value;
+  if(kind==='auto'){ kind=detectKind(src); }
+  if(!kind){ $('inHint').textContent='无法识别输入类型，请粘贴 CREATE TABLE / JSON 样例 / Go struct，或手动选择类型。'; $('inHint').className='hint warn'; return; }
   $('inHint').textContent='生成中…'; $('inHint').className='hint';
   updateCli(kind);
   try{
     const r=await fetch('/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({source:src,kind,dialect:$('dialect').value,pkg:$('pkg').value,mode:$('mode').value})});
+      body:JSON.stringify({source:src,kind,dialect:$('dialect').value,pkg:$('pkg').value,mode:$('mode').value,structName:$('structName').value})});
     const d=await r.json();
     if(d.error){ $('inHint').textContent='错误：'+d.error; $('inHint').className='hint warn'; return; }
     current.files=d.files; renderFiles();
-    $('modeChip').textContent=d.detected||(kind==='ddl'?'DDL':'Go struct');
+    const label={ddl:'DDL',json:'JSON 样例',struct:'Go struct'}[kind]||kind;
+    $('modeChip').textContent=d.detected||label;
     $('inHint').textContent='已生成 '+Object.keys(d.files).length+' 个文件。'; $('inHint').className='hint ok';
   }catch(err){ $('inHint').textContent='请求失败：'+err; $('inHint').className='hint warn'; }
 }

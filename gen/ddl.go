@@ -42,6 +42,7 @@ type Options struct {
 	Dialect     DDLType   // 显式指定方言；TypeAuto 时按内容嗅探
 	Mode        OutputMode // 输出文件组织方式
 	TablePrefix string    // 表前缀，仅作用于 TableName() 返回的物理表名
+	StructName  string    // 顶层模型结构体名覆盖（JSON 样例 / DDL 单表场景）；为空则用表名推断
 }
 
 // Column 是单列的解析结果。
@@ -525,6 +526,10 @@ func FromDDL(ddl string, opts Options) (map[string]string, error) {
 		} else {
 			names[i] = t.Name
 		}
+	}
+	// 结构体名覆盖（仅作用于首个表，单表 / JSON 场景）
+	if opts.StructName != "" && len(tables) > 0 {
+		tables[0].StructName = opts.StructName
 	}
 
 	files := map[string]string{}
