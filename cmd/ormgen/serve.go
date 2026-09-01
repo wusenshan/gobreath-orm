@@ -17,11 +17,14 @@ import (
 var assetsFS embed.FS
 
 type generateRequest struct {
-	Source  string `json:"source"`
-	Kind    string `json:"kind"` // "ddl" | "struct"
-	Dialect string `json:"dialect"`
-	Pkg     string `json:"pkg"`
-	Mode    string `json:"mode"`
+	Source     string `json:"source"`
+	Kind       string `json:"kind"` // "ddl" | "struct" | "json" | ""(自动)
+	Dialect    string `json:"dialect"`
+	Pkg        string `json:"pkg"`
+	Mode       string `json:"mode"`
+	StructName string `json:"structName"`
+	Example    bool   `json:"example"` // 附示例代码
+	Repo       bool   `json:"repo"`    // 附 Repo 脚手架
 }
 
 type generateResponse struct {
@@ -69,7 +72,22 @@ func generateHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp := generateResponse{Files: map[string]string{}}
-	switch req.Kind {
+	kind := req.Kind
+	if kind == "" || kind == "auto" {
+		kind = detectKindORM(req.Source)
+	}
+	om := gen.PerType
+	switch strings.ToLower(req.Mode) {
+	case "twofiles", "two":
+		om = gen.TwoFiles
+	case "singlefile", "single":
+		om = gen.SingleFile
+	}
+	pkg := req.Pkg
+	if pkg == "" {
+		pkg = "model"
+	}
+	switch kind {
 	case "ddl":
 		dt := gen.TypeAuto
 		switch strings.ToLower(req.Dialect) {
@@ -85,18 +103,15 @@ func generateHandler(w http.ResponseWriter, r *http.Request) {
 		} else {
 			resp.Detected = "DDL / " + dialectName(dt)
 		}
-		om := gen.PerType
-		switch strings.ToLower(req.Mode) {
-		case "twofiles", "two":
-			om = gen.TwoFiles
-		case "singlefile", "single":
-			om = gen.SingleFile
+		files, err := gen.FromDDL(req.Source, gen.Options{Package: pkg, Dialect: dt, Mode: om, StructName: req.StructName, Example: req.Example, Repo: req.Repo})
+		if err != nil {
+			resp.Error = err.Error()
+		} else {
+			resp.Files = files
 		}
-		pkg := req.Pkg
-		if pkg == "" {
-			pkg = "model"
-		}
-		files, err := gen.FromDDL(req.Source, gen.Options{Package: pkg, Dialect: dt, Mode: om})
+	case "json":
+		resp.Detected = "JSON 样例 / 推断 model"
+		files, err := gen.FromJSON(req.Source, gen.Options{Package: pkg, Mode: om, StructName: req.StructName, Example: req.Example, Repo: req.Repo})
 		if err != nil {
 			resp.Error = err.Error()
 		} else {
@@ -142,9 +157,31 @@ func generateHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		resp.Files = map[string]string{outFile: string(data)}
 	default:
-		resp.Error = "kind 必须是 ddl 或 struct"
+		resp.Error = "无法识别输入类型（请粘贴 CREATE TABLE / JSON 样例 / Go struct）"
 	}
 	writeJSON(w, resp)
+}
+
+// detectKindORM 按内容嗅探 ormgen 输入类型：DDL / JSON 样例 / Go struct。
+func detectKindORM(src string) string {
+	s := strings.TrimSpace(src)
+	if s == "" {
+		return ""
+	}
+	low := strings.ToLower(s)
+	if strings.Contains(low, "create table") {
+		return "ddl"
+	}
+	if strings.HasPrefix(s, "{") || strings.HasPrefix(s, "[") {
+		var probe any
+		if json.Unmarshal([]byte(s), &probe) == nil {
+			return "json"
+		}
+	}
+	if strings.Contains(s, "struct") && (strings.Contains(low, "type ") || strings.HasPrefix(low, "package")) {
+		return "struct"
+	}
+	return ""
 }
 
 func saveHandler(w http.ResponseWriter, r *http.Request) {

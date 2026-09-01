@@ -13,6 +13,10 @@
 - **输出方式 `-mode`**：`perType`（每表 `xxx.go` + `xxx_cols.go`，默认）/ `twoFiles`（合并 `models.go` + `columns.go`）/ `singleFile`（合并 `models_gen.go`，结构体与闭包同文件）。
 - **ormgen serve Web 生成器**：新增 `ormgen -serve`（默认 `:8080`）——纯 `net/http` + `//go:embed` 内嵌 HTML 页面，**零额外依赖**。页面左右分屏：左屏粘贴 / 上传 `.go` 或 `.sql`，自动识别 struct 与 DDL，可选数据库类型与生成参数；右屏展示生成文件（按文件切换、一键复制 / 复制全部 / 下载）；附**可复制的等价 CLI 命令**；文件输出支持「覆盖 / 存在跳过」与浏览器下载。struct 模式按粘贴源码批量生成列闭包，DDL 模式按建表语句生成 model + 闭包；CLI 与 HTTP **共用同一 `gen` 内核**。生成器不保证输出可直接编译，命名 / 包冲突由开发自行处理。
 - **修复**：DDL 解析器对 `bigserial` / `smallserial` 的 `autoincrement` tag 推断此前仅匹配前缀 `serial` 而漏判，现改为包含匹配，PG 大整型自增主键正确输出 `db:"id,pk,autoincrement"`。
+- **ormgen JSON 样例推断（B 组「更聪明输入」）**：新增 `ormgen -json <sample.json>`——粘贴一份 JSON 文档样例即可推断 Go 结构体与 `ColOf` 列闭包（扁平推断：`float64` 按无小数判定 `int64`/`float64`、`"2024-..T..Z"` 识别 `time.Time`、`nil`→`any`、嵌套对象退化为 `map[string]any`、数组取首元素类型）。Web 端与 DDL / struct 共用自动嗅探（`detectKind`：建表语句→ddl、`{`/`[` 且可 `json.Unmarshal`→json、`struct`+`type `/`package`→struct），无需手动选类型。`gen` 包新增 `ParseJSONSample` / `FromJSON`（`gen/json.go` + `gen/json_test.go`）。
+- **生成物即所用（C 组）**：`ormgen` / `esgen` 生成后默认附带 `example.go`——可直接复制到业务代码的「零字段名」示例（orm: 插入 / 查询 / 更新删除 / Repo / 向量近邻 `NearestBy` 五段；es: 写入 / 检索 / 向量 kNN `Nearest().KnnNumCandidates` 三段），占位 `exampleDB` / `exampleClient` 避免引入具体驱动依赖；可用 `-example=false` 关闭。
+- **工程化（D 组）**：新增 `Repo[T]` 便捷构造脚手架 `-repo`（orm: `<Struct>_repo.go` 的 `New<Struct>Repo(db)`；es: `<struct>_repo.go` 的 `New<Struct>Repo(cli)`），等价于 `orm.NewRepo[T](...)` / `es.NewRepo[T](...)`，默认关闭。生成物统一 `gofmt`（Web 与 CLI 共用 `format.Source`）。
+- **软删除字段自包含识别（C 组）**：DDL / JSON 生成 model 时，命中 `deleted_at` / `deleted` / `is_deleted` / `is_del` / `del_at` 等命名且类型为 `time.Time`/`bool`/`int*` 的字段，自动加 `,logic` tag 并附注释——无需在 `orm.Config` 里配置 `SoftDeleteField` 即生效逻辑删除（软删字段在示例插入段被自动跳过，留零值由框架填充）。
 
 ## v0.1.7 (2026-08-30)
 
