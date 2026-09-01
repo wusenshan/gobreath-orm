@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gobreath-orm gen</title>
+<style>
+  :root{
+    --bg:#ffffff; --panel:#f7f8fa; --line:#e3e6ea; --text:#1f2937; --muted:#6b7280;
+    --info:#185fa5; --info-bg:#e6f1fb; --ok:#3b6d11; --ok-bg:#eaf3de; --warn:#854f0b; --warn-bg:#faefda;
+    --radius:12px;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;color:var(--text);background:var(--bg)}
+  .wrap{max-width:1100px;margin:0 auto;padding:20px}
+  header{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+  h1{font-size:18px;margin:0}
+  .sub{font-size:13px;color:var(--muted);margin:2px 0 0}
+  .badge{font-size:12px;background:var(--ok-bg);color:var(--ok);border-radius:99px;padding:4px 10px}
+  .toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:10px 0}
+  select,input,textarea,button{font-family:inherit;font-size:13px;color:var(--text)}
+  select,input[type=text]{padding:6px 8px;border:1px solid var(--line);border-radius:8px;background:var(--bg)}
+  button{padding:6px 12px;border:1px solid var(--line);border-radius:8px;background:var(--bg);cursor:pointer}
+  button.primary{background:var(--info);color:#fff;border-color:var(--info)}
+  textarea{width:100%;height:300px;padding:10px;border:1px solid var(--line);border-radius:8px;background:var(--panel);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;line-height:1.5;resize:vertical}
+  .split{display:flex;gap:12px;flex-wrap:wrap}
+  .col{flex:1 1 360px;min-width:320px;display:flex;flex-direction:column}
+  .card{border:1px solid var(--line);border-radius:var(--radius);padding:12px 14px;background:var(--bg)}
+  .card h2{font-size:13px;font-weight:600;margin:0 0 8px}
+  .hint{font-size:12px;margin:6px 0 0}
+  .hint.ok{color:var(--ok)} .hint.warn{color:var(--warn)}
+  .filelist{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}
+  .filelist button{font-size:12px;padding:4px 10px}
+  .filelist button.active{background:var(--info-bg);border-color:var(--info);color:var(--info)}
+  pre{margin:0;padding:10px;border:1px solid var(--line);border-radius:8px;background:var(--panel);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;line-height:1.5;white-space:pre;overflow:auto;max-height:320px}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:10px 0}
+  .row label{font-size:12px;color:var(--muted)}
+  .params{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:10px 0}
+  .params .f{display:flex;flex-direction:column;gap:4px}
+  .params .f label{font-size:12px;color:var(--muted)}
+  .cmd{display:flex;align-items:center;gap:10px;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-family:ui-monospace,monospace;font-size:12px;margin-top:10px}
+  .cmd code{flex:1;overflow:auto;white-space:nowrap}
+  .outbar{display:flex;gap:8px;align-items:center;margin:8px 0}
+  .foot{font-size:12px;color:var(--muted);margin-top:8px}
+  .status{font-size:12px;color:var(--ok);margin-top:6px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>gobreath-orm gen</h1>
+      <p class="sub">粘贴 Go 结构体或 DDL，一键生成 model + 列闭包</p>
+    </div>
+    <span class="badge">零依赖 · AI 原生</span>
+  </header>
+
+  <div class="toolbar">
+    <span id="modeChip" class="badge" style="background:var(--info-bg);color:var(--info)">待识别</span>
+    <label>输入类型
+      <select id="kind">
+        <option value="auto">自动识别</option>
+        <option value="ddl">DDL 建表语句</option>
+        <option value="json">JSON 文档样例</option>
+        <option value="struct">Go 结构体</option>
+      </select>
+    </label>
+    <label>方言
+      <select id="dialect">
+        <option value="auto">自动识别</option>
+        <option value="postgres">PostgreSQL</option>
+        <option value="mysql">MySQL</option>
+        <option value="sqlite">SQLite</option>
+      </select>
+    </label>
+    <label>上传 .go / .sql / .json
+      <input type="file" id="upload" accept=".go,.sql,.json,.txt">
+    </label>
+  </div>
+
+  <div class="split">
+    <div class="col">
+      <div class="card">
+        <h2>输入 / Input</h2>
+        <textarea id="source" placeholder="粘贴 CREATE TABLE ... / type X struct { ... } / JSON 文档样例"></textarea>
+        <div class="hint" id="inHint">支持多结构体 / 多表 / JSON 样例；自动识别 Go、DDL 与 JSON。</div>
+      </div>
+    </div>
+    <div class="col">
+      <div class="card">
+        <h2>生成结果 / Output</h2>
+        <div class="filelist" id="fileList"></div>
+        <pre id="out">（点击「生成」后在此显示）</pre>
+        <div class="outbar">
+          <button class="primary" id="genBtn">生成</button>
+          <button id="copyOne">复制</button>
+          <button id="copyAll">复制全部</button>
+          <button id="dlCur">下载当前</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:12px">
+    <h2>生成参数 / Gen Params</h2>
+    <div class="params">
+      <div class="f"><label>包名 Package</label><input type="text" id="pkg" value="model"></div>
+      <div class="f"><label>输出方式</label>
+        <select id="mode">
+          <option value="perType">按类型分文件</option>
+          <option value="twoFiles">合并双文件</option>
+          <option value="singleFile">合并单文件</option>
+        </select>
+      </div>
+      <div class="f"><label>表前缀</label><input type="text" id="prefix" value=""></div>
+      <div class="f"><label>结构体名（JSON/单表）</label><input type="text" id="structName" value="" placeholder="默认 Doc"></div>
+      <div class="f"><label>严格 tag 校验</label>
+        <select id="strict"><option value="off">关闭（默认）</option><option value="on">开启</option></select>
+      </div>
+    </div>
+    <div class="row" style="margin-top:6px">
+      <label><input type="checkbox" id="example" checked> 附示例代码（example.go）</label>
+      <label><input type="checkbox" id="repo"> 生成 Repo 脚手架（&lt;struct&gt;_repo.go）</label>
+    </div>
+    <div class="cmd">
+      <code id="cliCmd">go run github.com/wusenshan/gobreath-orm/cmd/ormgen -type User -dir ./generated</code>
+      <button id="copyCli">复制命令</button>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:12px">
+    <h2>输出文件 / File Output</h2>
+    <div class="row">
+      <label>输出目录
+        <input type="text" id="outDir" value="./generated" style="min-width:220px">
+      </label>
+      <label><input type="checkbox" id="skip"> 存在时跳过</label>
+      <button id="saveBtn">写入文件</button>
+      <span class="status" id="saveStatus"></span>
+    </div>
+    <div class="foot">默认覆盖已存在文件（黄字提示不保证生成代码可直接编译，命名 / 包冲突由开发自行处理）。</div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let current = { files: {}, active: null };
+
+// 首次进入的默认示例（含向量字段，呼应 AI 原生定位）：打开页面即见效果
+const DEFAULT_DDL = `CREATE TABLE products (
+    id          bigserial PRIMARY KEY,
+    name        varchar(120) NOT NULL,
+    price       numeric(10,2),
+    description text,
+    embedding   vector(128),
+    created_at  timestamptz DEFAULT now()
+);`;
+
+function detectKind(src){
+  const low = src.toLowerCase();
+  if (/create\s+table/.test(low)) return 'ddl';
+  const t = src.trim();
+  if(t.startsWith('{') || t.startsWith('[')){
+    try { JSON.parse(t); return 'json'; } catch(e){}
+  }
+  if (/type\s+\w+\s+struct/.test(low) || /^package\s+/m.test(low)) return 'struct';
+  return '';
+}
+function refreshHint(){
+  const src = $('source').value.trim();
+  const k = detectKind(src);
+  const chip = $('modeChip');
+  if(!src){ chip.textContent='待识别'; return; }
+  if(k==='ddl'){ chip.textContent='已识别：DDL'; }
+  else if(k==='json'){ chip.textContent='已识别：JSON 样例'; }
+  else if(k==='struct'){ chip.textContent='已识别：Go struct'; }
+  else { chip.textContent='无法识别（请确认是 CREATE TABLE / JSON 样例 / Go struct）'; }
+}
+$('source').addEventListener('input', refreshHint);
+
+$('upload').addEventListener('change', e=>{
+  const f = e.target.files[0]; if(!f) return;
+  const rd = new FileReader();
+  rd.onload = ()=>{ $('source').value = rd.result; refreshHint(); };
+  rd.readAsText(f);
+});
+
+function renderFiles(){
+  const list = $('fileList'); list.innerHTML='';
+  const names = Object.keys(current.files);
+  if(names.length===0){ $('out').textContent='（无输出）'; return; }
+  names.forEach((n,i)=>{
+    const b=document.createElement('button');
+    b.textContent=n; if(i===0) b.classList.add('active');
+    b.onclick=()=>{ current.active=n; [...list.children].forEach(c=>c.classList.remove('active')); b.classList.add('active'); $('out').textContent=current.files[n]; };
+    list.appendChild(b);
+  });
+  current.active=names[0]; $('out').textContent=current.files[names[0]];
+}
+
+function updateCli(kind){
+  const pkg=$('pkg').value||'model', mode=$('mode').value;
+  let cmd;
+  if(kind==='ddl'){ cmd=`go run github.com/wusenshan/gobreath-orm/cmd/ormgen -ddl schema.sql -pkg ${pkg} -mode ${mode} -dir ./generated`; }
+  else { cmd=`go run github.com/wusenshan/gobreath-orm/cmd/ormgen -type User -pkg ${pkg} -dir ./generated`; }
+  $('cliCmd').textContent=cmd;
+}
+
+let _lastGen=0;
+async function generate(){
+  const now=Date.now();
+  if(now-_lastGen<400) return;          // 防抖：避免点击「生成」按钮时 blur+click 双触发
+  _lastGen=now;
+  const src=$('source').value;
+  let kind=$('kind').value;
+  if(kind==='auto'){ kind=detectKind(src); }
+  if(!kind){ $('inHint').textContent='无法识别输入类型，请粘贴 CREATE TABLE / JSON 样例 / Go struct，或手动选择类型。'; $('inHint').className='hint warn'; return; }
+  $('inHint').textContent='生成中…'; $('inHint').className='hint';
+  updateCli(kind);
+  try{
+    const r=await fetch('/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({source:src,kind,dialect:$('dialect').value,pkg:$('pkg').value,mode:$('mode').value,structName:$('structName').value,example:$('example').checked,repo:$('repo').checked})});
+    const d=await r.json();
+    if(d.error){ $('inHint').textContent='错误：'+d.error; $('inHint').className='hint warn'; return; }
+    current.files=d.files; renderFiles();
+    const label={ddl:'DDL',json:'JSON 样例',struct:'Go struct'}[kind]||kind;
+    $('modeChip').textContent=d.detected||label;
+    $('inHint').textContent='已生成 '+Object.keys(d.files).length+' 个文件。'; $('inHint').className='hint ok';
+  }catch(err){ $('inHint').textContent='请求失败：'+err; $('inHint').className='hint warn'; }
+}
+$('genBtn').onclick=generate;
+
+// 光标离开输入块即主动生成一次（加强体验）；点击其它按钮时不重复触发，避免抖动
+$('source').addEventListener('blur', e=>{
+  const src=$('source').value.trim();
+  if(!src) return;                       // 空输入不自动生成
+  if(!detectKind(src)) return;          // 无法识别也不自动生成（避免无谓报错）
+  const t=e.relatedTarget;
+  if(t && t.tagName==='BUTTON') return; // 焦点移到按钮（复制/下载/生成等）交给对应点击处理
+  generate();
+});
+
+function copy(text){ navigator.clipboard.writeText(text); }
+$('copyOne').onclick=()=>{ if(current.active) copy(current.files[current.active]); };
+$('copyAll').onclick=()=>{ copy(Object.values(current.files).join('\n\n')); };
+$('copyCli').onclick=()=>copy($('cliCmd').textContent);
+$('dlCur').onclick=()=>{
+  if(!current.active) return;
+  const b=new Blob([current.files[current.active]],{type:'text/plain'});
+  const a=document.createElement('a'); a.href=URL.createObjectURL(b); a.download=current.active; a.click();
+};
+
+$('saveBtn').onclick=async()=>{
+  const dir=$('outDir').value; if(!dir){ $('saveStatus').textContent='请填写输出目录'; return; }
+  const r=await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({dir,files:current.files,skipExisting:$('skip').checked})});
+  const d=await r.json();
+  if(d.error){ $('saveStatus').textContent='保存失败：'+d.error; $('saveStatus').style.color='var(--warn)'; return; }
+  $('saveStatus').textContent='已写入 '+d.written.length+' 个，跳过 '+d.skipped.length+' 个'; $('saveStatus').style.color='var(--ok)';
+};
+
+// 首次进入：若输入为空则填默认示例并自动生成一次，降低上手门槛
+if(!$('source').value.trim()){
+  $('source').value = DEFAULT_DDL;
+  $('dialect').value = 'postgres';
+  refreshHint();
+  generate();
+}
+</script>
+</body>
+</html>

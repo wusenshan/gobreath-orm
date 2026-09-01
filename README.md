@@ -503,6 +503,26 @@ q := orm.NewQuery[User]().
 
 > 推荐：每个模型文件顶上加一行 `//go:generate`，保存或 CI 时跑 `go generate ./...`，列名集合会自动保持同步。
 
+### 从 DDL 生成（ormgen -ddl）与 Web 生成器（ormgen serve）
+
+除了给已有结构体补列闭包，`ormgen` 还能**直接从建表语句生成模型 + 列闭包**（适合已有库、不想手搓 struct 的新手）：
+
+```bash
+# 从建表语句生成（自动嗅探 PG/MySQL/SQLite 方言，不依赖扩展名）
+go run github.com/wusenshan/gobreath-orm/cmd/ormgen -ddl schema.sql -pkg model -mode perType -dir ./generated
+```
+
+- 支持单文件内多张表、`serial`/`bigserial`/`AUTO_INCREMENT`/`AUTOINCREMENT` 自增、`vector(N)` → `[]float32` + `,vector(N)`、引号标识符与 `schema.表` 限定名。
+- `-mode`：`perType`（每表 `xxx.go`+`xxx_cols.go`，默认）/`twoFiles`（合并 `models.go`+`columns.go`）/`singleFile`（合并 `models_gen.go`，结构体与闭包同文件）。
+
+也可以启动**本地 Web 生成器**：粘贴 Go 结构体或 DDL、左右分屏预览、一键复制 / 下载、还能复制等价 CLI 命令：
+
+```bash
+go run github.com/wusenshan/gobreath-orm/cmd/ormgen -serve   # 默认 http://:8080
+```
+
+> 生成器仅做文本解析、零依赖、绝不执行上传内容；输出不保证可直接编译，命名 / 包冲突由开发自行处理。
+
 ### OR 与条件块
 
 ```go
