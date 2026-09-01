@@ -84,6 +84,17 @@ func DetectDialect(ddl string) DDLType {
 	}
 }
 
+// lineOf 返回 src 中字符索引 idx 所在的行号（从 1 开始），用于解析错误精确定位。
+func lineOf(src string, idx int) int {
+	if idx < 0 {
+		idx = 0
+	}
+	if idx > len(src) {
+		idx = len(src)
+	}
+	return strings.Count(src[:idx], "\n") + 1
+}
+
 // ParseDDL 解析一段 DDL 文本，返回其中所有 CREATE TABLE 对应的表结构。
 // 支持 IF NOT EXISTS、schema 限定名（public.users）、引号标识符、多条 CREATE TABLE。
 func ParseDDL(ddl string, dt DDLType) ([]Table, error) {
@@ -155,7 +166,7 @@ func ParseDDL(ddl string, dt DDLType) ([]Table, error) {
 		body := src[bodyStart:k]
 		j = k + 1
 
-		tbl, err := parseTableBody(rawName, body, dt)
+		tbl, err := parseTableBody(rawName, body, src, dt, bodyStart)
 		if err != nil {
 			return nil, err
 		}
@@ -168,15 +179,18 @@ func ParseDDL(ddl string, dt DDLType) ([]Table, error) {
 	return tables, nil
 }
 
-func parseTableBody(rawName, body string, dt DDLType) (Table, error) {
+func parseTableBody(rawName, body, src string, dt DDLType, base int) (Table, error) {
 	name := stripSchema(rawName)
 	tbl := Table{Name: name, StructName: toGoName(name)}
 	defs := splitTopLevel(body)
 	pkCols := map[string]bool{}
 	seen := map[string]bool{}
+	scanned := 0
 	for _, d := range defs {
+		raw := d
 		d = strings.TrimSpace(d)
 		if d == "" {
+			scanned += len(raw)
 			continue
 		}
 		low := strings.ToLower(d)
@@ -191,10 +205,13 @@ func parseTableBody(rawName, body string, dt DDLType) (Table, error) {
 			strings.HasPrefix(low, "index") || strings.HasPrefix(low, "check") {
 			continue
 		}
+		off := strings.Index(body[scanned:], d)
+		line := lineOf(src, base+scanned+off)
 		col, err := parseColumn(d, dt)
 		if err != nil {
-			return tbl, err
+			return tbl, fmt.Errorf("第 %d 行: %v", line, err)
 		}
+		scanned += off + len(d)
 		// 保证 Go 字段名在表内唯一
 		gn := col.GoName
 		if seen[gn] {
@@ -216,7 +233,7 @@ func parseTableBody(rawName, body string, dt DDLType) (Table, error) {
 		}
 	}
 	if len(tbl.Columns) == 0 {
-		return tbl, fmt.Errorf("ormgen: 表 %s 没有解析到列", rawName)
+		return tbl, fmt.Errorf("ormgen: 表 %s 没有解析到列（约第 %d 行）", rawName, lineOf(src, base))
 	}
 	for _, c := range tbl.Columns {
 		if c.GoType == "time.Time" {

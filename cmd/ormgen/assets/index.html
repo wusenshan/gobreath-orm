@@ -133,6 +133,16 @@
 const $ = id => document.getElementById(id);
 let current = { files: {}, active: null };
 
+// 首次进入的默认示例（含向量字段，呼应 AI 原生定位）：打开页面即见效果
+const DEFAULT_DDL = `CREATE TABLE products (
+    id          bigserial PRIMARY KEY,
+    name        varchar(120) NOT NULL,
+    price       numeric(10,2),
+    description text,
+    embedding   vector(128),
+    created_at  timestamptz DEFAULT now()
+);`;
+
 function detectKind(src){
   const low = src.toLowerCase();
   if (/create\s+table/.test(low)) return 'ddl';
@@ -227,6 +237,14 @@ $('saveBtn').onclick=async()=>{
   if(d.error){ $('saveStatus').textContent='保存失败：'+d.error; $('saveStatus').style.color='var(--warn)'; return; }
   $('saveStatus').textContent='已写入 '+d.written.length+' 个，跳过 '+d.skipped.length+' 个'; $('saveStatus').style.color='var(--ok)';
 };
+
+// 首次进入：若输入为空则填默认示例并自动生成一次，降低上手门槛
+if(!$('source').value.trim()){
+  $('source').value = DEFAULT_DDL;
+  $('dialect').value = 'postgres';
+  refreshHint();
+  generate();
+}
 </script>
 </body>
 </html>
