@@ -2,10 +2,17 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/)。
 
-## v0.1.8 (unreleased)
+## v0.1.8 (2026-09-01)
 
 - **PostgreSQL 自增主键回填修复（重要 bugfix）**：此前 `Insert` 仅靠 `sql.Result.LastInsertId()` 回填自增主键，但 **pgx 经 `database/sql` 不支持 `LastInsertId()`**（返回 error 后被静默吞掉），导致 PG 下 `u.Id` 始终为 `0`。现给 `Dialect` 接口新增 `SupportsLastInsertID() bool` 与 `InsertReturning(pkCol string) string`：MySQL / SQLite 维持 `LastInsertId()` 路径；PostgreSQL 自动改用 `INSERT ... RETURNING "id"` + 扫描单行回填，对调用方透明。另新增 `Executor.QueryRowContext`（及 `DB.queryRowContext`，按写操作 `HookKindExec` 上报日志/钩子）支撑该路径。`Insert` 现已三方言均正确回填主键（`crud.go` + `dialect.go` + `executor.go` + `pkwriteback_test.go`，含 mock 驱动验证 PG RETURNING 回填）。
 - **db tag 格式防呆（开关控制，默认关闭）**：`orm.Config` 新增 `StrictTagCheck bool`（默认 `false`）。开启后，模型解析阶段（`parseMeta` 及缓存命中补校验）会校验 `db` tag 是否使用标准引号格式；写成 `db:col,pk`（无引号）时 `reflect` 读不到 `db` key，导致 `pk` / `autoincrement` 等修饰符全部丢失，自增主键会被当成普通列写入 `0` 值且不报错——此时**直接 panic** 并给出明确提示（`orm: 结构体 X 字段 Y 的 db tag 格式错误：缺少引号，正确写法是 db:"col,pk,autoincrement"`）。默认关闭以兼容旧行为；一旦任一 `Open` 开启 `StrictTagCheck`，全局进入严格模式（`strictTagCheck` 包级 atomic，仅增不减，越严越安全）。`go vet` 也能静态拦截同类笔误，此开关作为运行时兜底（`model.go` + `executor.go` + `model_test.go`）。
+
+## v0.1.9 (unreleased)
+
+- **ormgen DDL 模式（从建表语句生成模型 + 列闭包）**：`cmd/ormgen` 新增 `-ddl <file.sql>`，直接解析 `CREATE TABLE` 生成 Go 结构体（含 `TableName()` 锁定物理表名）与 `ColOf` 列闭包文件。`gen` 包新增 `ParseDDL` / `FromDDL`：支持 **PG / MySQL / SQLite** 类型映射、`serial`/`bigserial`/`AUTO_INCREMENT`/`AUTOINCREMENT` 自增识别、`vector(N)` → `[]float32` + `,vector(N)` tag、`NOT NULL` / `DEFAULT` / `PRIMARY KEY`（列级与表级）、引号标识符与 `schema.表` 限定名、**单文件内多张表**。方言按内容嗅探（`DetectDialect`，不依赖扩展名）：`serial`/`vector(`/`::` → PG，`AUTO_INCREMENT`/`ENGINE=` → MySQL，`AUTOINCREMENT` → SQLite。
+- **输出方式 `-mode`**：`perType`（每表 `xxx.go` + `xxx_cols.go`，默认）/ `twoFiles`（合并 `models.go` + `columns.go`）/ `singleFile`（合并 `models_gen.go`，结构体与闭包同文件）。
+- **ormgen serve Web 生成器**：新增 `ormgen -serve`（默认 `:8080`）——纯 `net/http` + `//go:embed` 内嵌 HTML 页面，**零额外依赖**。页面左右分屏：左屏粘贴 / 上传 `.go` 或 `.sql`，自动识别 struct 与 DDL，可选数据库类型与生成参数；右屏展示生成文件（按文件切换、一键复制 / 复制全部 / 下载）；附**可复制的等价 CLI 命令**；文件输出支持「覆盖 / 存在跳过」与浏览器下载。struct 模式按粘贴源码批量生成列闭包，DDL 模式按建表语句生成 model + 闭包；CLI 与 HTTP **共用同一 `gen` 内核**。生成器不保证输出可直接编译，命名 / 包冲突由开发自行处理。
+- **修复**：DDL 解析器对 `bigserial` / `smallserial` 的 `autoincrement` tag 推断此前仅匹配前缀 `serial` 而漏判，现改为包含匹配，PG 大整型自增主键正确输出 `db:"id,pk,autoincrement"`。
 
 ## v0.1.7 (2026-08-30)
 
