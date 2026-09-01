@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -27,6 +28,7 @@ type fieldInfo struct {
 	unique  bool    // true 表示该列需唯一约束（db tag 含 ",unique"），仅 AutoMigrate 使用
 	index   bool    // true 表示该列需二级索引（db tag 含 ",index"），仅 AutoMigrate 使用
 	typ     reflect.Type
+	rawTag  string  // 原始 struct tag 字符串（仅用于 StrictTagCheck 模式下的格式校验）
 }
 
 // modelMeta 一张表的模型元数据（字段、列、主键）。
@@ -39,9 +41,16 @@ type modelMeta struct {
 	logicCol      *fieldInfo // 逻辑删除列（db tag 含 ",logic" 时非空）
 	logicIsTime   bool       // true 表示逻辑列是 time.Time/*time.Time，未删除判定为 IS NULL；否则 = 0
 	versionCol    *fieldInfo // 乐观锁版本列（db tag 含 ",version" 时非空）
+	tagChecked    bool       // 是否已在 StrictTagCheck 模式下校验过 tag 格式（避免重复校验）
 }
 
 var metaCache sync.Map
+
+// strictTagCheck 为 true 时，模型解析阶段会对 db tag 做严格格式校验
+// （无引号的 `db:col,pk` 会直接 panic）。默认 false（兼容旧行为，不校验）。
+// 仅增不减：只要进程内任一 Open 开启了 StrictTagCheck，全局即进入严格模式
+// （越严格越安全，且避免缓存命中的模型漏校验）。
+var strictTagCheck atomic.Bool
 
 type tableNamer interface{ TableName() string }
 
@@ -61,7 +70,17 @@ func getMetaOf(v reflect.Value) *modelMeta {
 
 func getMetaByType(typ reflect.Type) *modelMeta {
 	if v, ok := metaCache.Load(typ); ok {
-		return v.(*modelMeta)
+		m := v.(*modelMeta)
+		// 严格模式开启后，若此前以非严格模式缓存过（未校验），补校验一次。
+		if strictTagCheck.Load() && !m.tagChecked {
+			for _, f := range m.fields {
+				if f.rawTag != "" {
+					validateDbTag(f.rawTag, typ.Name(), f.goName)
+				}
+			}
+			m.tagChecked = true
+		}
+		return m
 	}
 	m := parseMeta(typ)
 	metaCache.Store(typ, m)
@@ -77,16 +96,19 @@ func parseMeta(typ reflect.Type) *modelMeta {
 			continue
 		}
 		tag := f.Tag.Get("db")
-		// guard: db tag 必须用引号包裹（标准 struct tag 格式 `db:"col,pk"`）。
-		// 写成 `db:col,pk`（无引号）时 reflect 读不到 key，Tag.Get("db") 返回空，
-		// 字段会退化成「仅按字段名映射」，pk/autoincrement 等全部丢失，导致
-		// 自增主键被当成普通列写入 0 值 —— 这类问题很难排查，这里直接报错。
-		validateDbTag(string(f.Tag), typ.Name(), f.Name)
+		raw := string(f.Tag)
+		// guard（仅 StrictTagCheck 模式）：db tag 必须用引号包裹（标准 struct tag 格式
+		// `db:"col,pk"`）。写成 `db:col,pk`（无引号）时 reflect 读不到 key，Tag.Get("db")
+		// 返回空，字段会退化成「仅按字段名映射」，pk/autoincrement 等全部丢失，导致自增主键
+		// 被当成普通列写入 0 值 —— 这类问题很难排查。默认关闭以兼容旧行为；开启后启动即 panic。
+		if strictTagCheck.Load() {
+			validateDbTag(raw, typ.Name(), f.Name)
+		}
 		if tag == "-" {
-			m.fields = append(m.fields, fieldInfo{goName: f.Name, ignore: true})
+			m.fields = append(m.fields, fieldInfo{goName: f.Name, ignore: true, rawTag: raw})
 			continue
 		}
-		fi := fieldInfo{goName: f.Name, typ: f.Type}
+		fi := fieldInfo{goName: f.Name, typ: f.Type, rawTag: raw}
 		if tag != "" {
 			parts := strings.Split(tag, ",")
 			fi.colName = parts[0]
@@ -143,6 +165,7 @@ func parseMeta(typ reflect.Type) *modelMeta {
 			}
 		}
 	}
+	m.tagChecked = strictTagCheck.Load()
 	return m
 }
 

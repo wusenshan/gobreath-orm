@@ -149,9 +149,11 @@ func (User) TableName() string { return "users" }
 > 典型症状：**自增主键列被当成普通列、插入时写入 `0`**，SQL 形如
 > `INSERT INTO t (id, name) VALUES (0, 'x')`，且不会报任何错，极难排查。
 >
-> 从 v0.1.8 起，框架在解析模型时会**主动 panic 并给出明确提示**，不再静默退化：
+> **防呆开关（默认关闭）**：从 v0.1.8 起，可在 `orm.Open(orm.Config{StrictTagCheck: true})`
+> 中开启严格校验。开启后，解析模型时遇到无引号 `db` tag 会**主动 panic** 并提示：
 > `orm: 结构体 User 字段 Id 的 db tag 格式错误：缺少引号，正确写法是 db:"col,pk,autoincrement"`。
-> 升级后即可在启动第一时间发现这类笔误。
+> 默认关闭是为了兼容旧行为（不校验）；一旦任一 `Open` 开启，全局进入严格模式（越严越安全）。
+> `go vet` 也能静态拦截同类笔误，此开关作为运行时兜底，建议在 CI / 启动阶段开启以便第一时间暴露。
 
 ### 2. 打开连接
 

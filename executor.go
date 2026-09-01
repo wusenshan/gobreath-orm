@@ -113,6 +113,13 @@ type Config struct {
 	// "WHERE version = ?" 并在 SET 中 "version = version + 1"，
 	// 受影响行数为 0 时返回 ErrOptimisticLock。
 	OptimisticField string
+
+	// StrictTagCheck 严格校验 struct tag 格式（默认 false）。
+	// 开启后，模型解析阶段会校验 db tag 是否使用标准引号格式 `db:"col,pk"`；
+	// 若写成无引号的 `db:col,pk`，reflect 读不到 db key 会导致 pk/autoincrement
+	// 等修饰符静默丢失（自增主键被写入 0 值且不报错），此时直接 panic 暴露问题。
+	// 默认关闭以兼容旧行为；一旦任一 Open 开启，全局进入严格模式（越严越安全）。
+	StrictTagCheck bool
 }
 
 // Open 用标准 database/sql 打开连接，并按驱动名选择方言。
@@ -188,6 +195,9 @@ func Open(args ...any) (*DB, error) {
 	}
 	if cfg.OptimisticField != "" {
 		db = db.WithOptimisticField(cfg.OptimisticField)
+	}
+	if cfg.StrictTagCheck {
+		strictTagCheck.Store(true)
 	}
 	return db, nil
 }
