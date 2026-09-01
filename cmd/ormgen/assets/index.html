@@ -65,7 +65,6 @@
         <option value="sqlite">SQLite</option>
       </select>
     </label>
-    <button class="primary" id="genBtn">生成</button>
     <label>上传 .go / .sql
       <input type="file" id="upload" accept=".go,.sql,.txt">
     </label>
@@ -85,6 +84,7 @@
         <div class="filelist" id="fileList"></div>
         <pre id="out">（点击「生成」后在此显示）</pre>
         <div class="outbar">
+          <button class="primary" id="genBtn">生成</button>
           <button id="copyOne">复制</button>
           <button id="copyAll">复制全部</button>
           <button id="dlCur">下载当前</button>
@@ -178,7 +178,11 @@ function updateCli(kind){
   $('cliCmd').textContent=cmd;
 }
 
-$('genBtn').onclick=async()=>{
+let _lastGen=0;
+async function generate(){
+  const now=Date.now();
+  if(now-_lastGen<400) return;          // 防抖：避免点击「生成」按钮时 blur+click 双触发
+  _lastGen=now;
   const src=$('source').value; const kind=detectKind(src);
   if(!kind){ $('inHint').textContent='无法识别输入类型，请粘贴 CREATE TABLE 或 Go struct。'; $('inHint').className='hint warn'; return; }
   $('inHint').textContent='生成中…'; $('inHint').className='hint';
@@ -192,7 +196,18 @@ $('genBtn').onclick=async()=>{
     $('modeChip').textContent=d.detected||(kind==='ddl'?'DDL':'Go struct');
     $('inHint').textContent='已生成 '+Object.keys(d.files).length+' 个文件。'; $('inHint').className='hint ok';
   }catch(err){ $('inHint').textContent='请求失败：'+err; $('inHint').className='hint warn'; }
-};
+}
+$('genBtn').onclick=generate;
+
+// 光标离开输入块即主动生成一次（加强体验）；点击其它按钮时不重复触发，避免抖动
+$('source').addEventListener('blur', e=>{
+  const src=$('source').value.trim();
+  if(!src) return;                       // 空输入不自动生成
+  if(!detectKind(src)) return;          // 无法识别也不自动生成（避免无谓报错）
+  const t=e.relatedTarget;
+  if(t && t.tagName==='BUTTON') return; // 焦点移到按钮（复制/下载/生成等）交给对应点击处理
+  generate();
+});
 
 function copy(text){ navigator.clipboard.writeText(text); }
 $('copyOne').onclick=()=>{ if(current.active) copy(current.files[current.active]); };
