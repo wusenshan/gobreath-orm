@@ -10,7 +10,7 @@
 
 `gobreath-orm` 是一个 **AI 原生（AI-ready）、类型安全、零魔法字符串** 的 Go ORM——**内置向量检索，让 RAG / 语义搜索开箱即用**，同时保留 MyBatis-Plus 式 `LambdaQueryWrapper` 的零字段名查询体验：调用点绝不出现手写列名 / 关键字 / 占位符，从根本上避免拼 SQL 写错字段、写错 `AND` 位置、出现 SQL 注入等常见问题。
 
-支持 Postgres（pgvector）/ MySQL 9+（原生 VECTOR）/ SQLite 三种方言；**向量一套 API 跨库通用、零额外依赖**（不引入 pgvector-go）。想直接用上向量能力，看 [向量检索专文档 →](VECTOR.md)。
+支持 Postgres（pgvector）/ MySQL 9+（原生 VECTOR）/ SQLite 三种方言；**向量一套 API 跨库通用、零额外依赖**（不引入 pgvector-go）。其中 **Postgres 向量检索开箱即用**；**MySQL 的向量检索函数 `VECTOR_DISTANCE` 与向量索引仅由 HeatWave on OCI / MySQL AI 提供，社区版/商业版只能建 `VECTOR(N)` 列、能存不能查**（上线前用 [VECTOR.md §7](VECTOR.md) 自检）。想直接用上向量能力，看 [向量检索专文档 →](VECTOR.md)。
 
 > 🤖 **为 AI / RAG 而生**：只要你的业务要做「知识库问答 / 语义搜索 / 相似推荐 / 文本去重」，第一步就是把文本变成向量存进数据库再近邻检索。`gobreath-orm` 把这一步做成一行 `NearestBy(...)`，Postgres 与 MySQL 同一套代码——向量逻辑、检索效果与接入 AI 向量模型的布置，见 [VECTOR.md](VECTOR.md)。
 
@@ -18,7 +18,7 @@
 
 ## 特性
 
-- 🌟 **AI 原生 · 向量检索（核心卖点）**：内置 `Nearest / WithinDistance`，**一套 API 同时适配 Postgres(pgvector) 与 MySQL 9+**，支持 Cosine/L2/InnerProduct/L1 四种度量；零依赖、无需 `pgvector-go`，`[]float32` 自动序列化为 `[..]`。让 RAG 检索、语义搜索、相似推荐、文本去重直接落地——完整逻辑、效果演示与接入 AI 向量模型的布置见 [VECTOR.md](VECTOR.md)。
+- 🌟 **AI 原生 · 向量检索（核心卖点）**：内置 `Nearest / WithinDistance`，**一套 API 同时适配 Postgres(pgvector) 与 MySQL 9+**，支持 Cosine/L2/InnerProduct/L1 四种度量；零依赖、无需 `pgvector-go`，`[]float32` 自动序列化为 `[..]`。让 RAG 检索、语义搜索、相似推荐、文本去重直接落地——完整逻辑、效果演示与接入 AI 向量模型的布置见 [VECTOR.md](VECTOR.md)。<br>*注：MySQL 的向量检索函数 `VECTOR_DISTANCE` / 向量索引仅 HeatWave on OCI 与 MySQL AI 提供，社区版/商业版只能建列、能存不能查；且 MySQL 距离函数只支持 `COSINE`/`DOT`/`EUCLIDEAN`，**`orm.L1`（曼哈顿）仅 Postgres 可用**——上线前用 VECTOR.md §7 自检。*
 - 🦭 **零字段名字符串**：用 `orm.Col[T](func(u *T) *F { return &u.Name })` 选字段，列名从结构体 `db` tag 自动推导；配合 `ormgen` 代码生成器可进一步缩成 `UserCols.Age`，编译期就能发现字段用错。
 - 🧩 **泛型 + 链式条件**：`Eq / Ne / Gt / Ge / Lt / Le / Like / In / NotIn / Between / IsNull / IsNotNull`，自动处理 `AND/OR` 拼接与占位符。
 - 🪄 **MyBatis-Plus 式条件块**：`Or()` 与 `If(cond, func(q))` 对标 MP 的 `.or()` 与三参数条件（Go 不支持重载，用条件块统一实现）。
@@ -34,7 +34,7 @@
 - 🎯 **部分更新（多字段 / map）**：`Query.Set(col, val)` 链式 + `UpdateSets`，或 `UpdatePartial / UpdateByIdSets` 以 `map[string]any` 指定字段；强制带 WHERE，禁止全表更新。
 - 🔐 **乐观锁**：`db:"version,version"`（或 `Config.OptimisticField` 约定）标记版本列；`UpdateById / UpdateByIdSets` 自动 `WHERE version = ?` 并 `SET version = version + 1`，冲突时返回 `ErrOptimisticLock`。
 - 🪝 **SQL 生命周期钩子（Hook）**：`Config.Hooks` 或 `db.WithHooks(...)` 注册实现 `Hook` 接口的对象；每次 `exec` / `query` 的 before / after 阶段都会触发 `On(HookEvent)`，可零侵入地做审计、限流、链路追踪。未配置则不触发、零开销。
-- 🌐 **读写分离 / 多数据源**：`Config.ReadWrite`（或等价的 `Config.MultiSource`）声明主库 + 只读副本；框架按 SQL 前缀自动把写操作路由主库、读操作 round-robin 到副本，事务内自动回落主库。`*readWriteRouter` 内部加锁，并发安全。
+- 🌐 **读写分离 / 多数据源**：`Config.ReadWrite`（或等价的 `Config.MultiSource`）声明主库 + 只读副本；框架按 SQL 前缀自动把写操作路由主库、读操作 round-robin 到副本，事务内自动回落主库；**`SELECT ... FOR UPDATE` / `FOR SHARE` 等悲观锁读也会识别并路由主库**，避免锁落在只读副本上失效。*`*readWriteRouter` 内部加锁，并发安全。
 - 🗃 **AutoMigrate（数据库迁移）**：`db.AutoMigrate(ctx, &User{}, &Order{})` 幂等建表（`CREATE TABLE IF NOT EXISTS`）+ 二级索引（`CREATE INDEX IF NOT EXISTS`），三方言自动生成 DDL；自动识别 `,vector(N)`（PG `vector(N)` / MySQL `VECTOR(N)` / SQLite `TEXT`）与 `,json`（PG `JSONB` / MySQL `JSON` / SQLite `TEXT`）、`,unique` / `,index`；无需引入迁移工具即可让表结构与结构体对齐。
 - 🔗 **关联预加载（Preload）**：`orm.Preload(ctx, db, &users, "Articles")` 一次性批量加载 **has_many / has_one / belongs_to** 关联，避免 N+1 查询；默认外键约定 `<类型名>_id`（如 `User` → `user_id`），可用 `orm:"has_many;fk:user_id"` / `orm:"belongs_to;fk:xxx"` 覆盖；软删除过滤对子查询同样生效。
 - ⋇ **Distinct 去重查询**：`orm.NewQuery[T]().Distinct()` 生成 `SELECT DISTINCT`，可搭配 `Select` / 条件 / 排序 / 分页照常使用。
@@ -846,10 +846,12 @@ db := orm.Open("mysql", dsn).WithLogger(func(level orm.LogLevel, query string, a
 
 gobreath-orm 内置向量近邻检索，**一套 API 同时适配 Postgres（pgvector）与 MySQL 9+（原生 VECTOR 类型）**——SQL 由方言自动分发，业务代码不用关心底层差异：
 
+> ⚠️ **MySQL 跨库可用性前提**：`VECTOR_DISTANCE()` 与 `VECTOR INDEX` 仅由 **MySQL HeatWave on OCI** / **MySQL AI** 提供，社区版 / 商业版发行包**不包含**（dev.mysql.com 官方 Note 原话）。社区版能建 `VECTOR(N)` 列、能 `STRING_TO_VECTOR()` 存取，但距离查询会报 `FUNCTION VECTOR_DISTANCE does not exist`。接入前务必用 [VECTOR.md §7](VECTOR.md) 的自检命令确认目标库能力。
+
 | 数据库 | 启用方式 | 框架生成的检索语法 |
 |---|---|---|
 | **Postgres + pgvector** | `CREATE EXTENSION vector;` + `vector(N)` 列 | `"embedding" <=> $1`（运算符 `<=>`/`<->`/`<#>`/`<+>`） |
-| **MySQL 9+** | `VECTOR(N)` 列 | `VECTOR_DISTANCE(\`embedding\`, STRING_TO_VECTOR(?), 'COSINE')` |
+| **MySQL 9+（仅 HeatWave / MySQL AI）** | `VECTOR(N)` 列 | `VECTOR_DISTANCE(\`embedding\`, STRING_TO_VECTOR(?), 'COSINE')`（社区版会报函数不存在） |
 
 向量字段用 `[]float32` / `[]float64` 即可，框架自动序列化为 `[..]` 文本参数化绑定——**无需引入 `pgvector-go` 之类的第三方包**，零额外依赖。
 
@@ -878,14 +880,14 @@ q := orm.NewQuery[Doc]().Nearest(embCol, vec, 10).WithinDistance(embCol, vec, 0.
 | 欧几里得 | `orm.L2` | `<->` | `EUCLIDEAN` | 图像/音频等已归一化前的几何距离 |
 | 余弦 | `orm.Cosine` | `<=>` | `COSINE` | **文本嵌入相似度（推荐）** |
 | 内积 | `orm.InnerProduct` | `<#>`（负内积） | `DOT` | 向量已归一化时最快 |
-| 曼哈顿 | `orm.L1` | `<+>` | `MANHATTAN`（MySQL 9.7+） | 稀疏向量 |
+| 曼哈顿 | `orm.L1` | `<+>` | **MySQL 不支持**（MySQL 距离函数仅 `COSINE`/`DOT`/`EUCLIDEAN`，无 `MANHATTAN`） | 稀疏向量（仅 Postgres） |
 
 > **注意**：`Nearest` / `WithinDistance` 不指定度量时沿用旧版默认 `L2`；做语义检索请显式 `NearestBy(..., orm.Cosine)`。
 > SQLite 无原生向量类型，仅能生成语法（用于离线拼 SQL），真正检索请换 PG / MySQL。
 
 **完整可运行示例**：见 [`examples/vector-search`](examples/vector-search)，无需装数据库即可看到 PG / MySQL 两种方言生成的 SQL。
 
-**性能提示**：百万级向量请用向量索引——PG `CREATE INDEX ON docs USING hnsw (embedding vector_cosine_ops);`，MySQL `CREATE VECTOR INDEX idx ON docs(embedding);`。框架生成的 `ORDER BY 距离 ASC LIMIT k` 能直接命中这些索引。
+**性能提示**：百万级向量请用向量索引——PG `CREATE INDEX ON docs USING hnsw (embedding vector_cosine_ops);`，MySQL `CREATE VECTOR INDEX idx ON docs(embedding);`（向量索引同样仅 HeatWave / MySQL AI，社区版无）。框架生成的 `ORDER BY 距离 ASC LIMIT k` 能直接命中这些索引。
 
 ---
 
@@ -1124,7 +1126,7 @@ cities, err := orm.SelectList(ctx, db,
 | 数据库 | `Open` 驱动名 | 默认方言 | 备注 |
 |---|---|---|---|
 | Postgres | `postgres` / `pgx` | Postgres | 默认；支持 jsonb、向量 `<->`（pgvector） |
-| MySQL | `mysql` | MySQL | 支持 `JSON_CONTAINS`、向量 `VECTOR_DISTANCE`（MySQL 9+） |
+| MySQL | `mysql` | MySQL | 支持 `JSON_CONTAINS`；向量类型 `VECTOR(N)` 社区版可建可存，但向量检索函数 `VECTOR_DISTANCE` 与向量索引仅 HeatWave on OCI / MySQL AI 提供（社区版查询会报函数不存在），详见 [VECTOR.md §6/§7](VECTOR.md) |
 | SQLite | `sqlite` / `sqlite3` | SQLite | 支持 `json_extract` / `json_contains`；无原生向量类型 |
 
 新增方言只需实现 `Dialect` 接口（`QuoteIdent` / `Placeholder` / `JsonPath` / `JsonContains` / `VectorDistance` / `VectorBind` / `UpsertSuffix` / `SupportsLastInsertID` / `InsertReturning`）并在 `dialectForDriver` 注册。

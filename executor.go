@@ -262,6 +262,15 @@ func isWriteQuery(query string) bool {
 	if trimmed == "" {
 		return false
 	}
+	// 悲观锁读（SELECT ... FOR UPDATE / FOR SHARE 等）必须在主库执行，
+	// 否则会被路由到只读副本导致锁失效或报错。框架仅生成 FOR UPDATE，
+	// 这里按子串兜底覆盖 FOR UPDATE / FOR SHARE / FOR KEY SHARE / FOR NO KEY UPDATE。
+	if strings.Contains(trimmed, " FOR UPDATE") ||
+		strings.Contains(trimmed, " FOR SHARE") ||
+		strings.Contains(trimmed, " FOR KEY SHARE") ||
+		strings.Contains(trimmed, " FOR NO KEY UPDATE") {
+		return true
+	}
 	for _, prefix := range []string{"INSERT", "UPDATE", "DELETE", "REPLACE", "CREATE", "ALTER", "DROP", "TRUNCATE", "MERGE", "CALL"} {
 		if strings.HasPrefix(trimmed, prefix) {
 			return true

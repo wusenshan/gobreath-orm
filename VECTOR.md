@@ -277,10 +277,102 @@ hits, _ := orm.SelectList(ctx, db,
 - **度量选择**：用错度量（如对归一化向量用 L2 而非 Cosine）会劣化召回质量；语义检索默认 Cosine。
 - **阈值 `WithinDistance` 的量纲**：Cosine 距离在 `[0,2]`，L2/L1 在 `[0,+∞)`，设阈值前先了解所选度量的取值范围。
 - **索引**：百万级以上务必建 HNSW / VECTOR 索引（见 4.3），否则退化为全表扫描。
+- **MySQL 社区版 / 商业版无向量检索函数（最致命）**：`VECTOR_DISTANCE()` 与 `VECTOR INDEX` 仅由 **MySQL HeatWave on OCI** 与 **MySQL AI** 提供，社区版 / 商业版发行包并不包含（dev.mysql.com 官方 Note 原话）。社区版能建 `VECTOR(N)` 列、能 `STRING_TO_VECTOR()` / `VECTOR_TO_STRING()` / `VECTOR_DIM()` 存取，但一旦执行距离查询就报 `FUNCTION VECTOR_DISTANCE does not exist`。因此"一套 API 跨库通用"实际是：**PostgreSQL(pgvector) 完整可用；MySQL 仅部署在 HeatWave / MySQL AI 时可用**。接入前务必用下文 §7 自检。
+- **MySQL 距离度量无 `MANHATTAN`**：`VECTOR_DISTANCE` 支持的度量只有 `COSINE` / `DOT` / `EUCLIDEAN`，**没有 `MANHATTAN`**（`MANHATTAN` 只在 Oracle Database 的 `VECTOR_DISTANCE` 里，是另一个产品）。所以 `orm.L1`（曼哈顿）在 MySQL 上无法映射，切勿在 MySQL 方言下使用 `orm.L1`。
 
 ---
 
-## 7. 相关链接
+## 7. 上线前前置验证：向量能力自检（PG + MySQL 对照）
+
+> **为什么需要**：第 6 节最致命的坑是 **MySQL 社区版 / 商业版的 `VECTOR_DISTANCE()` 与 `VECTOR INDEX` 仅由 MySQL HeatWave on OCI / MySQL AI 提供，社区 / 商业发行版并不包含**（dev.mysql.com 官方 Note 原话）。社区版能建 `VECTOR(N)` 列、能 `STRING_TO_VECTOR()` 存取，但一执行距离查询就报 `FUNCTION VECTOR_DISTANCE does not exist`。下面两组命令可在接入 gobreath-orm 前，确认目标库到底"能不能跑向量检索"，避免上线才炸。
+
+### 7.1 PostgreSQL（pgvector）—— 先确认插件
+
+```sql
+-- ① 查向量插件是否已安装（能返回版本号即说明可用）
+SELECT extname, extversion FROM pg_extension WHERE extname = 'vector';
+-- 若为空，需要有 superuser 权限先建扩展：
+-- CREATE EXTENSION IF NOT EXISTS vector;
+
+-- ② 建含向量的表
+CREATE TABLE articles (
+  id        BIGSERIAL PRIMARY KEY,
+  title     TEXT,
+  embedding vector(4)          -- 维度 = 你的 embedding 模型输出维度
+);
+
+-- ③ 插入向量行（文本直接写，框架同款写法）
+INSERT INTO articles (title, embedding) VALUES
+  ('gobreath-orm', '[0.12,-0.34,0.56,0.78]'),
+  ('向量检索',      '[0.90, 0.10, 0.20, 0.30]');
+
+-- ④ 距离查询（余弦）：<=> 即 COSINE 距离算子
+SELECT id, title,
+       embedding <=> '[0.12,-0.34,0.56,0.78]' AS dist
+FROM articles
+ORDER BY embedding <=> '[0.12,-0.34,0.56,0.78]'
+LIMIT 3;
+
+-- ⑤（可选）百万级加速：建 HNSW 索引（须与查询度量一致）
+CREATE INDEX ON articles USING hnsw (embedding vector_cosine_ops);
+```
+
+若 ① 返回 `vector` 且 ④ 能算出 `dist`，说明 PG 向量检索可用。
+
+### 7.2 MySQL 9+ —— 先确认是否真的是 HeatWave / MySQL AI
+
+```sql
+-- ① 查版本（确认是 9.x，并留意发行渠道）
+SELECT VERSION();
+
+-- ② 关键自检：距离函数是否存在。
+--    能返回 0（与自身距离）说明是 HeatWave / MySQL AI，向量检索可用；
+--    报 "FUNCTION VECTOR_DISTANCE does not exist" 即社区 / 商业版，不支持向量检索。
+SELECT VECTOR_DISTANCE(
+         STRING_TO_VECTOR('[1,2,3,4]'),
+         STRING_TO_VECTOR('[1,2,3,4]'),
+         'COSINE') AS d;
+
+-- ③ 建含向量的表（社区版也能建）
+CREATE TABLE articles (
+  id        BIGINT AUTO_INCREMENT PRIMARY KEY,
+  title     VARCHAR(255),
+  embedding VECTOR(4)            -- 维度 = 模型输出维度
+);
+
+-- ④ 插入向量行（社区版也能插，靠 STRING_TO_VECTOR）
+INSERT INTO articles (title, embedding) VALUES
+  ('gobreath-orm', STRING_TO_VECTOR('[0.12,-0.34,0.56,0.78]')),
+  ('向量检索',      STRING_TO_VECTOR('[0.90,0.10,0.20,0.30]'));
+
+-- ⑤ 距离查询（只有 ② 通过才有意义）：度量仅 COSINE / DOT / EUCLIDEAN
+SELECT id, title,
+       VECTOR_DISTANCE(embedding, STRING_TO_VECTOR('[0.12,-0.34,0.56,0.78]'), 'COSINE') AS dist
+FROM articles
+ORDER BY VECTOR_DISTANCE(embedding, STRING_TO_VECTOR('[0.12,-0.34,0.56,0.78]'), 'COSINE')
+LIMIT 3;
+
+-- ⑥（可选）向量索引：同样是 HeatWave / MySQL AI 专有，社区版会报特性不支持
+-- CREATE VECTOR INDEX idx_articles_embedding ON articles(embedding);
+```
+
+> ⚠️ MySQL 距离度量只支持 `COSINE` / `DOT` / `EUCLIDEAN`，**没有 `MANHATTAN`**。因此 `orm.L1`（曼哈顿）在 MySQL 上无法映射，切勿在 MySQL 方言下使用 `orm.L1`。
+
+### 7.3 自检结论速查
+
+| 检查项 | PostgreSQL | MySQL（社区 / 商业版） | MySQL（HeatWave / MySQL AI） |
+|---|---|---|---|
+| 向量类型 / 列 | ✅ `vector(N)` | ✅ `VECTOR(N)` | ✅ `VECTOR(N)` |
+| 写入 / 读取向量 | ✅ | ✅ `STRING_TO_VECTOR` | ✅ |
+| 距离函数 | ✅ `<=>` `<->` `<#>` `<+>` | ❌ 函数不存在 | ✅ `VECTOR_DISTANCE` |
+| 向量索引 | ✅ HNSW | ❌ 不支持 | ✅ `VECTOR INDEX` |
+| `orm.L1` 曼哈顿 | ✅ `<+>` | ❌ 无 MANHATTAN 度量 | ❌ 无 MANHATTAN 度量 |
+
+**结论**：gobreath-orm 向量检索在 **PostgreSQL 上开箱即用**；在 **MySQL 上仅当数据库是 HeatWave on OCI 或 MySQL AI 时可用**，社区 / 商业版只能存、不能查。接入前用 7.1 / 7.2 的自检命令确认目标库能力。
+
+---
+
+## 8. 相关链接
 
 - 速览与 API 全集：[README.md](README.md)
 - 可运行示例（离线看两套方言 SQL）：[examples/vector-search](examples/vector-search)
