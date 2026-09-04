@@ -64,12 +64,12 @@ func TestParseDDL_Postgres(t *testing.T) {
 	want := map[string]Column{
 		"Id":        {GoName: "Id", ColName: "id", GoType: "int", IsPK: true, IsAutoInc: true},
 		"Name":      {GoName: "Name", ColName: "name", GoType: "string"},
-		"Age":       {GoName: "Age", ColName: "age", GoType: "int"},
-		"Score":     {GoName: "Score", ColName: "score", GoType: "float32"},
-		"Bio":       {GoName: "Bio", ColName: "bio", GoType: "string"},
-		"Active":    {GoName: "Active", ColName: "active", GoType: "bool"},
-		"Created":   {GoName: "Created", ColName: "created", GoType: "time.Time"},
-		"Embedding": {GoName: "Embedding", ColName: "embedding", GoType: "[]float32", IsVector: true, VectorDim: 128},
+		"Age":       {GoName: "Age", ColName: "age", GoType: "int", Nullable: true, Pointer: true},
+		"Score":     {GoName: "Score", ColName: "score", GoType: "float32", Nullable: true, Pointer: true},
+		"Bio":       {GoName: "Bio", ColName: "bio", GoType: "string", Nullable: true, Pointer: true},
+		"Active":    {GoName: "Active", ColName: "active", GoType: "bool", Nullable: true, Pointer: true},
+		"Created":   {GoName: "Created", ColName: "created", GoType: "time.Time", Nullable: true, Pointer: true},
+		"Embedding": {GoName: "Embedding", ColName: "embedding", GoType: "[]float32", IsVector: true, VectorDim: 128, Nullable: true, Pointer: false},
 	}
 	got := map[string]Column{}
 	for _, c := range users.Columns {
@@ -118,10 +118,10 @@ func TestParseDDL_MySQL(t *testing.T) {
 	want := map[string]Column{
 		"Id":        {GoName: "Id", ColName: "id", GoType: "int64", IsPK: true, IsAutoInc: true},
 		"Title":     {GoName: "Title", ColName: "title", GoType: "string"},
-		"InStock":   {GoName: "InStock", ColName: "in_stock", GoType: "int16"},
-		"Price":     {GoName: "Price", ColName: "price", GoType: "float64"},
-		"CreatedAt": {GoName: "CreatedAt", ColName: "created_at", GoType: "time.Time"},
-		"Embedding": {GoName: "Embedding", ColName: "embedding", GoType: "[]float32", IsVector: true, VectorDim: 768},
+		"InStock":   {GoName: "InStock", ColName: "in_stock", GoType: "int16", Nullable: true, Default: true, Pointer: false},
+		"Price":     {GoName: "Price", ColName: "price", GoType: "float64", Nullable: true, Pointer: true},
+		"CreatedAt": {GoName: "CreatedAt", ColName: "created_at", GoType: "time.Time", Nullable: true, Pointer: true},
+		"Embedding": {GoName: "Embedding", ColName: "embedding", GoType: "[]float32", IsVector: true, VectorDim: 768, Nullable: true, Pointer: false},
 	}
 	got := map[string]Column{}
 	for _, c := range p.Columns {

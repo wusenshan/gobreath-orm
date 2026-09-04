@@ -445,6 +445,61 @@ err := db.Transaction(ctx, func(tx *orm.DB) error {
 
 ---
 
+## 可空列与零值处理（OmitZero / 指针）
+
+写入时「字段零值（0 / "" / false）要不要进库」是 ORM 的经典歧义。gobreath-orm 提供两套互补能力，按场景选：
+
+### 1. 指针字段：精确表达 NULL（推荐，类型安全）
+
+把可空列声明为指针类型，由「指针是否为 nil」精确区分「未设置（NULL）」与「显式零值」：
+
+```go
+type Product struct {
+    Id    int   `db:"id,pk,autoincrement"`
+    Name  string `db:"name"`
+    Score *int   `db:"score"` // 可空：nil → NULL，Ptr(0) → 0
+}
+```
+
+写入路径 `argFor` 直接透传字段值，database/sql 会把 **nil 指针自动转为 SQL NULL**，非 nil 指针解引用写值——无需任何框架魔法，零值语义无歧义。配合 `orm.Ptr` 便捷构造：
+
+```go
+e := Product{ Score: orm.Ptr(0) }   // 显式存 0
+e2 := Product{}                       // Score=nil → INSERT score=NULL
+orm.Insert(ctx, db, &e)
+```
+
+> 注意：`OmitZero` **不会**跳过指针字段（它的 NULL/值语义由 nil 决定），只有值类型才会被跳过。
+
+### 2. OmitZero：值类型下跳过零值列（便捷）
+
+若不想全员指针，可在 Insert / Update 时开启 `OmitZero()`，框架跳过「值为类型零值」的可写列（主键除外），让数据库默认值或 NULL 生效：
+
+```go
+// 仅写 Name；Age=0 被跳过，数据库列默认值 / NULL 生效
+orm.Insert(ctx, db, &User{Name: "alice", Age: 0}, orm.OmitZero())
+
+// 更新时只覆盖非空的字段，不把其他列冲成 0 / ""
+orm.UpdateById(ctx, db, &User{Id: 1, Name: "bob"}, orm.OmitZero())
+```
+
+Repo 层同样支持：`repo.Insert(ctx, &User{Name: "alice"}, orm.OmitZero())`。
+
+行为要点与取舍：
+- 字面 `0` / `""` / `false` / 零时间 在启用 `OmitZero` 时会被跳过；**若需显式写入这些零值，请用指针字段，或不要启用该选项**。
+- 指针 / 接口 / 切片 / 映射 字段永不被跳过（NULL 语义交给 driver）。
+- `OmitZero` 是**用户主动开启**的，默认行为不变（零值照常入库），确定性优先。
+
+### 3. ormgen 从 DDL 自动出指针
+
+用 `ormgen -ddl` 生成模型时，对 **可空且无默认值** 的列会自动生成指针类型（如 `*int`、`*time.Time`），天然贴合「可空 = 可能 NULL」语义；`NOT NULL` 或带 `DEFAULT` 的列仍生成值类型：
+
+```bash
+ormgen -ddl schema.sql -type Product
+```
+
+---
+
 ## 查询构造器详解
 
 ### 条件方法一览
@@ -916,7 +971,7 @@ list, err := orm.SelectList(ctx, db, orm.NewQuery[User]().
 ```go
 // PG: INSERT ... ON CONFLICT ("id") DO UPDATE SET "name" = EXCLUDED."name", ...
 // MySQL: INSERT ... ON DUPLICATE KEY UPDATE `name` = VALUES(`name`), ...
-err := orm.Upsert(ctx, db, &User{Id: 1, Name: "neo", Age: 30})
+err := orm.Upsert(ctx, db, &User{Id: 1, Name: "neo", Age: 30}, nil)
 ```
 
 ### 部分更新（多字段 / map）

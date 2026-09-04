@@ -7,19 +7,89 @@ import (
 	"strings"
 )
 
+// ---- 写入选项 ----
+
+// WriteOption 控制写入（Insert / Update 系列）行为，按需以变参形式传入。
+type WriteOption func(*writeConfig)
+
+// writeConfig 是写入选项的累加结果。
+type writeConfig struct {
+	omitZero bool
+}
+
+// OmitZero 使 Insert / Update 跳过「值为类型零值」的可写列（主键列除外），
+// 让数据库列的默认值或 NULL 生效。适用于「未显式设置的字段不覆盖已有值」的场景。
+//
+// 行为要点：
+//   - 字面 0 / "" / false / 零时间 在启用 OmitZero 时会被跳过；
+//   - 若需显式写入这些零值，请用指针字段（nil 即 NULL，非 nil 即值），或不要启用本选项；
+//   - 指针 / 接口 / 切片 / 映射 字段永不被 OmitZero 跳过——它们的 NULL 语义由 driver 依据指针是否为 nil 决定。
+func OmitZero() WriteOption {
+	return func(c *writeConfig) { c.omitZero = true }
+}
+
+func applyWriteOptions(opts ...WriteOption) writeConfig {
+	var c writeConfig
+	for _, o := range opts {
+		if o != nil {
+			o(&c)
+		}
+	}
+	return c
+}
+
+// shouldOmitZero 判断某字段在 OmitZero 下是否应被跳过。
+// 指针/接口/切片/映射类型永不被跳过（nil 由 driver 写入 NULL，非 nil 正常写入）；
+// 其余值类型在其为零值时跳过。
+func shouldOmitZero(fv reflect.Value) bool {
+	if !fv.IsValid() {
+		return true
+	}
+	switch fv.Kind() {
+	case reflect.Ptr, reflect.Interface, reflect.Map, reflect.Slice:
+		return false
+	}
+	return fv.IsZero()
+}
+
+// filterOmitZeroCols 应用 OmitZero：从可写列中剔除零值非指针列（主键列永不被剔除）。
+func filterOmitZeroCols(meta *modelMeta, ev reflect.Value, cols []string) []string {
+	out := make([]string, 0, len(cols))
+	for _, c := range cols {
+		if meta.pk != nil && c == meta.pk.colName {
+			out = append(out, c)
+			continue
+		}
+		if shouldOmitZero(fieldByCol(ev, meta, c)) {
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+// Ptr 返回 v 的指针，便于把可空列声明为指针类型并安全赋值：
+//
+//	Score *int `db:"score"`
+//	e := Product{ Score: orm.Ptr(0) } // 显式存 0；不赋值则为 nil → NULL
+func Ptr[T any](v T) *T { return &v }
+
 // ---- 插入 ----
 
 // Insert 插入单条记录，并回填自增主键（若字段标记为 autoincrement）。
-func Insert[T any](ctx context.Context, db *DB, entity *T) error {
+func Insert[T any](ctx context.Context, db *DB, entity *T, opts ...WriteOption) error {
 	meta := getMeta[T]()
+	cfg := applyWriteOptions(opts...)
+	ev := reflect.ValueOf(entity).Elem()
 	cols := writableCols(meta)
+	if cfg.omitZero {
+		cols = filterOmitZeroCols(meta, ev, cols)
+	}
 	if len(cols) == 0 {
-		return fmt.Errorf("orm: %s 无可写字段", meta.table)
+		return fmt.Errorf("orm: %s 无可写字段（OmitZero 跳过全部零值列）", meta.table)
 	}
 	phIdx := 0
 	nextPh := func() string { phIdx++; return db.dialect.Placeholder(phIdx) }
-
-	ev := reflect.ValueOf(entity).Elem()
 	phs := make([]string, 0, len(cols))
 	args := make([]any, 0, len(cols))
 	for _, c := range cols {
@@ -63,15 +133,19 @@ func Insert[T any](ctx context.Context, db *DB, entity *T) error {
 }
 
 // BatchInsert 批量插入切片实体。
-func BatchInsert[T any](ctx context.Context, db *DB, entities []T) error {
+func BatchInsert[T any](ctx context.Context, db *DB, entities []T, opts ...WriteOption) error {
 	n := len(entities)
 	if n == 0 {
 		return nil
 	}
 	meta := getMeta[T]()
+	cfg := applyWriteOptions(opts...)
 	cols := writableCols(meta)
+	if cfg.omitZero {
+		cols = filterOmitZeroCols(meta, reflect.ValueOf(&entities[0]).Elem(), cols)
+	}
 	if len(cols) == 0 {
-		return fmt.Errorf("orm: %s 无可写字段", meta.table)
+		return fmt.Errorf("orm: %s 无可写字段（OmitZero 跳过全部零值列）", meta.table)
 	}
 	phIdx := 0
 	nextPh := func() string { phIdx++; return db.dialect.Placeholder(phIdx) }
@@ -118,11 +192,16 @@ func bindVal(meta *modelMeta, col string, val any) any {
 //
 // 冲突键需对应表中的主键或唯一索引，否则数据库会报约束错误。更新列 = 全部可写列减去冲突键；
 // 若无可更新列（仅冲突键一列），退化为 DO NOTHING（PG/SQLite）或等价无操作（MySQL）。
-func Upsert[T any](ctx context.Context, db *DB, entity *T, conflictCols ...string) error {
+func Upsert[T any](ctx context.Context, db *DB, entity *T, conflictCols []string, opts ...WriteOption) error {
 	meta := getMeta[T]()
+	cfg := applyWriteOptions(opts...)
+	ev := reflect.ValueOf(entity).Elem()
 	cols := writableCols(meta)
+	if cfg.omitZero {
+		cols = filterOmitZeroCols(meta, ev, cols)
+	}
 	if len(cols) == 0 {
-		return fmt.Errorf("orm: %s 无可写字段", meta.table)
+		return fmt.Errorf("orm: %s 无可写字段（OmitZero 跳过全部零值列）", meta.table)
 	}
 	cc := conflictCols
 	if len(cc) == 0 {
@@ -139,7 +218,6 @@ func Upsert[T any](ctx context.Context, db *DB, entity *T, conflictCols ...strin
 	}
 	phIdx := 0
 	nextPh := func() string { phIdx++; return db.dialect.Placeholder(phIdx) }
-	ev := reflect.ValueOf(entity).Elem()
 	phs := make([]string, 0, len(cols))
 	args := make([]any, 0, len(cols))
 	for _, c := range cols {
@@ -162,15 +240,19 @@ func Upsert[T any](ctx context.Context, db *DB, entity *T, conflictCols ...strin
 }
 
 // BatchUpsert 批量 upsert 切片实体，复用 Upsert 的冲突键与方言策略（多行 VALUES）。
-func BatchUpsert[T any](ctx context.Context, db *DB, entities []T, conflictCols ...string) error {
+func BatchUpsert[T any](ctx context.Context, db *DB, entities []T, conflictCols []string, opts ...WriteOption) error {
 	n := len(entities)
 	if n == 0 {
 		return nil
 	}
 	meta := getMeta[T]()
+	cfg := applyWriteOptions(opts...)
 	cols := writableCols(meta)
+	if cfg.omitZero {
+		cols = filterOmitZeroCols(meta, reflect.ValueOf(&entities[0]).Elem(), cols)
+	}
 	if len(cols) == 0 {
-		return fmt.Errorf("orm: %s 无可写字段", meta.table)
+		return fmt.Errorf("orm: %s 无可写字段（OmitZero 跳过全部零值列）", meta.table)
 	}
 	cc := conflictCols
 	if len(cc) == 0 {
@@ -367,16 +449,20 @@ func Page[T any](ctx context.Context, db *DB, q *Query[T], page, size int) (*Pag
 // ---- 更新 ----
 
 // UpdateById 按实体主键更新其非主键字段。
-func UpdateById[T any](ctx context.Context, db *DB, entity *T) error {
+func UpdateById[T any](ctx context.Context, db *DB, entity *T, opts ...WriteOption) error {
 	meta := getMeta[T]()
 	if meta.pk == nil {
 		return fmt.Errorf("orm: %s 无主键，无法 UpdateById", meta.table)
 	}
-	cols := updateCols(meta)
-	if len(cols) == 0 {
-		return fmt.Errorf("orm: %s 无可更新字段", meta.table)
-	}
+	cfg := applyWriteOptions(opts...)
 	ev := reflect.ValueOf(entity).Elem()
+	cols := updateCols(meta)
+	if cfg.omitZero {
+		cols = filterOmitZeroCols(meta, ev, cols)
+	}
+	if len(cols) == 0 {
+		return fmt.Errorf("orm: %s 无可更新字段（OmitZero 跳过全部零值列）", meta.table)
+	}
 	vi := resolveVersion(meta, db)
 	phIdx := 0
 	nextPh := func() string { phIdx++; return db.dialect.Placeholder(phIdx) }
@@ -434,13 +520,17 @@ func UpdateById[T any](ctx context.Context, db *DB, entity *T) error {
 }
 
 // Update 按查询条件更新，使用 entity 的非主键字段作为新值。自动跳过已逻辑删除的行。
-func Update[T any](ctx context.Context, db *DB, q *Query[T], entity *T) error {
+func Update[T any](ctx context.Context, db *DB, q *Query[T], entity *T, opts ...WriteOption) error {
 	meta := getMeta[T]()
-	cols := updateCols(meta)
-	if len(cols) == 0 {
-		return fmt.Errorf("orm: %s 无可更新字段", meta.table)
-	}
+	cfg := applyWriteOptions(opts...)
 	ev := reflect.ValueOf(entity).Elem()
+	cols := updateCols(meta)
+	if cfg.omitZero {
+		cols = filterOmitZeroCols(meta, ev, cols)
+	}
+	if len(cols) == 0 {
+		return fmt.Errorf("orm: %s 无可更新字段（OmitZero 跳过全部零值列）", meta.table)
+	}
 	phIdx := 0
 	nextPh := func() string { phIdx++; return db.dialect.Placeholder(phIdx) }
 	setParts := make([]string, 0, len(cols))
