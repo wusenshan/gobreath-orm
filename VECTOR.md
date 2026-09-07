@@ -370,9 +370,29 @@ LIMIT 3;
 
 **结论**：gobreath-orm 向量检索在 **PostgreSQL 上开箱即用**；在 **MySQL 上仅当数据库是 HeatWave on OCI 或 MySQL AI 时可用**，社区 / 商业版只能存、不能查。接入前用 7.1 / 7.2 的自检命令确认目标库能力。
 
+### 7.4 数据库能力矩阵（四库对照）
+
+下面把四款数据库在向量相关能力上做一次全景对比，方便根据目标环境做决策。其中 SQLite 仅作为离线/嵌入式场景参考，生产环境近邻检索仍建议用 Postgres 或 MySQL HeatWave。
+
+| 能力 | PG+pgvector | MySQL 社区 | MySQL HeatWave | SQLite |
+|---|---|---|---|---|
+| 向量存储 | ✅ | ✅ | ✅ | ⚠️ TEXT |
+| 向量检索 | ✅ | ❌ | ✅ | ❌ |
+| Upsert | ✅ | ✅ | ✅ | ✅ |
+| RETURNING | ✅ | ❌ | ❌ | ✅ |
+| JSON 路径查询 | ✅ | ✅ | ✅ | ✅ |
+
+说明：
+
+- **向量存储**：PG/MySQL 均有原生向量类型；SQLite 无原生向量类型，框架按文本序列化存储，可用于离线拼 SQL，但不能在库内做距离计算。
+- **向量检索**：仅 PG（pgvector 运算符）和 MySQL HeatWave / MySQL AI（`VECTOR_DISTANCE`）支持；MySQL 社区版与 SQLite 不支持。
+- **Upsert**：框架层统一提供 `Upsert` / `BatchUpsert`，底层按方言生成 `INSERT ... ON CONFLICT/ON DUPLICATE KEY UPDATE/INSERT OR REPLACE`。
+- **RETURNING**：PG/SQLite 支持插入/更新后返回主键或字段；MySQL 全系列（含 HeatWave）不支持 `RETURNING`，框架在 MySQL 方言下走 `LastInsertId` 或 `InsertReturning` 补偿。
+- **JSON 路径查询**：框架提供 JSON 路径检索抽象，四款数据库均可在各自方言下工作。
+
 ---
 
-## 8. 相关链接
+## 9. 相关链接
 
 - 速览与 API 全集：[README.md](README.md)
 - 可运行示例（离线看两套方言 SQL）：[examples/vector-search](examples/vector-search)
