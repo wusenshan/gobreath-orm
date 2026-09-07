@@ -14,21 +14,23 @@ import (
 
 // fieldInfo 结构体字段的元数据。
 type fieldInfo struct {
-	goName  string
-	colName string
-	pk      bool
-	autoInc bool
-	ignore  bool
-	json    bool    // true 表示字段以 JSON 形式读写（db tag 含 ",json"）
-	vector  bool    // true 表示字段为向量列（db tag 含 ",vector"），读写时序列化为文本 [..]
-	vectorDim int   // 向量维度（db tag 含 ",vector(N)" 时解析出 N；0 表示未指定维度）
-	logic   bool    // true 表示该字段是逻辑删除列（db tag 含 ",logic"）
-	nologic bool    // true 表示显式退出约定软删除匹配（db tag 含 ",nologic"）
-	version bool    // true 表示该字段是乐观锁版本列（db tag 含 ",version"）
-	unique  bool    // true 表示该列需唯一约束（db tag 含 ",unique"），仅 AutoMigrate 使用
-	index   bool    // true 表示该列需二级索引（db tag 含 ",index"），仅 AutoMigrate 使用
-	typ     reflect.Type
-	rawTag  string  // 原始 struct tag 字符串（仅用于 StrictTagCheck 模式下的格式校验）
+	goName            string
+	colName           string
+	pk                bool
+	autoInc           bool
+	ignore            bool
+	json              bool   // true 表示字段以 JSON 形式读写（db tag 含 ",json"）
+	vector            bool   // true 表示字段为向量列（db tag 含 ",vector"），读写时序列化为文本 [..]
+	vectorDim         int    // 向量维度（db tag 含 ",vector(N)" 时解析出 N；0 表示未指定维度）
+	vectorIndexType   string // 向量索引类型："hnsw"/"ivfflat"，非空表示需 AutoMigrate 建向量索引（db tag 含 ",hnsw(cosine)" 等）
+	vectorIndexMetric string // 向量索引距离度量："cosine"/"l2"/"ip"/"l1"（来自 hnsw(...) 括号参数，缺省 cosine）
+	logic             bool   // true 表示该字段是逻辑删除列（db tag 含 ",logic"）
+	nologic           bool   // true 表示显式退出约定软删除匹配（db tag 含 ",nologic"）
+	version           bool   // true 表示该字段是乐观锁版本列（db tag 含 ",version"）
+	unique            bool   // true 表示该列需唯一约束（db tag 含 ",unique"），仅 AutoMigrate 使用
+	index             bool   // true 表示该列需二级索引（db tag 含 ",index"），仅 AutoMigrate 使用
+	typ               reflect.Type
+	rawTag            string // 原始 struct tag 字符串（仅用于 StrictTagCheck 模式下的格式校验）
 }
 
 // modelMeta 一张表的模型元数据（字段、列、主键）。
@@ -118,6 +120,12 @@ func parseMeta(typ reflect.Type) *modelMeta {
 					if n := parseVectorDim(p); n > 0 {
 						fi.vectorDim = n
 					}
+					continue
+				}
+				if strings.HasPrefix(p, "hnsw") || strings.HasPrefix(p, "ivfflat") {
+					typ, metric := parseVectorIndexSpec(p)
+					fi.vectorIndexType = typ
+					fi.vectorIndexMetric = metric
 					continue
 				}
 				switch p {
@@ -483,6 +491,23 @@ func parseVectorDim(seg string) int {
 		return 0
 	}
 	return n
+}
+
+// parseVectorIndexSpec 从 db tag 分段（如 "hnsw(cosine)" / "ivfflat(l2)"）解析向量索引类型与度量；
+// 无括号（如 "hnsw"）时度量默认 cosine（最常用）。返回 (索引类型, 度量)。
+func parseVectorIndexSpec(seg string) (string, string) {
+	seg = strings.TrimSpace(seg)
+	open := strings.Index(seg, "(")
+	close := strings.Index(seg, ")")
+	typ := seg
+	metric := "cosine"
+	if open > 0 && close > open {
+		typ = strings.TrimSpace(seg[:open])
+		if m := strings.TrimSpace(seg[open+1 : close]); m != "" {
+			metric = m
+		}
+	}
+	return typ, metric
 }
 
 // isTimeType 判断字段类型是否为 time.Time（含指针形式），用于决定逻辑删除的「未删除」判定。

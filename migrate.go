@@ -14,7 +14,9 @@ import (
 //
 // 实体可传指针或值：orm.AutoMigrate(ctx, db, &User{}, &Article{})。
 // 列类型由 Go 类型按当前方言推导；支持主键/自增、`,vector(N)` 向量列、`,json` 列、
-// `,unique` 唯一约束、`,index` 二级索引。
+// `,unique` 唯一约束、`,index` 二级索引；向量列还可声明 `,hnsw(cosine)` / `,ivfflat(l2)`
+// 让 AutoMigrate 自动建向量索引（PG 生成 USING hnsw/ivfflat + vector_*_ops；MySQL 生成
+// CREATE VECTOR INDEX，仅 HeatWave 可用；SQLite 无原生向量索引则跳过）。
 //
 // 已知限制（v0.1.7）：
 //   - 仅做「增量建表」，不自动变更已有列（如改类型、加长度）；改表结构需手动 ALTER。
@@ -72,6 +74,24 @@ func migrateStatements(meta *modelMeta, d Dialect, prefix string) []string {
 			indexes = append(indexes, fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s ON %s (%s)",
 				d.QuoteIdent(idxName), table, d.QuoteIdent(f.colName)))
 		}
+		if f.vectorIndexType != "" {
+			idxName := fmt.Sprintf("idx_%s_%s", strings.ReplaceAll(meta.finalTable(prefix), ".", "_"), f.colName)
+			switch dialectKind(d) {
+			case "postgres":
+				indexes = append(indexes, fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s ON %s USING %s (%s %s)",
+					d.QuoteIdent(idxName), table, f.vectorIndexType, d.QuoteIdent(f.colName), vectorOpsClass(f.vectorIndexMetric)))
+			case "mysql":
+				// MySQL 向量索引语法为 CREATE VECTOR INDEX，无度量参数（度量由查询时的
+				// VECTOR_DISTANCE 决定）；且仅 HeatWave on OCI / MySQL AI 支持，社区版执行会报
+				// 函数不存在。l1 在 MySQL 整体不支持（VECTOR_DISTANCE 无 MANHATTAN），建索引无意义，跳过。
+				if f.vectorIndexMetric != "l1" {
+					indexes = append(indexes, fmt.Sprintf("CREATE VECTOR INDEX %s ON %s (%s)",
+						d.QuoteIdent(idxName), table, d.QuoteIdent(f.colName)))
+				}
+			default:
+				// SQLite 无原生向量索引，跳过（向量以 TEXT 存储，生产建议用 PG/MySQL）
+			}
+		}
 	}
 	// 主键约束：若已在内联列定义（PG SERIAL PRIMARY KEY / MySQL AUTO_INCREMENT PRIMARY KEY /
 	// SQLite INTEGER PRIMARY KEY AUTOINCREMENT）则不再追加独立 PRIMARY KEY 子句。
@@ -92,6 +112,21 @@ func dialectKind(d Dialect) string {
 		return "sqlite"
 	default:
 		return "sqlite" // 未知方言按 SQLite 的宽松类型兜底，避免迁移直接失败
+	}
+}
+
+// vectorOpsClass 把向量索引度量映射为 PG pgvector 的索引算子族（ops class）。
+// hnsw / ivfflat 建索引时都必须指定算子族；缺省 cosine（最常用）。
+func vectorOpsClass(metric string) string {
+	switch metric {
+	case "l2":
+		return "vector_l2_ops"
+	case "ip":
+		return "vector_ip_ops"
+	case "l1":
+		return "vector_l1_ops"
+	default:
+		return "vector_cosine_ops"
 	}
 }
 

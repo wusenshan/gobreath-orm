@@ -132,7 +132,13 @@ func Insert[T any](ctx context.Context, db *DB, entity *T, opts ...WriteOption) 
 	return nil
 }
 
-// BatchInsert 批量插入切片实体。
+// defaultBatchInsertSize 批量写入时单条多值 INSERT 的默认分批行数；避免万级实体生成
+// 一条超长 SQL（占位符/长度爆炸，MySQL 还可能触 max_allowed_packet）。每批单独执行，
+// 与调用方是否包事务一致：若需原子性请在外部 db.BeginTx 包裹。
+const defaultBatchInsertSize = 500
+
+// BatchInsert 批量插入切片实体，内部按 defaultBatchInsertSize 分批为多值 INSERT 执行。
+// 每条实体仍走 argFor + serializeVector/VectorBind，向量列正确处理。
 func BatchInsert[T any](ctx context.Context, db *DB, entities []T, opts ...WriteOption) error {
 	n := len(entities)
 	if n == 0 {
@@ -147,12 +153,25 @@ func BatchInsert[T any](ctx context.Context, db *DB, entities []T, opts ...Write
 	if len(cols) == 0 {
 		return fmt.Errorf("orm: %s 无可写字段（OmitZero 跳过全部零值列）", meta.table)
 	}
+	for start := 0; start < n; start += defaultBatchInsertSize {
+		end := start + defaultBatchInsertSize
+		if end > n {
+			end = n
+		}
+		if err := batchInsertRange(ctx, db, meta, cols, entities[start:end]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// batchInsertRange 对切片子集执行一次多值 INSERT；向量列经 VectorBind 包装。
+func batchInsertRange[T any](ctx context.Context, db *DB, meta *modelMeta, cols []string, entities []T) error {
 	phIdx := 0
 	nextPh := func() string { phIdx++; return db.dialect.Placeholder(phIdx) }
-
-	args := make([]any, 0, n*len(cols))
-	valueRows := make([]string, 0, n)
-	for i := 0; i < n; i++ {
+	args := make([]any, 0, len(entities)*len(cols))
+	valueRows := make([]string, 0, len(entities))
+	for i := range entities {
 		ev := reflect.ValueOf(&entities[i]).Elem()
 		phs := make([]string, 0, len(cols))
 		for _, c := range cols {
@@ -267,11 +286,25 @@ func BatchUpsert[T any](ctx context.Context, db *DB, entities []T, conflictCols 
 			updateCols = append(updateCols, c)
 		}
 	}
+	for start := 0; start < n; start += defaultBatchInsertSize {
+		end := start + defaultBatchInsertSize
+		if end > n {
+			end = n
+		}
+		if err := batchUpsertRange(ctx, db, meta, cols, cc, updateCols, entities[start:end]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// batchUpsertRange 对切片子集执行一次多值 UPSERT；向量列经 VectorBind 包装。
+func batchUpsertRange[T any](ctx context.Context, db *DB, meta *modelMeta, cols, cc, updateCols []string, entities []T) error {
 	phIdx := 0
 	nextPh := func() string { phIdx++; return db.dialect.Placeholder(phIdx) }
-	args := make([]any, 0, n*len(cols))
-	valueRows := make([]string, 0, n)
-	for i := 0; i < n; i++ {
+	args := make([]any, 0, len(entities)*len(cols))
+	valueRows := make([]string, 0, len(entities))
+	for i := range entities {
 		ev := reflect.ValueOf(&entities[i]).Elem()
 		phs := make([]string, 0, len(cols))
 		for _, c := range cols {
@@ -398,7 +431,7 @@ func Exists[T any](ctx context.Context, db *DB, q *Query[T]) (bool, error) {
 
 // PageResult 通用分页结果：既携带本页数据，也携带分页元数据，方便前端直接渲染分页器。
 type PageResult[T any] struct {
-	List    []T  `json:"list"`    // 本页数据
+	List    []T   `json:"list"`    // 本页数据
 	Page    int   `json:"page"`    // 当前页（1-based，非法值自动归正为 1）
 	Size    int   `json:"size"`    // 每页条数（非法值自动归正为 10）
 	Total   int64 `json:"total"`   // 符合条件的总条数
