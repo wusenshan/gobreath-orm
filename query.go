@@ -581,8 +581,25 @@ func (q *Query[T]) Build() (string, []any) {
 		sql += fmt.Sprintf(" ORDER BY %s", d.VectorDistance(q.vecCol, d.Placeholder(1), q.vectorMetric))
 	}
 
+	// 分页：LIMIT 必须写在 OFFSET 之前。「只有 OFFSET 没有 LIMIT」的合法性按方言区分：
+	//   - MySQL / SQLite：语法上不允许，必须补一个「不设上限」的 LIMIT
+	//     （MySQL 用官方推荐的 18446744073709551615，SQLite 用负数即无上限）
+	//   - PostgreSQL：OFFSET 可独立出现，且 PG 拒绝负数 LIMIT（会报
+	//     "LIMIT must not be negative"，见 nodeLimit.c recompute_limits），故不补
+	// 未知方言按 SQLite 兜底（与 migrate.go 的 dialectKind 策略一致）。
+	// Limit(0) 不会被当作「取 0 行」，未设 Limit/Offset 时仍不生成 LIMIT。
 	if q.limit > 0 {
 		sql += fmt.Sprintf(" LIMIT %d", q.limit)
+	} else if q.offset > 0 {
+		// 同时覆盖值/指针两种持有方式，避免直传 `*mysqlDialect` 这类指针时漏判。
+		switch d.(type) {
+		case mysqlDialect, *mysqlDialect:
+			sql += " LIMIT 18446744073709551615"
+		case postgresDialect, *postgresDialect:
+			// PG 原生支持独立 OFFSET，无需补 LIMIT
+		default:
+			sql += " LIMIT -1"
+		}
 	}
 	if q.offset > 0 {
 		sql += fmt.Sprintf(" OFFSET %d", q.offset)

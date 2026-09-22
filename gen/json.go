@@ -3,6 +3,7 @@ package gen
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
@@ -31,8 +32,15 @@ func ParseJSONSample(jsonStr string) ([]Table, error) {
 	}
 	structName := "Doc"
 	t := Table{Name: toSnake(structName), StructName: structName}
-	for k, v := range obj {
-		t.Columns = append(t.Columns, inferORMColumn(k, v))
+	// map 迭代顺序随机，必须按 key 排序后再推断列，否则同一样例每次生成的模型
+	// 字段顺序都不同（生成物 diff 噪声大、测试断言不稳定）。
+	keys := make([]string, 0, len(obj))
+	for k := range obj {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		t.Columns = append(t.Columns, inferORMColumn(k, obj[k]))
 	}
 	for _, c := range t.Columns {
 		if c.GoType == "time.Time" {

@@ -18,6 +18,14 @@
 - **工程化（D 组）**：新增 `Repo[T]` 便捷构造脚手架 `-repo`（orm: `<Struct>_repo.go` 的 `New<Struct>Repo(db)`；es: `<struct>_repo.go` 的 `New<Struct>Repo(cli)`），等价于 `orm.NewRepo[T](...)` / `es.NewRepo[T](...)`，默认关闭。生成物统一 `gofmt`（Web 与 CLI 共用 `format.Source`）。
 - **软删除字段自包含识别（C 组）**：DDL / JSON 生成 model 时，命中 `deleted_at` / `deleted` / `is_deleted` / `is_del` / `del_at` 等命名且类型为 `time.Time`/`bool`/`int*` 的字段，自动加 `,logic` tag 并附注释——无需在 `orm.Config` 里配置 `SoftDeleteField` 即生效逻辑删除（软删字段在示例插入段被自动跳过，留零值由框架填充）。
 
+### 修复（代码审查发现）
+
+- **向量序列化精度（`vector.go`）**：`formatFloatVal` 把 `float32` 提升为 `float64` 后仍按 64 位格式化，导致**定长数组**向量（如 `[3]float32{0.1,1.5,2.2}`）序列化成 `[0.10000000149011612,1.5,2.200000047683716]`，而 `[]float32` 走 `floats32ToText` 得到正确的 `[0.1,1.5,2.2]`——同一份语义的两种容器写出不同文本，影响向量列写入与距离计算。现按种类分别用 bitSize 32 / 64 格式化，两者结果一致。
+- **map 形式部分更新的列名校验（`crud.go`）**：`UpdateSets` / `UpdateByIdSets` / `UpdatePartial` 的字段名是纯字符串 map key，此前直接加引号拼进 SET 子句，既让拼错的列名（如 `nmae`）只能由数据库报错，也让外部输入（HTTP 参数、配置）成为注入面（`UPDATE t SET "name = 'x' OR 1=1 --" = $1`）。新增 `checkSetCols` 在拼 SQL 前校验列必须存在于模型元数据，否则返回错误且不下发 SQL；`Query.Set` 走 `ColExpr` 本已受限，一并纳入同一校验。
+- **只有 Offset 没有 Limit 的 SQL 合法性（`query.go`）**：`Query.Offset(n)` 此前单独使用时生成 `... OFFSET 20`，MySQL / SQLite 下是语法错误。现按方言补无上限 LIMIT —— MySQL `LIMIT 18446744073709551615`、SQLite `LIMIT -1`；PostgreSQL 的 `OFFSET` 可独立使用且**拒绝负数 LIMIT**（报 `LIMIT must not be negative`），故不补（不能与 SQLite 共用 `LIMIT -1`）。`Limit(0)` 不会被当作「取 0 行」。
+- **JSON 样例推断的列顺序不确定（`gen/json.go`）**：`ParseJSONSample` 直接 `range` JSON 对象的 map，导致同一份样例每次推断出的字段顺序都不同（生成物 diff 噪声、测试断言随机失败，CI 上已实际复现）。现按 key 排序后推断，输出稳定；`gen/json_test.go` 补稳定性断言。
+- **回归测试（`fix_regression_test.go`）**：新增 `auditExecutor`（只记录下发 SQL 的轻量执行器）+ 三类断言——`float32` 数组/切片序列化一致、未知列名被拒且不下发 SQL、Offset-only 在三种方言下的 SQL 形状（PG 不补 LIMIT、SQLite 补 `LIMIT -1`、MySQL 补无上限 LIMIT）。
+
 ## v0.1.7 (2026-08-30)
 
 - **AutoMigrate（数据库迁移）**：新增 `db.AutoMigrate(ctx, &User{}, ...)`，幂等建表（`CREATE TABLE IF NOT EXISTS`）+ 二级索引（`CREATE INDEX IF NOT EXISTS`）；自动识别 `,vector(N)`（PG `vector(N)` / MySQL `VECTOR(N)` / SQLite `TEXT`）、`,json`（PG `JSONB` / MySQL `JSON` / SQLite `TEXT`）、`,unique` / `,index`；主键 + 自增按方言生成（PG `BIGSERIAL` / MySQL `AUTO_INCREMENT` / SQLite `INTEGER PRIMARY KEY AUTOINCREMENT`）。不扩展 `Dialect` 接口，用方言类型 switch 生成 DDL，三方言全适配（`migrate.go`）。

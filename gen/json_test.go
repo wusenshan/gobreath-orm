@@ -33,7 +33,7 @@ func TestParseJSONSample_ORM(t *testing.T) {
 		t.Errorf("HasTime should be true for time.Time column")
 	}
 
-	// 数组顶层取首个元素
+	// 数组顶层取首个元素；列按 key 排序，故首列稳定为 id
 	arr := `[{"id":2,"name":"y"},{"id":3,"name":"z"}]`
 	tables, err = ParseJSONSample(arr)
 	if err != nil {
@@ -41,5 +41,15 @@ func TestParseJSONSample_ORM(t *testing.T) {
 	}
 	if len(tables) != 1 || tables[0].Columns[0].GoName != "Id" {
 		t.Errorf("array sample should pick first element, got %+v", tables)
+	}
+	// 同一份样例多次推断必须得到完全一致的列顺序（map 迭代顺序不得泄漏到生成物）
+	for i := 0; i < 20; i++ {
+		again, err := ParseJSONSample(arr)
+		if err != nil {
+			t.Fatalf("ParseJSONSample(array) 第 %d 次: %v", i, err)
+		}
+		if again[0].Columns[0].GoName != tables[0].Columns[0].GoName {
+			t.Fatalf("列顺序不稳定：第 %d 次首列为 %s，期望 %s", i, again[0].Columns[0].GoName, tables[0].Columns[0].GoName)
+		}
 	}
 }

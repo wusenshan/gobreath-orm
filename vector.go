@@ -73,9 +73,14 @@ func floats64ToText(v []float64) string {
 }
 
 // formatFloatVal 把单个数值（任意整/浮点种类）格式化为最短十进制文本，用于向量序列化。
+// 浮点按各自的位宽格式化（float32 用 bitSize 32）：rv.Float() 会把 float32 提升为
+// float64，若一律按 64 位格式化，[3]float32{0.1} 会得到 "0.10000000149011612"，
+// 与 []float32 分支（floats32ToText）的结果不一致并多出无意义的精度位。
 func formatFloatVal(rv reflect.Value) string {
 	switch rv.Kind() {
-	case reflect.Float32, reflect.Float64:
+	case reflect.Float32:
+		return strconv.FormatFloat(rv.Float(), 'f', -1, 32)
+	case reflect.Float64:
 		return strconv.FormatFloat(rv.Float(), 'f', -1, 64)
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		return strconv.FormatInt(rv.Int(), 10)

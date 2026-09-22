@@ -474,9 +474,24 @@ func Update[T any](ctx context.Context, db *DB, q *Query[T], entity *T) error {
 
 // ---- 部分更新（多字段 / map）----
 
+// checkSetCols 校验部分更新（map 形式）使用的列名都真实存在于模型元数据中。
+// map 的 key 是纯字符串，若来自外部输入（HTTP 参数、配置）会被原样加引号拼进 SET 子句，
+// 而不像 Col/ColOf 那样经过 picker 反查校验；同时拼错的列名（如 "nmae"）也只有数据库
+// 才会报错。这里在拼 SQL 前直接拒绝，兼顾注入防护与拼写防呆。
+func checkSetCols(meta *modelMeta, sets map[string]any) error {
+	for col := range sets {
+		fi := fieldInfoForCol(meta, col)
+		if fi == nil || fi.ignore {
+			return fmt.Errorf("orm: %s 不存在列 %q（UpdateSets/UpdateByIdSets 的字段名必须是模型中的真实列名）", meta.table, col)
+		}
+	}
+	return nil
+}
+
 // UpdateSets 按查询条件更新 q.sets 中的字段（与 Query.Set 链式配合）。
 // 自动跳过已逻辑删除的行（Unscoped 例外）；必须有 WHERE 条件，禁止全表更新；
-// q.sets 为空则报错。返回受影响行数。
+// q.sets 为空则报错。字段名必须是模型中的真实列名（含 db:"..." 的列名），
+// 否则报错且不下发 SQL。返回受影响行数。
 //
 // 例：
 //
@@ -487,6 +502,9 @@ func UpdateSets[T any](ctx context.Context, db *DB, q *Query[T]) (int64, error) 
 	meta := getMeta[T]()
 	if len(q.sets) == 0 {
 		return 0, fmt.Errorf("orm: UpdateSets 至少需要 Set 一个字段")
+	}
+	if err := checkSetCols(meta, q.sets); err != nil {
+		return 0, err
 	}
 	d := db.dialect
 	phIdx := 0
@@ -529,7 +547,7 @@ func UpdatePartial[T any](ctx context.Context, db *DB, q *Query[T], sets map[str
 // UpdateByIdSets 按主键更新 sets 中的字段（map 形式的部分更新）。
 // 自动跳过已逻辑删除的行（Unscoped 例外）。若 sets 含乐观锁版本列，则
 // 自动追加 "WHERE version = ?" 并 "SET version = version + 1"，受影响行数为 0
-// 时返回 ErrOptimisticLock。返回受影响行数。
+// 时返回 ErrOptimisticLock。field 名必须是模型中的真实列名，否则报错。返回受影响行数。
 func UpdateByIdSets[T any](ctx context.Context, db *DB, id any, sets map[string]any) (int64, error) {
 	meta := getMeta[T]()
 	if meta.pk == nil {
@@ -537,6 +555,9 @@ func UpdateByIdSets[T any](ctx context.Context, db *DB, id any, sets map[string]
 	}
 	if len(sets) == 0 {
 		return 0, fmt.Errorf("orm: UpdateByIdSets 至少需要一个字段")
+	}
+	if err := checkSetCols(meta, sets); err != nil {
+		return 0, err
 	}
 	d := db.dialect
 	vi := resolveVersion(meta, db)
