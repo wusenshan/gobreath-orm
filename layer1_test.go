@@ -71,7 +71,7 @@ func TestJoinInvalidTablePanics(t *testing.T) {
 
 func TestUpsertPG(t *testing.T) {
 	db := NewDB(mustOpenMock(t), PG)
-	_ = Upsert(context.Background(), db, &User{Id: 1, Name: "a", Age: 3})
+	_ = Upsert(context.Background(), db, &User{Id: 1, Name: "a", Age: 3}, nil)
 	want := `INSERT INTO "users" ("name", "age") VALUES ($1, $2) ON CONFLICT ("id") DO UPDATE SET "name" = EXCLUDED."name", "age" = EXCLUDED."age"`
 	if recQuery != want {
 		t.Fatalf("PG Upsert SQL 错误:\n 实际 %s\n 期望 %s", recQuery, want)
@@ -80,7 +80,7 @@ func TestUpsertPG(t *testing.T) {
 
 func TestUpsertMySQL(t *testing.T) {
 	db := NewDB(mustOpenMock(t), MySQL)
-	_ = Upsert(context.Background(), db, &User{Id: 1, Name: "a", Age: 3})
+	_ = Upsert(context.Background(), db, &User{Id: 1, Name: "a", Age: 3}, nil)
 	want := "INSERT INTO `users` (`name`, `age`) VALUES (?, ?) ON DUPLICATE KEY UPDATE `name` = VALUES(`name`), `age` = VALUES(`age`)"
 	if recQuery != want {
 		t.Fatalf("MySQL Upsert SQL 错误:\n 实际 %s\n 期望 %s", recQuery, want)
@@ -89,7 +89,7 @@ func TestUpsertMySQL(t *testing.T) {
 
 func TestUpsertNoUpdateCols(t *testing.T) {
 	db := NewDB(mustOpenMock(t), PG)
-	_ = Upsert(context.Background(), db, &OnlyPK{Id: 7})
+	_ = Upsert(context.Background(), db, &OnlyPK{Id: 7}, nil)
 	if !strings.Contains(recQuery, `ON CONFLICT ("id") DO NOTHING`) {
 		t.Fatalf("无可更新列时应退化为 DO NOTHING: %s", recQuery)
 	}

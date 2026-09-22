@@ -31,12 +31,12 @@ func (r *Repo[T]) DB() *DB { return r.db }
 
 // ---- 增删改查（免类型参数）----
 
-func (r *Repo[T]) Insert(ctx context.Context, entity *T) error {
-	return Insert[T](ctx, r.db, entity)
+func (r *Repo[T]) Insert(ctx context.Context, entity *T, opts ...WriteOption) error {
+	return Insert[T](ctx, r.db, entity, opts...)
 }
 
-func (r *Repo[T]) BatchInsert(ctx context.Context, entities []T) error {
-	return BatchInsert[T](ctx, r.db, entities)
+func (r *Repo[T]) BatchInsert(ctx context.Context, entities []T, opts ...WriteOption) error {
+	return BatchInsert[T](ctx, r.db, entities, opts...)
 }
 
 func (r *Repo[T]) SelectById(ctx context.Context, id any) (*T, error) {
@@ -63,22 +63,22 @@ func (r *Repo[T]) Exists(ctx context.Context, q *Query[T]) (bool, error) {
 	return Exists[T](ctx, r.db, q)
 }
 
-func (r *Repo[T]) UpdateById(ctx context.Context, entity *T) error {
-	return UpdateById[T](ctx, r.db, entity)
+func (r *Repo[T]) UpdateById(ctx context.Context, entity *T, opts ...WriteOption) error {
+	return UpdateById[T](ctx, r.db, entity, opts...)
 }
 
-func (r *Repo[T]) Update(ctx context.Context, q *Query[T], entity *T) error {
-	return Update[T](ctx, r.db, q, entity)
+func (r *Repo[T]) Update(ctx context.Context, q *Query[T], entity *T, opts ...WriteOption) error {
+	return Update[T](ctx, r.db, q, entity, opts...)
 }
 
 // Upsert 插入或按冲突键更新单条记录（方言分发：PG/SQLite ON CONFLICT、MySQL ON DUPLICATE KEY）。
-func (r *Repo[T]) Upsert(ctx context.Context, entity *T, conflictCols ...string) error {
-	return Upsert[T](ctx, r.db, entity, conflictCols...)
+func (r *Repo[T]) Upsert(ctx context.Context, entity *T, conflictCols []string, opts ...WriteOption) error {
+	return Upsert[T](ctx, r.db, entity, conflictCols, opts...)
 }
 
 // BatchUpsert 批量 upsert 切片实体。
-func (r *Repo[T]) BatchUpsert(ctx context.Context, entities []T, conflictCols ...string) error {
-	return BatchUpsert[T](ctx, r.db, entities, conflictCols...)
+func (r *Repo[T]) BatchUpsert(ctx context.Context, entities []T, conflictCols []string, opts ...WriteOption) error {
+	return BatchUpsert[T](ctx, r.db, entities, conflictCols, opts...)
 }
 
 // UpdateSets 按查询条件更新 q 中 Set 的字段（链式部分更新）。
