@@ -15,6 +15,7 @@
 - **fix: SQLite 的 `JsonContains` 生成不存在的函数**：SQLite 的 JSON1 扩展**没有** `json_contains`，此前生成的 `json_contains(col, ?)` 执行即报错。现用 `json_each` 展开成等价的浅层「子集」语义（候选对象的每个键值对都能在列对象里同名同值同类型地找到），与 PG 的 `@>`、MySQL 的 `JSON_CONTAINS` 对齐（仅浅层，不递归嵌套）（`dialect.go` + `json_test.go`）。
 - **fix: SQLite 的时间列聚合扫不回来**：`MAX(col)` / `MIN(col)` 是没有声明类型的表达式，modernc 驱动只能按 TEXT 交回（实测形态是 Go 的 `time.Time.String()`，如 `2026-09-01 16:00:00 +0000 UTC`），`sql.Null[time.Time]` 因此扫描失败；同一字段读原始列却正常（列声明了 `DATETIME`）。现 `MaxOf` / `MinOf` 的时间分支先扫成 `any` 再按多方言时间文本归一（`aggregate.go` + `aggregate_test.go`）。
 - **test: 真库集成测试子模块 `integration/`**：mock 只断言「生成了什么 SQL 字符串」，验不出驱动返回类型、方言语法合法性、主键回填的两条路径、事务/锁/约束的真实行为。新增嵌套模块（驱动由它导入，主模块保持零依赖；沿用 `examples/` 的 `replace => ..` 约定）在 SQLite / PostgreSQL(pgvector) / MySQL 上各跑同一套 24 个用例，附 `docker-compose.yml` 与独立 CI job；真库跑出并回归了上面这批方言问题（`integration/` + `.github/workflows/ci.yml`）。
+- **test: 横向性能基准子模块 `bench/`**：用同一张表、同一份种子数据、语义相同的 SQL 对照 `database/sql`（下界）/ GORM / 本库，跑在 SQLite 内存库上以剥离网络因素。含 5 个单表场景与 `BatchInsert` 分批大小扫描，另有一层更重要的产物：`TestResultParity` 断言三层**返回完全相同的数据**、`TestSQLParity` 打印三层**真正下发**的 SQL（走日志钩子而非 DryRun —— 后者够不着 `SelectById` / `Insert` / `UpdateById` 这些固定模板路径），二者进 CI，防止基准与实现悄悄脱节。实测结论：`InsertOne` / `UpdateByID` 接近裸 SQL（比 GORM 快 2.2× / 1.3×），`Count` 与裸 SQL 持平，**`ListPage` 是唯一明显落后的读路径**（50 行比裸 SQL 慢 26%、分配 2.4 倍，反射行映射是热点）；`BatchInsert` 的吞吐拐点在 chunk≈10 而非越大越好（`bench/` + `.github/workflows/ci.yml`）。
 
 ## v0.1.11 (2026-09-04)
 

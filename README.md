@@ -1228,6 +1228,8 @@ cities, err := orm.SelectList(ctx, db,
 
 `Distinct()` 与 `Select` / `Eq` / `OrderBy` / `Limit` / `Page` 等链式条件完全兼容，顺序随意。
 
+> `Select(cols ...string)` 只接受**列名**（会按方言加引号）。要投影 `COUNT(*)`、`SUM(score) * 2` 这类**表达式**，请用聚合 API（`Count` / `Sum` / `Avg` / …）或 `RawQuery` / `Query.Last()`。把表达式塞进 `Select` 会被当成标识符加引号：PostgreSQL 下报「列不存在」，SQLite 下更隐蔽 —— `SELECT "COUNT(*)"` 被视为字符串常量，**静默返回字面量而不是计数**。
+
 ---
 
 ## 安全与防注入
@@ -1256,6 +1258,7 @@ cities, err := orm.SelectList(ctx, db,
 
 - **单元测试**：根模块 `go test ./...`。仓库内置一个零依赖的纯 Go mock 驱动，断言生成的 SQL 形状与扫描行为。
 - **真库集成测试**：[`integration/`](integration/README.md) 是独立子模块（驱动由它导入，根模块保持零依赖），在 SQLite / PostgreSQL(pgvector) / MySQL 上跑同一套用例。mock 验不出的东西 —— 驱动返回类型、方言语法是否真的合法、主键回填的两条路径、事务与锁的真实行为 —— 都在这里覆盖。本地 `docker compose up -d` 起库，CI 里是独立 job（数据库不可用时自动退化为只跑 SQLite）。
+- **横向性能基准**：[`bench/`](bench/README.md) 也是独立子模块，用同一张表 / 同一份数据 / 语义相同的 SQL 对照 `database/sql`、GORM 与本库。里面有两层价值：`TestResultParity` / `TestSQLParity` 断言三层**在做同一件事**（进 CI），以及 5 个单表场景 + 分批大小的实测数据（不进 CI —— 共享 runner 的 CPU 噪声会让 ns/op 失去意义）。测出来的东西反过来指导实现，例如「`ListPage` 的反射行映射是唯一明显落后于裸 SQL 的读路径」就是那里读出来的。
 
 ---
 
