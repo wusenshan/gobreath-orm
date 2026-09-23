@@ -29,6 +29,10 @@ func (db *DB) AutoMigrate(ctx context.Context, models ...any) error {
 		stmts := migrateStatements(meta, db.dialect, db.prefix)
 		for _, s := range stmts {
 			if _, err := db.execContext(ctx, s); err != nil {
+				// MySQL 没有 CREATE INDEX IF NOT EXISTS，重复执行靠忽略「索引已存在」实现幂等。
+				if isDuplicateIndexErr(err) {
+					continue
+				}
 				return fmt.Errorf("orm: AutoMigrate 执行失败 (%s): %w", s, err)
 			}
 		}
@@ -69,8 +73,7 @@ func migrateStatements(meta *modelMeta, d Dialect, prefix string) []string {
 		cols = append(cols, "  "+def)
 		if f.index {
 			idxName := fmt.Sprintf("idx_%s_%s", strings.ReplaceAll(meta.finalTable(prefix), ".", "_"), f.colName)
-			indexes = append(indexes, fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s ON %s (%s)",
-				d.QuoteIdent(idxName), table, d.QuoteIdent(f.colName)))
+			indexes = append(indexes, createIndexSQL(d, idxName, table, f.colName))
 		}
 	}
 	// 主键约束：若已在内联列定义（PG SERIAL PRIMARY KEY / MySQL AUTO_INCREMENT PRIMARY KEY /
@@ -78,6 +81,39 @@ func migrateStatements(meta *modelMeta, d Dialect, prefix string) []string {
 	create := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (\n%s\n)", table, strings.Join(cols, ",\n"))
 	stmts := append([]string{create}, indexes...)
 	return stmts
+}
+
+// createIndexSQL 生成二级索引 DDL。
+//
+// PG 与 SQLite 支持 `CREATE INDEX IF NOT EXISTS`；MySQL（含 8.x）**不支持**该子句
+// （那是 MariaDB 的扩展），带上会直接 Error 1064 语法错误 —— 真库实测确认。
+// 所以 MySQL 生成朴素 `CREATE INDEX`，幂等性改由 AutoMigrate 忽略「索引已存在」错误来保证
+// （见 isDuplicateIndexErr），两者合起来仍是幂等的。
+func createIndexSQL(d Dialect, idxName, table, col string) string {
+	if dialectKind(d) == "mysql" {
+		return fmt.Sprintf("CREATE INDEX %s ON %s (%s)",
+			d.QuoteIdent(idxName), table, d.QuoteIdent(col))
+	}
+	return fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s ON %s (%s)",
+		d.QuoteIdent(idxName), table, d.QuoteIdent(col))
+}
+
+// isDuplicateIndexErr 判断错误是否只是「这个名字的索引已经建好了」。
+//
+// 这里刻意用错误文本匹配而不是驱动错误码：根模块保持零依赖，不能 import 各驱动去
+// 断言其错误类型（mysql.MySQLError / pgconn.PgError）。匹配面收窄到两个明确的措辞，
+// 避免把「唯一约束冲突」之类的真实错误也吞掉：
+//   - MySQL 1061 "Duplicate key name 'idx_...'"
+//   - PG 42P07 / SQLite "relation ... already exists" / "... already exists"
+//
+// 另：调用点只在 AutoMigrate 执行 DDL 时使用；CREATE TABLE 自带 IF NOT EXISTS，
+// 不会依赖这条兜底。
+func isDuplicateIndexErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "duplicate key name") || strings.Contains(s, "already exists")
 }
 
 // dialectKind 返回方言种类字符串（用于列类型映射的类型 switch）。

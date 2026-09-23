@@ -44,7 +44,29 @@ type Dialect interface {
 	InsertReturning(pkCol string) string
 }
 
+// ---- upsert 主键回填的可选方言能力 ----
+//
+// 下面两个接口**刻意不并入 Dialect**：Dialect 是公开契约，加方法会逼所有自定义方言跟着改。
+// 这里用类型断言探测（见 Upsert）：方言不实现时，Upsert 只是不回填自增主键，不会报错，
+// 与 BatchInsert / BatchUpsert 的行为一致。
+
+// upsertReturningDialect 由支持 `INSERT ... ON CONFLICT ... RETURNING` 的方言实现。
+// PG 与 SQLite 3.35+ 都支持，且 DO UPDATE 命中时返回的是**被更新的那一行**，因此可靠。
+type upsertReturningDialect interface {
+	UpsertReturning(pkCol string) string
+}
+
+// upsertPKCapturingDialect 由「不能 RETURNING，但能让 LAST_INSERT_ID() 带回目标行主键」的方言实现。
+// MySQL 需要它：ON DUPLICATE KEY UPDATE 走到更新分支时，LAST_INSERT_ID() 并不指向该行。
+type upsertPKCapturingDialect interface {
+	UpsertSuffixCapturePK(conflict, update []string, pkCol string) string
+}
+
 type postgresDialect struct{}
+
+func (d postgresDialect) UpsertReturning(pkCol string) string {
+	return " RETURNING " + d.QuoteIdent(pkCol)
+}
 
 func (d postgresDialect) QuoteIdent(name string) string {
 	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
@@ -139,6 +161,20 @@ func (d mysqlDialect) UpsertSuffix(conflict, update []string) string {
 	return "ON DUPLICATE KEY UPDATE " + strings.Join(sets, ", ")
 }
 
+// UpsertSuffixCapturePK 让 upsert 顺带把目标行主键带回 LAST_INSERT_ID()。
+// MySQL 官方文档给的写法：在 UPDATE 列表末尾加 `id` = LAST_INSERT_ID(`id`)。
+// 之所以需要：ON DUPLICATE KEY UPDATE 走「更新已有行」分支时，LAST_INSERT_ID() 不指向该行；
+// 加上这一段后，无论本次是插入还是更新，`res.LastInsertId()` 都返回目标行主键。
+// 右值取自当前行（不是 VALUES(id)），所以对数据本身是无操作。
+func (d mysqlDialect) UpsertSuffixCapturePK(conflict, update []string, pkCol string) string {
+	capture := d.QuoteIdent(pkCol) + " = LAST_INSERT_ID(" + d.QuoteIdent(pkCol) + ")"
+	if len(update) == 0 {
+		// 原本是 `id` = `id` 那样的无操作占位，这里正好换成主键捕获。
+		return "ON DUPLICATE KEY UPDATE " + capture
+	}
+	return d.UpsertSuffix(conflict, update) + ", " + capture
+}
+
 type sqliteDialect struct{}
 
 func (d sqliteDialect) QuoteIdent(name string) string {
@@ -150,7 +186,15 @@ func (d sqliteDialect) JsonPath(col, path string) string {
 	return fmt.Sprintf("json_extract(%s, '%s')", d.QuoteIdent(col), strings.ReplaceAll(p, "'", "''"))
 }
 func (d sqliteDialect) JsonContains(col, ph string) string {
-	return fmt.Sprintf("json_contains(%s, %s)", d.QuoteIdent(col), ph)
+	// SQLite 没有 json_contains 函数（原实现生成的 json_contains(...) 会直接报
+	// "no such function"，真库实测确认）。这里用 json_each 展开成等价语义：
+	// 「候选对象的每个键值对，都能在列对象里找到同名、同值、同类型的项」= 子集/包含。
+	// 与 PG 的 `@>`、MySQL 的 JSON_CONTAINS(col, candidate) 对齐，空对象恒为子集（恒真）。
+	// 注意：只做**浅层**键值包含，不递归比较嵌套对象/数组；需要深层包含请用 PG 的 jsonb 路径。
+	q := d.QuoteIdent(col)
+	return fmt.Sprintf("NOT EXISTS (SELECT 1 FROM json_each(%s) AS p WHERE NOT EXISTS ("+
+		"SELECT 1 FROM json_each(%s) AS c WHERE c.key = p.key AND c.value = p.value AND c.type = p.type))",
+		ph, q)
 }
 func (sqliteDialect) ForUpdateClause() string { return "" }
 func (d sqliteDialect) VectorDistance(col, ph string, m VectorMetric) string {
@@ -168,6 +212,14 @@ func (d sqliteDialect) VectorDistance(col, ph string, m VectorMetric) string {
 func (sqliteDialect) VectorBind(ph string) string { return ph }
 func (sqliteDialect) SupportsLastInsertID() bool  { return true }
 func (sqliteDialect) InsertReturning(pkCol string) string { return "" }
+
+// UpsertReturning 见 upsertReturningDialect。SQLite 3.35+ 支持 RETURNING，
+// 且 ON CONFLICT DO UPDATE 命中时返回的是被更新的那一行 ——
+// 这一点很关键：last_insert_rowid() 在 DO UPDATE 后**不会**更新，
+// 所以 SQLite 侧 upsert 的唯一可靠回填方式就是 RETURNING。
+func (d sqliteDialect) UpsertReturning(pkCol string) string {
+	return " RETURNING " + d.QuoteIdent(pkCol)
+}
 func (d sqliteDialect) UpsertSuffix(conflict, update []string) string {
 	if len(update) == 0 {
 		return fmt.Sprintf("ON CONFLICT(%s) DO NOTHING", quoteCols(conflict, d))

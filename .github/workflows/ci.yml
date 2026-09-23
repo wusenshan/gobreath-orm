@@ -28,3 +28,56 @@ jobs:
 
       - name: Test
         run: go test -count=1 ./...
+
+  # 真库集成测试（integration/ 是独立模块，上面的 `./...` 覆盖不到它）。
+  # 只跑 linux：service 容器需要 runner 上的 Docker，windows 跑不出额外价值。
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        # 用 pgvector 而非官方 postgres：向量列（,vector(N)）的用例需要该扩展。
+        # 扩展由测试自身 CREATE EXTENSION IF NOT EXISTS 建立（见 harness_test.go），
+        # 所以这里无需挂载 initdb 脚本。
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: gobreath
+          POSTGRES_PASSWORD: gobreath
+          POSTGRES_DB: gobreath
+        ports: ["5433:5432"]
+        options: >-
+          --health-cmd "pg_isready -U gobreath"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      mysql:
+        # 钉 8.0：主仓不支持 MySQL 9 的原生 VECTOR（那是 gobreath-es 的路线）。
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: gobreath
+          MYSQL_DATABASE: gobreath
+        ports: ["3307:3306"]
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -pgobreath"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+    defaults:
+      run:
+        working-directory: integration
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: integration/go.mod
+          cache-dependency-path: integration/go.sum
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test (sqlite + postgres + mysql)
+        env:
+          ORM_IT_PG_DSN: postgres://gobreath:gobreath@127.0.0.1:5433/gobreath?sslmode=disable
+          ORM_IT_MYSQL_DSN: root:gobreath@tcp(127.0.0.1:3307)/gobreath?parseTime=true&loc=Local
+        run: go test -v -count=1 ./...

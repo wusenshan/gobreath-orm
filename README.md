@@ -23,19 +23,20 @@
 - 🧩 **泛型 + 链式条件**：`Eq / Ne / Gt / Ge / Lt / Le / Like / In / NotIn / Between / IsNull / IsNotNull`，自动处理 `AND/OR` 拼接与占位符。
 - 🪄 **MyBatis-Plus 式条件块**：`Or()` 与 `If(cond, func(q))` 对标 MP 的 `.or()` 与三参数条件（Go 不支持重载，用条件块统一实现）。
 - 🗂 **自动表名推导**：`User` → `users`（蛇形 + 复数），也可实现 `TableName()` 显式指定；支持 DB 级表前缀（`t_users`）。
-- 🧱 **完整 CRUD**：`Insert / BatchInsert / SelectById / SelectList / SelectOne / Count / Exists / Page / UpdateById / Update / DeleteById / Delete`，自增主键自动回填。
+- 🧱 **完整 CRUD**：`Insert / BatchInsert / SelectById / SelectList / SelectOne / Count / Exists / Page / UpdateById / Update / DeleteById / Delete`，自增主键自动回填；另有聚合 `Sum / Avg / Max / Min`（+ 强类型 `*Of` 版本）与单列取值 `Pluck / PluckCol`。
+- 🔎 **预览 SQL**：`Query.ToSQL()` 与 `orm.DryRun(db, q)` 在不访问数据库的前提下拿到最终 SQL 与参数（对标 GORM 的 DryRun），单测断言与 DBA 复核都用得上。
 - 🔒 **原生事务**：`db.Transaction(ctx, func(tx *orm.DB) error)`。
 - 📦 **JSON 字段**：`db:"meta,json"` 即可把结构体字段（map / struct）自动与 JSON 列互转；支持按路径查询与 `JSON_CONTAINS / @>` 包含查询，三方言全适配。
 - 🛡 **三层防注入**：值参数化绑定 + 列名仅取自结构体 tag 白名单 + 表名白名单校验与引号转义。
 - ⚡ **原生 SQL 出口**：`RawQuery / RawOne / RawExec` 执行任意 SQL 并自动扫描结果，支持字段别名与非表 DTO 接收（对标 MP 交给 XML 的复杂查询）。
 - ⚙️ **结构体配置**：`orm.Open(orm.Config{...})` 具名传参一次配齐驱动 / 前缀 / 日志 / 连接池，也兼容 `Open(driver, dsn)` 旧写法。
 - 🔗 **联表查询（JOIN）**：`Join / LeftJoin / RightJoin`（+ `As` 别名变体）+ 主表 `Alias()`，表名白名单校验，ON 条件原文拼接；`Select` 支持 `u.name` 带别名列。
-- 🔁 **Upsert（插入或更新）**：`Upsert / BatchUpsert`，方言分发——Postgres / SQLite 走 `ON CONFLICT ... DO UPDATE`，MySQL 走 `ON DUPLICATE KEY UPDATE`；冲突键默认主键，可覆盖。
+- 🔁 **Upsert（插入或更新）**：`Upsert / BatchUpsert`，方言分发——Postgres / SQLite 走 `ON CONFLICT ... DO UPDATE`，MySQL 走 `ON DUPLICATE KEY UPDATE`；冲突键默认主键，可覆盖；自增主键自动回填（PG/SQLite 用 `RETURNING`，MySQL 用 `LAST_INSERT_ID(id)`）。
 - 🎯 **部分更新（多字段 / map）**：`Query.Set(col, val)` 链式 + `UpdateSets`，或 `UpdatePartial / UpdateByIdSets` 以 `map[string]any` 指定字段；强制带 WHERE，禁止全表更新。
 - 🔐 **乐观锁**：`db:"version,version"`（或 `Config.OptimisticField` 约定）标记版本列；`UpdateById / UpdateByIdSets` 自动 `WHERE version = ?` 并 `SET version = version + 1`，冲突时返回 `ErrOptimisticLock`。
 - 🪝 **SQL 生命周期钩子（Hook）**：`Config.Hooks` 或 `db.WithHooks(...)` 注册实现 `Hook` 接口的对象；每次 `exec` / `query` 的 before / after 阶段都会触发 `On(HookEvent)`，可零侵入地做审计、限流、链路追踪。未配置则不触发、零开销。
 - 🌐 **读写分离 / 多数据源**：`Config.ReadWrite`（或等价的 `Config.MultiSource`）声明主库 + 只读副本；框架按 SQL 前缀自动把写操作路由主库、读操作 round-robin 到副本，事务内自动回落主库；**`SELECT ... FOR UPDATE` / `FOR SHARE` 等悲观锁读也会识别并路由主库**，避免锁落在只读副本上失效。*`*readWriteRouter` 内部加锁，并发安全。
-- 🗃 **AutoMigrate（数据库迁移）**：`db.AutoMigrate(ctx, &User{}, &Order{})` 幂等建表（`CREATE TABLE IF NOT EXISTS`）+ 二级索引（`CREATE INDEX IF NOT EXISTS`），三方言自动生成 DDL；自动识别 `,vector(N)`（PG `vector(N)` / MySQL `VECTOR(N)` / SQLite `TEXT`）与 `,json`（PG `JSONB` / MySQL `JSON` / SQLite `TEXT`）、`,unique` / `,index`；无需引入迁移工具即可让表结构与结构体对齐。
+- 🗃 **AutoMigrate（数据库迁移）**：`db.AutoMigrate(ctx, &User{}, &Order{})` 幂等建表（`CREATE TABLE IF NOT EXISTS`）+ 二级索引（PG/SQLite 用 `CREATE INDEX IF NOT EXISTS`；MySQL 不支持该子句，改由忽略「索引已存在」错误保证幂等），三方言自动生成 DDL；自动识别 `,vector(N)`（PG `vector(N)` / MySQL `VECTOR(N)` / SQLite `TEXT`）与 `,json`（PG `JSONB` / MySQL `JSON` / SQLite `TEXT`）、`,unique` / `,index`；无需引入迁移工具即可让表结构与结构体对齐。
 - 🔗 **关联预加载（Preload）**：`orm.Preload(ctx, db, &users, "Articles")` 一次性批量加载 **has_many / has_one / belongs_to** 关联，避免 N+1 查询；默认外键约定 `<类型名>_id`（如 `User` → `user_id`），可用 `orm:"has_many;fk:user_id"` / `orm:"belongs_to;fk:xxx"` 覆盖；软删除过滤对子查询同样生效。
 - ⋇ **Distinct 去重查询**：`orm.NewQuery[T]().Distinct()` 生成 `SELECT DISTINCT`，可搭配 `Select` / 条件 / 排序 / 分页照常使用。
 
@@ -428,6 +429,62 @@ hasVip, err := orm.Exists(ctx, db,
     orm.NewQuery[User]().JsonContains(profileCol, map[string]any{"tags": []string{"vip"}}),
 )
 ```
+
+### 聚合（Sum / Avg / Max / Min）
+
+```go
+total, err := orm.Sum(ctx, db,
+    orm.NewQuery[Order]().Eq(statusCol, "paid"),
+    orm.Col[Order](func(o *Order) *int64 { return &o.Amount }),
+)
+avg, err := orm.Avg(ctx, db, q, amountCol)
+maxAge, err := orm.Max(ctx, db, orm.NewQuery[User](), ageCol) // 返回 any（驱动原生类型）
+```
+
+聚合列同样来自结构体 `db` tag（`orm.Col` / `orm.TCol` / ormgen 列集），写不出字符串列名；口径与
+`Count` 完全一致：自动带软删除过滤，并计入 JOIN、主表别名与 db 级表前缀。
+
+- **空结果集**：`Sum / Avg` 返回 0（SQL 的 NULL 已归一），不报错；
+- **返回类型**：`Max / Min` 的类型随列而定，故返回 `any`（数值 → `int64`/`float64`/`string`，时间列 → `time.Time`，
+  PG 的 numeric 已由 `[]byte` 归一为 `string`）。要确定的类型就用强类型版本：
+
+```go
+// 时间列取最新值：MaxOf 直接扫成 time.Time，不必自己断言
+last, err := orm.MaxOf(ctx, db, q, orm.TCol(func(u *User) *time.Time { return &u.CreatedAt }))
+```
+
+- **带 GROUP BY / HAVING 会直接报错**：那类查询返回多行，单值接口只能取到第一行，静默返回部分结果比报错危险。
+  分组聚合请用 `SelectList + Select(聚合表达式 AS 别名)` 扫进自定义 DTO —— 报错信息里也会给出这个提示。
+  分组聚合的结果映射见文末「路线图（Phase 2+）」。
+
+### 单列取值（Pluck）
+
+只查一列、直接拿到强类型切片，不必查全表再循环取值：
+
+```go
+// 推荐：类型全部推导，无需写类型参数
+ids, err := orm.Pluck(ctx, db, orm.NewQuery[User]().Eq(statusCol, 1),
+    orm.TCol(func(u *User) *int64 { return &u.Id }))
+
+// 用 ormgen 生成的列集（类型是 orm.ColExpr，不带字段类型）：元素类型需显式给出
+ids, err = orm.PluckCol[User, int64](ctx, db, q, UserCols.Id)
+```
+
+`F` 应为标量类型；列值为 NULL 时该位置填 `F` 的零值，保持下标与结果集对齐。
+与聚合不同，`Pluck` 是普通查询 —— `OrderBy / Limit / Offset / Join` 照常生效。
+
+> **为什么是两个函数**：Go 无法从接口类型的参数推导类型参数。`Pluck` 的参数是带字段类型的
+> `orm.TColExpr`，因此能全推导；`PluckCol` 接受任意列表达式（含 ormgen 的 `ColExpr`），代价是元素类型必须写明。
+
+### 预览 SQL（ToSQL / DryRun）
+
+```go
+sql, args := q.ToSQL()          // 只看查询构造器自身状态，不访问数据库
+sql, args = orm.DryRun(db, q)   // 补上 db 的方言 / 表前缀 / 软删除条件 —— 真正会执行的那条语句
+```
+
+`ToSQL` 适合单测断言 SQL 与快速排查；`DryRun` 会带上 db 级配置（对标 GORM 的 DryRun），
+适合把语句交给 DBA 复核慢查询。
 
 ### 事务（Transaction）
 
@@ -974,6 +1031,13 @@ list, err := orm.SelectList(ctx, db, orm.NewQuery[User]().
 err := orm.Upsert(ctx, db, &User{Id: 1, Name: "neo", Age: 30}, nil)
 ```
 
+两个容易踩的点，框架都替你处理了：
+
+- **冲突键是自增主键时，该列会被写进 INSERT 列清单**（只要实体上已赋非零值）。否则 INSERT 里没有 `"id"`，`ON CONFLICT ("id")` 永远命不中，「存在则更新」会静默退化成「新增一行」。
+- **自增主键会被回填**，与 `Insert` 一致：PG / SQLite 走 `RETURNING`，MySQL 用 `LAST_INSERT_ID(id)` 技巧（`ON DUPLICATE KEY UPDATE` 走到更新分支时，裸 `LAST_INSERT_ID()` 并不指向该行）。`BatchUpsert` 不回填，与 `BatchInsert` 保持一致。
+
+主键留零值时语义就是「插入新行、主键交给数据库」，此时不会写 `id` 列。`BatchUpsert` 因多行 `VALUES` 必须列数一致，按整批决策：整批都赋了主键才带上该列，只赋了部分会**直接报错**而不是猜。
+
 ### 部分更新（多字段 / map）
 
 不想整行更新时，用 `Query.Set(col, val)` 链式 + `UpdateSets`，或以 `map[string]any` 传 `UpdatePartial` / `UpdateByIdSets`。**强制带 WHERE 条件，禁止全表更新**；向量列同样自动序列化绑定。
@@ -1059,7 +1123,7 @@ db, _ := orm.Open(orm.Config{
 
 ## AutoMigrate（数据库迁移）
 
-`AutoMigrate` 让表结构与 Go 结构体保持一致，**幂等、可重复执行**：先 `CREATE TABLE IF NOT EXISTS` 建表，再按需补 `CREATE INDEX IF NOT EXISTS` 二级索引。它直接读结构体的 `db` tag，**不扩展 `Dialect` 接口**（用方言类型 switch 生成 DDL），三方言（PG / MySQL / SQLite）都能正确产出对应语法。
+`AutoMigrate` 让表结构与 Go 结构体保持一致，**幂等、可重复执行**：先 `CREATE TABLE IF NOT EXISTS` 建表，再按需补二级索引。建索引语句按方言分派 —— PG / SQLite 用 `CREATE INDEX IF NOT EXISTS`，MySQL（含 8.x）不支持该子句（那是 MariaDB 扩展，带上会 `Error 1064`），故生成朴素 `CREATE INDEX`，幂等性由执行时忽略「索引已存在」错误兜住。它直接读结构体的 `db` tag，**不扩展 `Dialect` 接口**（用方言类型 switch 生成 DDL），三方言（PG / MySQL / SQLite）都能正确产出对应语法。
 
 ```go
 type Product struct {
@@ -1182,9 +1246,16 @@ cities, err := orm.SelectList(ctx, db,
 |---|---|---|---|
 | Postgres | `postgres` / `pgx` | Postgres | 默认；支持 jsonb、向量 `<->`（pgvector） |
 | MySQL | `mysql` | MySQL | 支持 `JSON_CONTAINS`；向量类型 `VECTOR(N)` 社区版可建可存，但向量检索函数 `VECTOR_DISTANCE` 与向量索引仅 HeatWave on OCI / MySQL AI 提供（社区版查询会报函数不存在），详见 [VECTOR.md §6/§7](VECTOR.md) |
-| SQLite | `sqlite` / `sqlite3` | SQLite | 支持 `json_extract` / `json_contains`；无原生向量类型 |
+| SQLite | `sqlite` / `sqlite3` | SQLite | 支持 `json_extract`；无 `json_contains` 函数，`JsonContains` 由方言展开为 `json_each` 等价语义；无原生向量类型 |
 
-新增方言只需实现 `Dialect` 接口（`QuoteIdent` / `Placeholder` / `JsonPath` / `JsonContains` / `VectorDistance` / `VectorBind` / `UpsertSuffix` / `SupportsLastInsertID` / `InsertReturning`）并在 `dialectForDriver` 注册。
+新增方言只需实现 `Dialect` 接口（`QuoteIdent` / `Placeholder` / `JsonPath` / `JsonContains` / `VectorDistance` / `VectorBind` / `UpsertSuffix` / `SupportsLastInsertID` / `InsertReturning`）并在 `dialectForDriver` 注册。另有 `upsertReturningDialect` / `upsertPKCapturingDialect` 两个**可选**接口（用类型断言探测）用于 `Upsert` 后回填自增主键 —— 不实现它们不会报错，只是不回填。
+
+---
+
+## 测试与 CI
+
+- **单元测试**：根模块 `go test ./...`。仓库内置一个零依赖的纯 Go mock 驱动，断言生成的 SQL 形状与扫描行为。
+- **真库集成测试**：[`integration/`](integration/README.md) 是独立子模块（驱动由它导入，根模块保持零依赖），在 SQLite / PostgreSQL(pgvector) / MySQL 上跑同一套用例。mock 验不出的东西 —— 驱动返回类型、方言语法是否真的合法、主键回填的两条路径、事务与锁的真实行为 —— 都在这里覆盖。本地 `docker compose up -d` 起库，CI 里是独立 job（数据库不可用时自动退化为只跑 SQLite）。
 
 ---
 

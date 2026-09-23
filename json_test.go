@@ -42,7 +42,9 @@ func TestJsonContainsBuildAllDialects(t *testing.T) {
 	}{
 		{PG, `"meta" @> $1::jsonb`},
 		{MySQL, "JSON_CONTAINS(`meta`, ?)"},
-		{SQLite, `json_contains("meta", ?)`},
+		// SQLite 没有 json_contains 函数（真库实测报 "no such function"），
+		// 方言改用 json_each 展开成等价的浅层「子集」语义。
+		{SQLite, `NOT EXISTS (SELECT 1 FROM json_each(?) AS p WHERE NOT EXISTS (SELECT 1 FROM json_each("meta") AS c`},
 	}
 	for _, c := range cases {
 		q := NewQuery[Doc]().WithDialect(c.d).
@@ -50,6 +52,9 @@ func TestJsonContainsBuildAllDialects(t *testing.T) {
 		sqlStr, args := q.Build()
 		if !strings.Contains(sqlStr, c.want) {
 			t.Fatalf("[%s] JSON 包含查询错误: %s（期望含 %q）", c.d, sqlStr, c.want)
+		}
+		if strings.Contains(sqlStr, "json_contains") {
+			t.Fatalf("[%s] 不应生成 json_contains（SQLite 无此函数）: %s", c.d, sqlStr)
 		}
 		if len(args) != 1 {
 			t.Fatalf("[%s] JsonContains 应有 1 个参数，实际 %d", c.d, len(args))

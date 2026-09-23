@@ -210,6 +210,7 @@ func Upsert[T any](ctx context.Context, db *DB, entity *T, conflictCols []string
 		}
 		cc = []string{meta.pk.colName}
 	}
+	cols = upsertConflictCols(meta, ev, cols, cc)
 	updateCols := make([]string, 0, len(cols))
 	for _, c := range cols {
 		if !contains(cc, c) {
@@ -232,11 +233,123 @@ func Upsert[T any](ctx context.Context, db *DB, entity *T, conflictCols []string
 		}
 		phs = append(phs, ph)
 	}
+	needPK := upsertNeedsPKBackfill(meta, ev)
+	suffix := db.dialect.UpsertSuffix(cc, updateCols)
+	if needPK {
+		// 方言变体：让 LAST_INSERT_ID() 带回命中行的主键（MySQL）。
+		if d, ok := db.dialect.(upsertPKCapturingDialect); ok {
+			suffix = d.UpsertSuffixCapturePK(cc, updateCols, meta.pk.colName)
+		}
+	}
 	sqlStr := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s) %s",
 		quoteTable(meta.finalTable(db.prefix), db.dialect), quoteCols(cols, db.dialect),
-		strings.Join(phs, ", "), db.dialect.UpsertSuffix(cc, updateCols))
-	_, err := db.execContext(ctx, sqlStr, args...)
-	return err
+		strings.Join(phs, ", "), suffix)
+	if needPK {
+		// RETURNING 路径：PG 与 SQLite 3.35+ 在 DO UPDATE 命中时返回的也是目标行，可靠。
+		if d, ok := db.dialect.(upsertReturningDialect); ok {
+			var id int64
+			if err := db.queryRowContext(ctx, sqlStr+d.UpsertReturning(meta.pk.colName), args...).Scan(&id); err != nil {
+				return err
+			}
+			setFieldValue(fieldByCol(ev, meta, meta.pk.colName), id)
+			return nil
+		}
+	}
+	res, err := db.execContext(ctx, sqlStr, args...)
+	if err != nil {
+		return err
+	}
+	// 自增主键回填，与 Insert 对齐：只回填「数据库真正发号」的情形（id > 0 才算数）。
+	if needPK {
+		if id, err := res.LastInsertId(); err == nil && id > 0 {
+			setFieldValue(fieldByCol(ev, meta, meta.pk.colName), id)
+		}
+	}
+	return nil
+}
+
+// upsertConflictCols 返回 upsert 语句的 INSERT 列清单：在 writableCols 的基础上，
+// 把「冲突键里被排除、但实体已赋非零值」的自增主键补回来。
+//
+// 为什么必须补：writableCols（model.go）跳过 autoInc 列，于是
+// Upsert(&User{Id: 7, ...}, []string{"id"}) 生成的 INSERT 里根本没有 "id" 列 ——
+// PG/SQLite 的 ON CONFLICT ("id") 与 MySQL 的 ON DUPLICATE KEY 都无从命中，
+// 数据库另发一个新主键后照常插入：「存在则更新」静默退化成「新增一行」，且不报任何错。
+// 三方言真库实测全中，而 mock 测试恰好把这条错误 SQL 断言成了期望值，所以长期未暴露。
+//
+// 主键为类型零值时**不补**：那时的语义本来就是「插入新行，主键交给数据库」。
+func upsertConflictCols(meta *modelMeta, ev reflect.Value, cols, conflict []string) []string {
+	var extra []string
+	for _, c := range conflict {
+		if contains(cols, c) || contains(extra, c) {
+			continue
+		}
+		fi := fieldInfoForCol(meta, c)
+		// 只补自增主键：ignore 列是用户明确要求忽略的，logic 列由 ORM 接管，都不该被写回。
+		if fi == nil || !fi.autoInc {
+			continue
+		}
+		if fv := fieldByCol(ev, meta, c); fv.IsValid() && !fv.IsZero() {
+			extra = append(extra, c)
+		}
+	}
+	if len(extra) == 0 {
+		return cols
+	}
+	// 冲突键前置：贴近手写 SQL 的阅读习惯（主键在最前），也便于日志排查。
+	return append(extra, cols...)
+}
+
+// upsertNeedsPKBackfill 判断 upsert 后是否需要回填自增主键：
+// 模型有自增主键、且实体里该主键仍是零值（未指定 → 由数据库发号）时为 true。
+func upsertNeedsPKBackfill(meta *modelMeta, ev reflect.Value) bool {
+	if meta.pk == nil || !meta.pk.autoInc {
+		return false
+	}
+	fv := fieldByCol(ev, meta, meta.pk.colName)
+	return fv.IsValid() && fv.IsZero()
+}
+
+// upsertBatchConflictCols 是 upsertConflictCols 的批量版本。
+//
+// 多行 VALUES 要求每行列数一致，所以无法逐行决定补不补，只能整批统一：
+//   - 全部行都赋了非零冲突主键 → 补上该列，各行的「存在则更新」才可能命中；
+//   - 全部行都留零值           → 不补（主键交由数据库发号，等价批量插入）；
+//   - 只有部分行赋值           → 两种解释都错（补列会让未赋值的行走主键 0），直接报错。
+func upsertBatchConflictCols(meta *modelMeta, ents reflect.Value, cols, conflict []string) ([]string, error) {
+	var candidates []string
+	for _, c := range conflict {
+		if contains(cols, c) {
+			continue
+		}
+		if fi := fieldInfoForCol(meta, c); fi != nil && fi.autoInc {
+			candidates = append(candidates, c)
+		}
+	}
+	if len(candidates) == 0 {
+		return cols, nil
+	}
+	n := ents.Len()
+	for _, c := range candidates {
+		assigned := 0
+		for i := 0; i < n; i++ {
+			if fv := fieldByCol(ents.Index(i), meta, c); fv.IsValid() && !fv.IsZero() {
+				assigned++
+			}
+		}
+		switch assigned {
+		case 0:
+			// 整批都交给数据库发号
+		case n:
+			cols = append([]string{c}, cols...) // 同 Upsert：冲突键前置
+		default:
+			return nil, fmt.Errorf("orm: %s 的 BatchUpsert 冲突键 %q 是自增主键，"+
+				"但本批 %d 行里只有 %d 行赋了值 —— 多行 VALUES 列数必须一致，"+
+				"无法只给部分行指定主键。请统一赋值，或把已赋值的行单独成批",
+				meta.table, c, n, assigned)
+		}
+	}
+	return cols, nil
 }
 
 // BatchUpsert 批量 upsert 切片实体，复用 Upsert 的冲突键与方言策略（多行 VALUES）。
@@ -260,6 +373,12 @@ func BatchUpsert[T any](ctx context.Context, db *DB, entities []T, conflictCols 
 			return fmt.Errorf("orm: %s 无主键且未指定冲突键，无法 BatchUpsert", meta.table)
 		}
 		cc = []string{meta.pk.colName}
+	}
+	// 逐行补冲突键列 —— 同一批里各行的自增主键可能有的已赋值、有的没赋值，
+	// 但多行 VALUES 必须列数一致，故这里统一决策（见 upsertBatchConflictCols）。
+	cols, err := upsertBatchConflictCols(meta, reflect.ValueOf(entities), cols, cc)
+	if err != nil {
+		return err
 	}
 	updateCols := make([]string, 0, len(cols))
 	for _, c := range cols {
@@ -291,7 +410,9 @@ func BatchUpsert[T any](ctx context.Context, db *DB, entities []T, conflictCols 
 	sqlStr := fmt.Sprintf("INSERT INTO %s (%s) VALUES %s %s",
 		quoteTable(meta.finalTable(db.prefix), db.dialect), quoteCols(cols, db.dialect),
 		strings.Join(valueRows, ", "), db.dialect.UpsertSuffix(cc, updateCols))
-	_, err := db.execContext(ctx, sqlStr, args...)
+	// 批量不回填自增主键：多行 RETURNING 的返回顺序与行序、以及 MySQL 的
+	// LAST_INSERT_ID + auto_increment_increment 都依赖较多前提，与 BatchInsert 保持一致。
+	_, err = db.execContext(ctx, sqlStr, args...)
 	return err
 }
 
@@ -359,23 +480,18 @@ func SelectOne[T any](ctx context.Context, db *DB, q *Query[T]) (*T, error) {
 }
 
 // Count 返回符合条件的记录数。自动过滤已逻辑删除的行（Unscoped 例外）。
+//
+// 与 SelectList 的口径一致性：JOIN 与主表别名会计入 —— INNER JOIN 会改变行数，
+// 此前 Count 手搓 FROM 把 JOIN 整个漏掉，带 JOIN 的查询算总数会与列表行数不符，
+// 分页页码因此对不上。ORDER BY / LIMIT / OFFSET、GROUP BY / HAVING 与
+// DISTINCT 不参与计数，语义始终是「符合条件的总行数」。
 func Count[T any](ctx context.Context, db *DB, q *Query[T]) (int64, error) {
-	meta := getMeta[T]()
-	args := []any{}
-	idx := 0
-	add := func(v any) int { idx++; args = append(args, v); return idx }
-	w := whereSQL(q.groups, db.dialect, add)
-	if s := logicSuffix(resolveLogic(meta, db), db.dialect, q.unscoped); s != "" {
-		if w == "" {
-			w = s
-		} else {
-			w += " AND " + s
-		}
-	}
-	sqlStr := fmt.Sprintf("SELECT COUNT(*) FROM %s", quoteTable(meta.finalTable(db.prefix), db.dialect))
-	if w != "" {
-		sqlStr += " WHERE " + w
-	}
+	qq := q.applyLogic(getMeta[T](), db).WithDialect(db.dialect).WithPrefix(db.prefix)
+	c := qq.agg("COUNT", "")
+	c.groupBy, c.havings, c.orders, c.distinct = nil, nil, nil, false
+	c.forUpdate, c.last = false, ""
+
+	sqlStr, args := c.Build()
 	rows, err := db.queryContext(ctx, sqlStr, args...)
 	if err != nil {
 		return 0, err
@@ -398,7 +514,7 @@ func Exists[T any](ctx context.Context, db *DB, q *Query[T]) (bool, error) {
 
 // PageResult 通用分页结果：既携带本页数据，也携带分页元数据，方便前端直接渲染分页器。
 type PageResult[T any] struct {
-	List    []T  `json:"list"`    // 本页数据
+	List    []T   `json:"list"`    // 本页数据
 	Page    int   `json:"page"`    // 当前页（1-based，非法值自动归正为 1）
 	Size    int   `json:"size"`    // 每页条数（非法值自动归正为 10）
 	Total   int64 `json:"total"`   // 符合条件的总条数

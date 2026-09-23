@@ -44,6 +44,9 @@ type Query[T any] struct {
 	tableExplicit bool   // true 表示 .Table() 显式指定，前缀不再叠加
 	prefix        string // 来自 DB 的表前缀（仅在自动推导名上生效）
 	selects       []string
+	aggFn         string    // 聚合函数名（SUM / AVG / MAX / MIN / COUNT），非空时投影整体替换为 FN(aggCol)
+	aggCol        string    // 聚合列名；aggFn 为 COUNT 且此处为空时渲染 FN(*)
+	noVecCol      bool      // true 表示投影已完全确定，不要再追加向量距离列（聚合 / Pluck 使用）
 	groups        [][]where // 每组内部 OR 连接，组间 AND 连接
 	orMode        bool      // 下一个条件是否与前一个 OR
 	orders        []order
@@ -60,9 +63,9 @@ type Query[T any] struct {
 	vector        any
 	vecFilterOn   bool
 	vecFilter     float64
-	vectorMetric  VectorMetric // 向量距离度量，默认 L2
-	alias         string       // 主表别名（FROM "users" u），便于在 ON / 条件里引用
-	joins         []join       // 联表子句（JOIN ... ON ...）
+	vectorMetric  VectorMetric   // 向量距离度量，默认 L2
+	alias         string         // 主表别名（FROM "users" u），便于在 ON / 条件里引用
+	joins         []join         // 联表子句（JOIN ... ON ...）
 	sets          map[string]any // 部分更新字段（UpdateSets / UpdatePartial 使用）
 }
 
@@ -120,12 +123,18 @@ func (q *Query[T]) Alias(alias string) *Query[T] {
 //	orm.NewQuery[User]().
 //	  LeftJoin("departments", `"users"."dept_id" = "departments"."id"`).
 //	  Select("users.name", "departments.dept_name")
-func (q *Query[T]) Join(table, on string) *Query[T]    { return q.join("INNER", table, "", on) }
-func (q *Query[T]) LeftJoin(table, on string) *Query[T] { return q.join("LEFT", table, "", on) }
+func (q *Query[T]) Join(table, on string) *Query[T]      { return q.join("INNER", table, "", on) }
+func (q *Query[T]) LeftJoin(table, on string) *Query[T]  { return q.join("LEFT", table, "", on) }
 func (q *Query[T]) RightJoin(table, on string) *Query[T] { return q.join("RIGHT", table, "", on) }
-func (q *Query[T]) JoinAs(table, alias, on string) *Query[T] { return q.join("INNER", table, alias, on) }
-func (q *Query[T]) LeftJoinAs(table, alias, on string) *Query[T] { return q.join("LEFT", table, alias, on) }
-func (q *Query[T]) RightJoinAs(table, alias, on string) *Query[T] { return q.join("RIGHT", table, alias, on) }
+func (q *Query[T]) JoinAs(table, alias, on string) *Query[T] {
+	return q.join("INNER", table, alias, on)
+}
+func (q *Query[T]) LeftJoinAs(table, alias, on string) *Query[T] {
+	return q.join("LEFT", table, alias, on)
+}
+func (q *Query[T]) RightJoinAs(table, alias, on string) *Query[T] {
+	return q.join("RIGHT", table, alias, on)
+}
 
 func (q *Query[T]) join(kind, table, alias, on string) *Query[T] {
 	if !identRe.MatchString(table) {
@@ -180,12 +189,12 @@ func (q *Query[T]) appendWhere(w where) *Query[T] {
 	return q
 }
 
-func (q *Query[T]) Eq(col ColExpr, val any) *Query[T]    { return q.addWhere(col.name, "=", []any{val}) }
-func (q *Query[T]) Ne(col ColExpr, val any) *Query[T]    { return q.addWhere(col.name, "!=", []any{val}) }
-func (q *Query[T]) Gt(col ColExpr, val any) *Query[T]    { return q.addWhere(col.name, ">", []any{val}) }
-func (q *Query[T]) Ge(col ColExpr, val any) *Query[T]    { return q.addWhere(col.name, ">=", []any{val}) }
-func (q *Query[T]) Lt(col ColExpr, val any) *Query[T]    { return q.addWhere(col.name, "<", []any{val}) }
-func (q *Query[T]) Le(col ColExpr, val any) *Query[T]    { return q.addWhere(col.name, "<=", []any{val}) }
+func (q *Query[T]) Eq(col ColExpr, val any) *Query[T] { return q.addWhere(col.name, "=", []any{val}) }
+func (q *Query[T]) Ne(col ColExpr, val any) *Query[T] { return q.addWhere(col.name, "!=", []any{val}) }
+func (q *Query[T]) Gt(col ColExpr, val any) *Query[T] { return q.addWhere(col.name, ">", []any{val}) }
+func (q *Query[T]) Ge(col ColExpr, val any) *Query[T] { return q.addWhere(col.name, ">=", []any{val}) }
+func (q *Query[T]) Lt(col ColExpr, val any) *Query[T] { return q.addWhere(col.name, "<", []any{val}) }
+func (q *Query[T]) Le(col ColExpr, val any) *Query[T] { return q.addWhere(col.name, "<=", []any{val}) }
 
 // Like 包含匹配（模糊查询），内部自动在两侧加 %，调用方无需自己拼接百分号。
 // 等价于 LIKE '%val%'。若 val 本身含 % 或 _，则按 LIKE 通配符规则解释。
@@ -226,8 +235,8 @@ func (q *Query[T]) NotIn(col ColExpr, vals []any) *Query[T] {
 func (q *Query[T]) Between(col ColExpr, lo, hi any) *Query[T] {
 	return q.addWhere(col.name, "BETWEEN", []any{lo, hi})
 }
-func (q *Query[T]) IsNull(col ColExpr) *Query[T]     { return q.addRaw(col.name, "IS NULL") }
-func (q *Query[T]) IsNotNull(col ColExpr) *Query[T]  { return q.addRaw(col.name, "IS NOT NULL") }
+func (q *Query[T]) IsNull(col ColExpr) *Query[T]    { return q.addRaw(col.name, "IS NULL") }
+func (q *Query[T]) IsNotNull(col ColExpr) *Query[T] { return q.addRaw(col.name, "IS NOT NULL") }
 
 // Json 在 JSON 列上按路径做比较（路径串形如 "a.b.c"，无法用结构体字段 picker 选取，故为字符串）。
 // 支持的 op：= != > >= < <= LIKE。渲染按方言展开：
@@ -493,6 +502,10 @@ func contains(ss []string, s string) bool {
 // Build 生成最终 SQL 与参数。向量（若有）恒为第一个占位符。
 func (q *Query[T]) Build() (string, []any) {
 	d := q.dialect
+	// 投影已被完全指定时（聚合 SUM/AVG/... 或 Pluck 的单列投影），不要再追加向量距离列：
+	// 结果集会从 1 列变成 2 列，Scan 单值直接报 "expected 1 destination arguments in Scan"。
+	// 另外聚合时的向量排序也要跳过（见下方 ORDER BY），否则是非法 SQL。
+	noVecCol := q.noVecCol
 	args := []any{}
 	idx := 0
 	add := func(v any) int {
@@ -506,14 +519,23 @@ func (q *Query[T]) Build() (string, []any) {
 	}
 
 	sel := "*"
-	if len(q.selects) > 0 {
+	switch {
+	case q.aggFn != "":
+		// 聚合投影：SUM/AVG/MAX/MIN/COUNT。列名同样走 quoteIdentPath，
+		// 与普通 Select 保持一致（支持 "u.name" 这种带别名的列路径）。
+		if q.aggCol == "" {
+			sel = q.aggFn + "(*)"
+		} else {
+			sel = q.aggFn + "(" + quoteIdentPath(d, q.aggCol) + ")"
+		}
+	case len(q.selects) > 0:
 		quoted := make([]string, len(q.selects))
 		for i, c := range q.selects {
 			quoted[i] = quoteIdentPath(d, c)
 		}
 		sel = strings.Join(quoted, ", ")
 	}
-	if q.hasVector {
+	if q.hasVector && !noVecCol {
 		dist := fmt.Sprintf("%s AS dist", d.VectorDistance(q.vecCol, d.Placeholder(1), q.vectorMetric))
 		if sel == "*" {
 			sel = "*" + ", " + dist
@@ -521,17 +543,7 @@ func (q *Query[T]) Build() (string, []any) {
 			sel = sel + ", " + dist
 		}
 	}
-	from := quoteTable(q.finalTable(), d)
-	if q.alias != "" {
-		from += " " + d.QuoteIdent(q.alias)
-	}
-	for _, j := range q.joins {
-		from += fmt.Sprintf(" %s JOIN %s", j.kind, quoteTable(j.table, d))
-		if j.alias != "" {
-			from += " " + d.QuoteIdent(j.alias)
-		}
-		from += " ON " + j.on
-	}
+	from := q.fromClause(d)
 	kw := "SELECT"
 	if q.distinct {
 		kw = "SELECT DISTINCT"
@@ -571,13 +583,21 @@ func (q *Query[T]) Build() (string, []any) {
 		ords := make([]string, 0, len(q.orders))
 		for _, o := range q.orders {
 			if o.vec {
-			ords = append(ords, fmt.Sprintf("%s %s", d.VectorDistance(q.vecCol, d.Placeholder(1), q.vectorMetric), ascDesc(o.asc)))
-		} else {
-			ords = append(ords, fmt.Sprintf("%s %s", d.QuoteIdent(o.col), ascDesc(o.asc)))
+				// 聚合查询里「按距离排序」是非法的：距离表达式既不在投影里也不在
+				// GROUP BY 里，PG 会直接报 "must appear in the GROUP BY clause or
+				// be used in an aggregate function"。聚合场景整段跳过。
+				if q.aggFn != "" {
+					continue
+				}
+				ords = append(ords, fmt.Sprintf("%s %s", d.VectorDistance(q.vecCol, d.Placeholder(1), q.vectorMetric), ascDesc(o.asc)))
+			} else {
+				ords = append(ords, fmt.Sprintf("%s %s", d.QuoteIdent(o.col), ascDesc(o.asc)))
+			}
 		}
-	}
-	sql += " ORDER BY " + strings.Join(ords, ", ")
-	} else if q.hasVector {
+		if len(ords) > 0 {
+			sql += " ORDER BY " + strings.Join(ords, ", ")
+		}
+	} else if q.hasVector && q.aggFn == "" {
 		sql += fmt.Sprintf(" ORDER BY %s", d.VectorDistance(q.vecCol, d.Placeholder(1), q.vectorMetric))
 	}
 
@@ -612,6 +632,43 @@ func (q *Query[T]) Build() (string, []any) {
 		sql += " " + strings.TrimSpace(q.last)
 	}
 	return sql, args
+}
+
+// ToSQL 返回当前查询编译出的 SQL 与参数，不访问数据库，对标 GORM 的 DryRun。
+//
+// 它只反映查询构造器自身的状态：不会补上 db 级表前缀、方言与软删除条件。
+// 要看「这条查询在某个 db 上真正会执行什么」，用 orm.DryRun(db, q)。
+func (q *Query[T]) ToSQL() (string, []any) { return q.Build() }
+
+// fromClause 渲染 "表 [别名] [JOIN ...]"，供 Build / Count / 聚合共用。
+//
+// 历史上 Count 自己手搓了 FROM，把 JOIN 整个漏掉了 —— 带 JOIN 的查询算总数时
+// 与 SelectList 的行数口径不一致（分页页码因此对不上）。统一到这里是修那个 bug 的一部分。
+func (q *Query[T]) fromClause(d Dialect) string {
+	s := quoteTable(q.finalTable(), d)
+	if q.alias != "" {
+		s += " " + d.QuoteIdent(q.alias)
+	}
+	for _, j := range q.joins {
+		s += fmt.Sprintf(" %s JOIN %s", j.kind, quoteTable(j.table, d))
+		if j.alias != "" {
+			s += " " + d.QuoteIdent(j.alias)
+		}
+		s += " ON " + j.on
+	}
+	return s
+}
+
+// agg 返回一个「投影被替换成聚合函数」的新查询（原查询不被修改）。
+// LIMIT / OFFSET 在聚合场景下会改变语义（只取部分行再聚合），故一并清空。
+func (q *Query[T]) agg(fn, col string) *Query[T] {
+	c := *q
+	c.aggFn = fn
+	c.aggCol = col
+	c.noVecCol = true
+	c.limit = 0
+	c.offset = 0
+	return &c
 }
 
 // whereSQL 把条件组渲染成 WHERE 子句（不含前缀 "WHERE"）。各组 AND，组内 OR。

@@ -11,6 +11,25 @@ type ColExpr struct {
 	name string
 }
 
+// Name 返回解析后的列名（只读）。聚合 / 投影这类「需要列名原值」的场景用它，
+// 调试时也可以直接打印表达式看清楚到底选中了哪一列。
+func (c ColExpr) Name() string { return c.name }
+
+// TColExpr 带字段类型的列表达式：既携带列名，也携带字段的 Go 类型 F。
+//
+// 它解决的问题是：Col 的返回类型把 F 擦除了，于是 Pluck / MaxOf 这类
+// 「结果类型取决于列」的函数无法从参数推导出 F，调用方被迫手写全部类型参数
+// （orm.Pluck[User, int64](...)）。用 TCol 则全部类型可从闭包字面量推导：
+//
+//	ids, err := orm.Pluck(ctx, db, q, orm.TCol(func(u *User) *int64 { return &u.ID }))
+type TColExpr[T any, F any] struct{ ColExpr }
+
+// TCol 同时解析列名与字段类型（Col 只解析列名）。
+// 列名的推导规则与 Col 完全一致，因此同样受「列名只来自结构体 db tag」的约束。
+func TCol[T any, F any](picker func(*T) *F) TColExpr[T, F] {
+	return TColExpr[T, F]{ColExpr: Col[T, F](picker)}
+}
+
 // Col 把一个「返回字段指针的闭包」解析成数据库列名。
 //
 // 用法：

@@ -2,6 +2,20 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/)。
 
+## v0.1.12（未发布）
+
+- **feat: 聚合函数 `Sum` / `Avg` / `Max` / `Min`**：此前只有 `Count`，`Sum/Avg/Max/Min` 全部缺席，用户跟着 README 学完 `GroupBy` 后要算 SUM 只能退回 `RawQuery`。现补齐四个基础聚合，并额外提供强类型版本 `SumOf / AvgOf / MaxOf / MinOf`（元素类型由 `orm.TCol` 推导，PG 的 numeric → `time.Time`/`int64`/`float64` 转换交给 `database/sql`）。聚合列仍只来自结构体 `db` tag，未给「三层防注入」开后门（`aggregate.go` + `aggregate_test.go`）。
+- **feat: `Pluck` / `PluckCol` 单列投影**：`SELECT col FROM ...` 直接返回 `[]F`，替代「查全表再循环取值」。`Query` 新增 `TColExpr[T, F]` 与 `orm.TCol`（`Col` 的类型参数 F 被擦除，`TCol` 保留它），因此 `Pluck` 的类型可全推导；因 Go 无法从接口类型的参数推导类型参数，列集来自 ormgen（类型是 `orm.ColExpr`）时走 `PluckCol` 并显式给出元素类型（`column.go` + `aggregate.go`）。
+- **feat: `Query.ToSQL()` 与 `orm.DryRun(db, q)`**：不访问数据库即可拿到最终 SQL 与参数（对标 GORM 的 DryRun）。`ToSQL` 只反映查询自身状态；`DryRun` 会补上 db 级方言、表前缀与软删除条件，即「真正会执行的那条语句」。
+- **fix: `Count` 遗漏 JOIN（总数与列表口径不一致）**：`Count` 此前自己拼 `FROM`，把 `JOIN` 整个漏掉 —— INNER JOIN 会改变行数，于是 `Count` 算出的总数与 `SelectList` 的实际行数不符，`Page` 的页码/`HasNext` 随之出错（测试环境单表时正常，上生产带联表才暴露）。现统一到 `Query.fromClause`，与聚合共用一处实现；`Exists` 顺带修正（`crud.go` + `query.go` + `aggregate_test.go`）。
+- **fix: 聚合 / 单列投影下的向量列**：聚合与 `Pluck` 的投影是确定的，此时再追加向量距离列会让结果集从 1 列变 2 列（`Scan` 报 `expected 1 destination arguments in Scan`），且聚合查询里的「按距离排序」在 PG 下是非法 SQL（`ORDER BY` 表达式的列既不在投影也不在 `GROUP BY`）。现按场景剔除（`query.go` + `aggregate_test.go`）。
+- **fix: `Upsert` 在自增主键上静默新增（数据损坏级）**：对已存在行执行 `Upsert(e, []string{"id"})` 会**多出一行**而不是更新目标行 —— `writableCols` 跳过 `autoInc` 列，INSERT 语句里没有 `"id"`，`ON CONFLICT ("id")` / `ON DUPLICATE KEY` 因此永不命中，数据库另发新主键后照常插入，且不报任何错。三方言真库实测全中；既有 mock 测试 `TestUpsertPG` / `TestUpsertMySQL` 恰好把这条错误 SQL 断言成了「期望值」，所以长期未暴露。现补 `upsertConflictCols`：冲突键是自增主键且实体已赋非零值时，把该列补进 INSERT 列清单（值为零时仍省略，交给数据库发号）。批量版 `upsertBatchConflictCols` 受多行 VALUES 列数一致约束，按整批决策 —— 只有部分行赋了主键时**直接报错**，而不是猜（`crud.go` + `layer1_test.go`）。
+- **feat: `Upsert` 回填自增主键**：与 `Insert` 对齐 —— PG / SQLite 走 `INSERT ... ON CONFLICT ... RETURNING`（`DO UPDATE` 命中时返回的也是目标行），MySQL 在 `ON DUPLICATE KEY UPDATE` 末尾追加官方技巧 `` `id` = LAST_INSERT_ID(`id`) ``（走到更新分支时裸 `LAST_INSERT_ID()` 并不指向该行）。两个能力以**可选接口**（`upsertReturningDialect` / `upsertPKCapturingDialect`）探测，不扩展 `Dialect` 接口本体，自定义方言无需改动。批量 `BatchUpsert` 仍不回填，与 `BatchInsert` 保持一致（`crud.go` + `dialect.go`）。
+- **fix: MySQL 不支持 `CREATE INDEX IF NOT EXISTS`**：AutoMigrate 此前一律生成该子句，MySQL（含 8.x）会直接报 `Error 1064` 语法错误（`IF NOT EXISTS` 只有 MariaDB 有）。现由 `createIndexSQL` 按方言分派：MySQL 生成朴素 `CREATE INDEX`，幂等性改由 `AutoMigrate` 忽略「索引已存在」错误（`isDuplicateIndexErr`，匹配 MySQL 1061 与 PG/SQLite 的 already exists）兜住（`migrate.go` + `migrate_test.go`）。
+- **fix: SQLite 的 `JsonContains` 生成不存在的函数**：SQLite 的 JSON1 扩展**没有** `json_contains`，此前生成的 `json_contains(col, ?)` 执行即报错。现用 `json_each` 展开成等价的浅层「子集」语义（候选对象的每个键值对都能在列对象里同名同值同类型地找到），与 PG 的 `@>`、MySQL 的 `JSON_CONTAINS` 对齐（仅浅层，不递归嵌套）（`dialect.go` + `json_test.go`）。
+- **fix: SQLite 的时间列聚合扫不回来**：`MAX(col)` / `MIN(col)` 是没有声明类型的表达式，modernc 驱动只能按 TEXT 交回（实测形态是 Go 的 `time.Time.String()`，如 `2026-09-01 16:00:00 +0000 UTC`），`sql.Null[time.Time]` 因此扫描失败；同一字段读原始列却正常（列声明了 `DATETIME`）。现 `MaxOf` / `MinOf` 的时间分支先扫成 `any` 再按多方言时间文本归一（`aggregate.go` + `aggregate_test.go`）。
+- **test: 真库集成测试子模块 `integration/`**：mock 只断言「生成了什么 SQL 字符串」，验不出驱动返回类型、方言语法合法性、主键回填的两条路径、事务/锁/约束的真实行为。新增嵌套模块（驱动由它导入，主模块保持零依赖；沿用 `examples/` 的 `replace => ..` 约定）在 SQLite / PostgreSQL(pgvector) / MySQL 上各跑同一套 24 个用例，附 `docker-compose.yml` 与独立 CI job；真库跑出并回归了上面这批方言问题（`integration/` + `.github/workflows/ci.yml`）。
+
 ## v0.1.11 (2026-09-04)
 
 - **fix: 读写分离下悲观锁读路由主库**：`executor.go` 的 `isWriteQuery` 增加 `FOR UPDATE` / `FOR SHARE` / `FOR KEY SHARE` / `FOR NO KEY UPDATE` 子串判定，命中即按写请求路由到主库，修复只读副本上 `SELECT ... FOR UPDATE` 悲观锁失效或报 `Table is read only` 的隐患（测试环境单库正常、上生产才暴露的典型坑）。

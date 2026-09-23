@@ -72,7 +72,9 @@ func TestJoinInvalidTablePanics(t *testing.T) {
 func TestUpsertPG(t *testing.T) {
 	db := NewDB(mustOpenMock(t), PG)
 	_ = Upsert(context.Background(), db, &User{Id: 1, Name: "a", Age: 3}, nil)
-	want := `INSERT INTO "users" ("name", "age") VALUES ($1, $2) ON CONFLICT ("id") DO UPDATE SET "name" = EXCLUDED."name", "age" = EXCLUDED."age"`
+	// 冲突键是自增主键、且实体已赋值 → 必须把它写进 INSERT 列清单，
+	// 否则 ON CONFLICT ("id") 永远命不中（真库实测会静默新增一行）。
+	want := `INSERT INTO "users" ("id", "name", "age") VALUES ($1, $2, $3) ON CONFLICT ("id") DO UPDATE SET "name" = EXCLUDED."name", "age" = EXCLUDED."age"`
 	if recQuery != want {
 		t.Fatalf("PG Upsert SQL 错误:\n 实际 %s\n 期望 %s", recQuery, want)
 	}
@@ -81,17 +83,100 @@ func TestUpsertPG(t *testing.T) {
 func TestUpsertMySQL(t *testing.T) {
 	db := NewDB(mustOpenMock(t), MySQL)
 	_ = Upsert(context.Background(), db, &User{Id: 1, Name: "a", Age: 3}, nil)
-	want := "INSERT INTO `users` (`name`, `age`) VALUES (?, ?) ON DUPLICATE KEY UPDATE `name` = VALUES(`name`), `age` = VALUES(`age`)"
+	want := "INSERT INTO `users` (`id`, `name`, `age`) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE `name` = VALUES(`name`), `age` = VALUES(`age`)"
 	if recQuery != want {
 		t.Fatalf("MySQL Upsert SQL 错误:\n 实际 %s\n 期望 %s", recQuery, want)
 	}
 }
 
+// TestUpsertPGBackfillsPK 校验 PG 侧 upsert 后回填自增主键（与 Insert 对齐）。
+func TestUpsertPGBackfillsPK(t *testing.T) {
+	db := NewDB(mustOpenMock(t), PG)
+	u := User{Name: "a", Age: 3} // Id 留零值 → 由数据库发号
+	if err := Upsert(context.Background(), db, &u, nil); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(recQuery, `RETURNING "id"`) {
+		t.Fatalf("PG 回填主键应走 RETURNING: %s", recQuery)
+	}
+	if u.Id != 1 {
+		t.Fatalf("未回填自增主键，Id = %d（期望 mock 返回的 1）", u.Id)
+	}
+}
+
+// TestUpsertMySQLCapturesPK 校验 MySQL 侧用 LAST_INSERT_ID(id) 技巧带回主键：
+// ON DUPLICATE KEY UPDATE 走到更新分支时，裸的 LAST_INSERT_ID() 并不指向该行。
+func TestUpsertMySQLCapturesPK(t *testing.T) {
+	db := NewDB(mustOpenMock(t), MySQL)
+	u := User{Name: "a", Age: 3}
+	if err := Upsert(context.Background(), db, &u, nil); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(recQuery, "`id` = LAST_INSERT_ID(`id`)") {
+		t.Fatalf("MySQL 应追加 LAST_INSERT_ID 主键捕获: %s", recQuery)
+	}
+	if strings.Contains(recQuery, "RETURNING") {
+		t.Fatalf("MySQL 不支持 RETURNING: %s", recQuery)
+	}
+	if u.Id != 1 {
+		t.Fatalf("未回填自增主键，Id = %d（期望 mock 返回的 1）", u.Id)
+	}
+}
+
+// TestUpsertZeroPKOmitsPKColumn 是上面两条的反面：
+// 主键留零值时语义就是「插入新行、主键交给数据库」，此时不应把 id 写进列清单。
+func TestUpsertZeroPKOmitsPKColumn(t *testing.T) {
+	for _, d := range []struct {
+		name string
+		d    Dialect
+	}{{"pg", PG}, {"mysql", MySQL}, {"sqlite", SQLite}} {
+		recQuery = ""
+		db := NewDB(mustOpenMock(t), d.d)
+		_ = Upsert(context.Background(), db, &User{Name: "a", Age: 3}, nil)
+		if contains(insertColNames(recQuery), "id") {
+			t.Fatalf("[%s] 主键为零值时不应写入 id 列: %s", d.name, recQuery)
+		}
+	}
+}
+
+// TestUpsertNoUpdateCols 校验「只有冲突键一列」时退化为 DO NOTHING。
 func TestUpsertNoUpdateCols(t *testing.T) {
 	db := NewDB(mustOpenMock(t), PG)
 	_ = Upsert(context.Background(), db, &OnlyPK{Id: 7}, nil)
+	if !strings.Contains(recQuery, `("id") VALUES ($1)`) {
+		t.Fatalf("仅冲突键时应带上该列: %s", recQuery)
+	}
 	if !strings.Contains(recQuery, `ON CONFLICT ("id") DO NOTHING`) {
 		t.Fatalf("无可更新列时应退化为 DO NOTHING: %s", recQuery)
+	}
+}
+
+// TestBatchUpsertConflictPKRules 覆盖批量 upsert 在自增冲突键上的整批决策。
+func TestBatchUpsertConflictPKRules(t *testing.T) {
+	ctx := context.Background()
+
+	// 全批都赋了值 → 整批带上主键列。
+	recQuery = ""
+	db := NewDB(mustOpenMock(t), PG)
+	if err := BatchUpsert(ctx, db, []User{{Id: 1, Name: "a"}, {Id: 2, Name: "b"}}, []string{"id"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(recQuery, `("id", "name", "age")`) {
+		t.Fatalf("整批已赋值应带上主键列: %s", recQuery)
+	}
+
+	// 全批都留零值 → 不补主键列（主键交给数据库）。
+	recQuery = ""
+	if err := BatchUpsert(ctx, db, []User{{Name: "a"}, {Name: "b"}}, []string{"id"}); err != nil {
+		t.Fatal(err)
+	}
+	if contains(insertColNames(recQuery), "id") {
+		t.Fatalf("整批未赋值不应带主键列: %s", recQuery)
+	}
+
+	// 只赋了部分 → 无法表达，必须报错而不是静默犯错。
+	if err := BatchUpsert(ctx, db, []User{{Id: 1, Name: "a"}, {Name: "b"}}, []string{"id"}); err == nil {
+		t.Fatal("部分行赋主键时应报错（多行 VALUES 列数必须一致）")
 	}
 }
 
@@ -168,6 +253,26 @@ func TestOptimisticLockConflict(t *testing.T) {
 }
 
 // ---- 测试辅助 ----
+
+// insertColNames 从记录的 SQL 里取出 INSERT 的列名（去掉方言引号）。
+// 不能直接对整条 SQL 做 Contains 断言 —— 冲突键列名同样会出现在
+// ON CONFLICT ("id") / ON DUPLICATE KEY 里，会给出假阳性。
+func insertColNames(sqlStr string) []string {
+	open := strings.Index(sqlStr, "(")
+	if open < 0 {
+		return nil
+	}
+	rel := strings.Index(sqlStr[open:], ")")
+	if rel < 0 {
+		return nil
+	}
+	parts := strings.Split(sqlStr[open+1:open+rel], ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		out = append(out, strings.Trim(strings.TrimSpace(p), "`\""))
+	}
+	return out
+}
 
 func mustOpenMock(t *testing.T) *sql.DB {
 	t.Helper()

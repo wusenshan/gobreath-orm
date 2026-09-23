@@ -2,6 +2,7 @@ package orm
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -68,8 +69,35 @@ func TestMigrateStatementsMySQL(t *testing.T) {
 			t.Fatalf("MySQL 建表语句缺少 %q:\n%s", f, create)
 		}
 	}
-	if !strings.Contains(stmts[1], "CREATE INDEX IF NOT EXISTS `idx_users_age` ON `users` (`age`)") {
+	// MySQL 不支持 CREATE INDEX IF NOT EXISTS（那是 MariaDB 扩展，8.x 会 Error 1064），
+	// 所以生成朴素 CREATE INDEX，幂等性由 AutoMigrate 忽略「索引已存在」错误来兜。
+	if !strings.Contains(stmts[1], "CREATE INDEX `idx_users_age` ON `users` (`age`)") {
 		t.Fatalf("MySQL 应生成 age 二级索引，实际: %s", stmts[1])
+	}
+	if strings.Contains(stmts[1], "IF NOT EXISTS") {
+		t.Fatalf("MySQL 索引语句不应带 IF NOT EXISTS（语法错误）: %s", stmts[1])
+	}
+}
+
+// TestIsDuplicateIndexErr 覆盖「幂等建索引」所依赖的错误文本识别。
+// 这条兜底是 MySQL 路径必需的：它不支持 CREATE INDEX IF NOT EXISTS，
+// 重复执行只能靠忽略「索引已存在」错误。
+func TestIsDuplicateIndexErr(t *testing.T) {
+	cases := []struct {
+		err  error
+		want bool
+	}{
+		{nil, false},
+		{errors.New("Error 1061: Duplicate key name 'idx_users_age'"), true}, // MySQL
+		{errors.New(`ERROR: relation "idx_users_age" already exists`), true}, // PG
+		{errors.New("index idx_users_age already exists"), true},             // SQLite
+		{errors.New("Error 1064: You have an error in your SQL syntax"), false},
+		{errors.New("no such table: users"), false},
+	}
+	for _, c := range cases {
+		if got := isDuplicateIndexErr(c.err); got != c.want {
+			t.Errorf("isDuplicateIndexErr(%v) = %v；期望 %v", c.err, got, c.want)
+		}
 	}
 }
 
