@@ -1,0 +1,44 @@
+# 集成测试用数据库。端口刻意选 5433 / 3307，避免与本机已装的 PG / MySQL 撞车。
+#
+#   docker compose up -d
+#   docker compose down -v        # 连数据卷一起清掉
+#
+# 起好后按 README.md 里的环境变量跑 go test 即可。
+services:
+  postgres:
+    # 用 pgvector 官方镜像：向量列（,vector(N)）与 Nearest/WithinDistance
+    # 的集成测试需要 vector 扩展，普通 postgres 镜像跑不了。
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: gobreath
+      POSTGRES_PASSWORD: gobreath
+      POSTGRES_DB: gobreath
+    ports:
+      - "5433:5432"
+    volumes:
+      # 首次初始化时自动 CREATE EXTENSION vector
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gobreath"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  mysql:
+    # 8.0：注意 MySQL 要到 9.0 才有原生 VECTOR 类型，8.0 下向量相关用例会跳过。
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: gobreath
+      MYSQL_DATABASE: gobreath
+    ports:
+      - "3307:3306"
+    command:
+      # 与生产常见的宽松配置保持一致；不关严格模式，
+      # 因为「零值时间被拒」本身就是要在集成测试里暴露的行为。
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_general_ci
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -uroot -pgobreath --silent"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
