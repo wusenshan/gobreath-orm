@@ -92,10 +92,22 @@ func (r *mockRows) Next(dest []driver.Value) error {
 
 var mockRegistry = map[string]*mockRows{}
 
+// mockFactories 与 mockRegistry 的区别：注册的是「每次查询现造一份」的工厂。
+//
+// mockRegistry 复用同一个 *mockRows 实例，而 mockRows.Next 会推进内部 pos，
+// 所以同一个实例第二次被查询就直接 EOF —— 单次断言够用，循环里（基准测试）不行。
+// 工厂先于 registry 匹配，现有用例不受影响。
+var mockFactories = map[string]func() driver.Rows{}
+
 func mockRowsFor(query string) driver.Rows {
 	// PostgreSQL 自增主键回填走 INSERT ... RETURNING "id"，优先匹配并返回单行单列 id。
 	if strings.Contains(strings.ToUpper(query), "RETURNING") {
 		return &mockRows{cols: []string{"id"}, data: [][]driver.Value{{driver.Value(int64(1))}}}
+	}
+	for k, f := range mockFactories {
+		if strings.Contains(query, k) {
+			return f()
+		}
 	}
 	for k, v := range mockRegistry {
 		if strings.Contains(query, k) {
@@ -107,11 +119,17 @@ func mockRowsFor(query string) driver.Rows {
 
 func newMockDB(t *testing.T) *DB {
 	t.Helper()
+	return newMockDBFor(t)
+}
+
+// newMockDBFor 与 newMockDB 同义，只是接受 testing.TB —— 基准测试拿到的是 *testing.B。
+func newMockDBFor(tb testing.TB) *DB {
+	tb.Helper()
 	sqlDB, err := sql.Open("ormmock", "")
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
-	t.Cleanup(func() { sqlDB.Close() })
+	tb.Cleanup(func() { sqlDB.Close() })
 	return NewDB(sqlDB, SQLite)
 }
 

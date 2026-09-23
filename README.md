@@ -1256,9 +1256,9 @@ cities, err := orm.SelectList(ctx, db,
 
 ## 测试与 CI
 
-- **单元测试**：根模块 `go test ./...`。仓库内置一个零依赖的纯 Go mock 驱动，断言生成的 SQL 形状与扫描行为。
+- **单元测试**：根模块 `go test ./...`。仓库内置一个零依赖的纯 Go mock 驱动，断言生成的 SQL 形状与扫描行为；并可用 `go test -run "^$" -bench BenchmarkScanList -benchmem` 度量**纯 ORM 层**开销（不经数据库引擎，`B/op` 与 `allocs/op` 逐字节可复现）。
 - **真库集成测试**：[`integration/`](integration/README.md) 是独立子模块（驱动由它导入，根模块保持零依赖），在 SQLite / PostgreSQL(pgvector) / MySQL 上跑同一套用例。mock 验不出的东西 —— 驱动返回类型、方言语法是否真的合法、主键回填的两条路径、事务与锁的真实行为 —— 都在这里覆盖。本地 `docker compose up -d` 起库，CI 里是独立 job（数据库不可用时自动退化为只跑 SQLite）。
-- **横向性能基准**：[`bench/`](bench/README.md) 也是独立子模块，用同一张表 / 同一份数据 / 语义相同的 SQL 对照 `database/sql`、GORM 与本库。里面有两层价值：`TestResultParity` / `TestSQLParity` 断言三层**在做同一件事**（进 CI），以及 5 个单表场景 + 分批大小的实测数据（不进 CI —— 共享 runner 的 CPU 噪声会让 ns/op 失去意义）。测出来的东西反过来指导实现，例如「`ListPage` 的反射行映射是唯一明显落后于裸 SQL 的读路径」就是那里读出来的。
+- **横向性能基准**：[`bench/`](bench/README.md) 也是独立子模块，用同一张表 / 同一份数据 / 语义相同的 SQL 对照 `database/sql`、GORM 与本库。里面有两层价值：`TestResultParity` / `TestSQLParity` 断言三层**在做同一件事**（进 CI），以及 5 个单表场景 + 分批大小的实测数据（不进 CI —— 共享 runner 的 CPU 噪声会让 ns/op 失去意义；本机单次抖动也可达 ±40%，所以结论一律以 `B/op` / `allocs/op` 为准）。测出来的东西反过来指导实现 —— 「`ListPage` 的行映射偏贵」正是那里读出来的，改完后 50 行列表的分配从 123.6 KB 降到 63.8 KB（详情与读数注意事项见该 README）。
 
 ---
 

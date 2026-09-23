@@ -163,10 +163,15 @@ func queryListReflect(ctx context.Context, db *DB, typ reflect.Type, meta *model
 		return nil, err
 	}
 	defer rows.Close()
+	// 与 SelectList 同理：扫描器按查询构造一次，不在逐行里重建映射计划与缓冲。
+	sc, err := newRowScannerMeta(rows, meta)
+	if err != nil {
+		return nil, err
+	}
 	out := make([]reflect.Value, 0, len(vals))
 	for rows.Next() {
 		ptr := reflect.New(typ)
-		if err := scanStruct(rows, ptr.Interface()); err != nil {
+		if err := sc.scanInto(rows, ptr.Interface()); err != nil {
 			return nil, err
 		}
 		out = append(out, ptr)

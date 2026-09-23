@@ -456,10 +456,16 @@ func SelectList[T any](ctx context.Context, db *DB, q *Query[T]) ([]T, error) {
 		return nil, err
 	}
 	defer rows.Close()
+	// 扫描器按查询构造一次：列映射计划与扫描缓冲都与具体某一行无关，
+	// 逐行重建是列表路径上最大的一笔浪费。
+	sc, err := newRowScanner(rows, (*T)(nil))
+	if err != nil {
+		return nil, err
+	}
 	var out []T
 	for rows.Next() {
 		var t T
-		if err := scanStruct(rows, &t); err != nil {
+		if err := sc.scanInto(rows, &t); err != nil {
 			return nil, err
 		}
 		out = append(out, t)
