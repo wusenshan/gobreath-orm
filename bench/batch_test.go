@@ -76,7 +76,7 @@ func BenchmarkBatchInsert(b *testing.B) {
 // rawInsertChunked 手写 SQL 的分批插入。
 // 与 ORM 层用同一个分批循环骨架，差异只在「构造语句」这一段。
 //
-// 语句用 strings.Builder 拼而不是 `+=`：后者对 2000 行是 O(n²) 的字符串拷贝，
+// 语句用 strings.Builder 拼而不是 `+=`：后者对整批行数是 O(n²) 的字符串拷贝，
 // 会把 raw 层的分配量抬到几十 MB，等于送给下界一个假的高水位。
 func rawInsertChunked(ctx context.Context, db *sql.DB, rows []benchRow, chunk int) error {
 	var sb strings.Builder
