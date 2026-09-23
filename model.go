@@ -95,6 +95,11 @@ func getMetaByType(typ reflect.Type) *modelMeta {
 func parseMeta(typ reflect.Type) *modelMeta {
 	tbl, explicit := resolveTable(typ)
 	m := &modelMeta{table: tbl, explicitTable: explicit}
+	// 主键 / 逻辑列 / 版本列先收集字段下标，循环体结束后再统一取地址 ——
+	// 循环里直接 `&m.fields[len(m.fields)-1]` 并不安全：后续 append 触发扩容时，
+	// 已保存的指针会指向**旧底层数组**的副本，值当时是对的但与 m.fields 断开同步。
+	var pkIdxs []int
+	logicIdx, versionIdx := -1, -1
 	for i := 0; i < typ.NumField(); i++ {
 		f := typ.Field(i)
 		if f.PkgPath != "" { // 非导出字段
@@ -151,24 +156,41 @@ func parseMeta(typ reflect.Type) *modelMeta {
 		m.fields = append(m.fields, fi)
 		m.columns = append(m.columns, fi.colName)
 		if fi.pk {
-			m.pk = &m.fields[len(m.fields)-1]
+			pkIdxs = append(pkIdxs, len(m.fields)-1)
 		}
 		if fi.logic {
-			m.logicCol = &m.fields[len(m.fields)-1]
+			logicIdx = len(m.fields) - 1
 			m.logicIsTime = isTimeType(f.Type)
 		}
 		if fi.version {
-			m.versionCol = &m.fields[len(m.fields)-1]
+			versionIdx = len(m.fields) - 1
 		}
 	}
-	if m.pk == nil {
+	// 未显式声明主键时，沿用「字段名 ID / Id」的约定推断。
+	if len(pkIdxs) == 0 {
 		for i := range m.fields {
 			if m.fields[i].goName == "ID" || m.fields[i].goName == "Id" {
 				m.fields[i].pk = true
-				m.pk = &m.fields[i]
+				pkIdxs = append(pkIdxs, i)
 				break
 			}
 		}
+	}
+	if len(pkIdxs) > 1 {
+		cols := make([]string, 0, len(pkIdxs))
+		for _, i := range pkIdxs {
+			cols = append(cols, m.fields[i].colName)
+		}
+		panic(compositePKPanic(typ, cols))
+	}
+	if len(pkIdxs) == 1 {
+		m.pk = &m.fields[pkIdxs[0]]
+	}
+	if logicIdx >= 0 {
+		m.logicCol = &m.fields[logicIdx]
+	}
+	if versionIdx >= 0 {
+		m.versionCol = &m.fields[versionIdx]
 	}
 	m.tagChecked = strictTagCheck.Load()
 	return m
@@ -185,6 +207,25 @@ func validateDbTag(raw, typeName, fieldName string) {
 	}
 	panic(fmt.Errorf("orm: 结构体 %s 字段 %s 的 db tag 格式错误：缺少引号，正确写法是 `db:\"col,pk,autoincrement\"`，而不是 `db:col,pk`",
 		typeName, fieldName))
+}
+
+// compositePKPanic 在模型声明了多个主键列时构造 panic 值。
+//
+// 复合主键尚未支持 —— 而在加上这道闸门之前，parseMeta 会让「最后一个 ,pk 列」静默胜出：
+// 多主键模型能正常构造，但主键只认最后一列，于是 DeleteById / UpdateById / Upsert 生成的
+// WHERE 少了一半条件，**可能命中并改写多行**；AutoMigrate 还会产出两个内联 PRIMARY KEY
+// 的非法 DDL（MySQL 1068 / PG "multiple primary keys"）。「静默做错事」比直接失败危险得多，
+// 因此在这里硬失败，把问题暴露在启动第一时间。
+//
+// 需要复合主键时，请先用显式条件（Eq / In / Where）代替按主键操作。
+func compositePKPanic(typ reflect.Type, cols []string) error {
+	name := typ.Name()
+	if name == "" {
+		name = typ.String() // 匿名结构体没有 Name()
+	}
+	return fmt.Errorf("orm: 结构体 %s 声明了 %d 个主键列（%s），但复合主键尚未支持；"+
+		"请只保留一个 ,pk 列，或改用显式条件（Eq / In）代替按主键操作",
+		name, len(cols), strings.Join(cols, ", "))
 }
 
 // resolveTable 返回逻辑表名，以及该表名是否来自 TableName() 显式指定。

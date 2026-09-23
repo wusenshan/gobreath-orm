@@ -15,6 +15,8 @@ type WriteOption func(*writeConfig)
 // writeConfig 是写入选项的累加结果。
 type writeConfig struct {
 	omitZero bool
+	only     []string // OnlyColumns 指定的列白名单
+	onlySet  bool     // 是否调用过 OnlyColumns（用于区分「未指定」与「显式指定为空」）
 }
 
 // OmitZero 使 Insert / Update 跳过「值为类型零值」的可写列（主键列除外），
@@ -26,6 +28,22 @@ type writeConfig struct {
 //   - 指针 / 接口 / 切片 / 映射 字段永不被 OmitZero 跳过——它们的 NULL 语义由 driver 依据指针是否为 nil 决定。
 func OmitZero() WriteOption {
 	return func(c *writeConfig) { c.omitZero = true }
+}
+
+// OnlyColumns 把本次写入限定在给定列上，其余列不进入 SQL。
+//
+// 主要用途是 UpdateById / Update：它们默认写入**全部**可写列，实体上未赋值的字段
+// （典型是 time.Time 的零值）会被一并写回，把库里已有的值抹成零值。用 OnlyColumns
+// 显式声明本次要更新的列即可避免。
+//
+// 与 OmitZero 的区别：OmitZero 按「值是否为零值」动态跳过，OnlyColumns 是静态白名单；
+// 两者可叠加（先取白名单，再按零值过滤）。列名必须是模型的真实列名 ——
+// 拼错或指向主键 / 自增 / 逻辑删除列时直接报错，不做静默忽略（见 filterOnlyCols）。
+func OnlyColumns(cols ...string) WriteOption {
+	return func(c *writeConfig) {
+		c.only = cols
+		c.onlySet = true
+	}
 }
 
 func applyWriteOptions(opts ...WriteOption) writeConfig {
@@ -56,7 +74,7 @@ func shouldOmitZero(fv reflect.Value) bool {
 func filterOmitZeroCols(meta *modelMeta, ev reflect.Value, cols []string) []string {
 	out := make([]string, 0, len(cols))
 	for _, c := range cols {
-		if meta.pk != nil && c == meta.pk.colName {
+		if fi := fieldInfoForCol(meta, c); fi != nil && fi.pk {
 			out = append(out, c)
 			continue
 		}
@@ -66,6 +84,66 @@ func filterOmitZeroCols(meta *modelMeta, ev reflect.Value, cols []string) []stri
 		out = append(out, c)
 	}
 	return out
+}
+
+// filterOnlyCols 应用 OnlyColumns 白名单；未指定该选项时原样返回 cols。
+//
+// 白名单里出现「存在于模型但不属于本次可写列」的列（主键 / 自增 / 逻辑删除 / 被忽略）
+// 时报错，而不是静默丢弃：静默丢弃会让「我以为更新了 name，其实 SQL 里根本没有它」
+// 这类误解一直藏着。这与 OmitZero 的取舍相反 —— 那里的零值跳过是调用方明确预期的行为。
+func filterOnlyCols(meta *modelMeta, cols, only []string) ([]string, error) {
+	writable := make(map[string]bool, len(cols))
+	for _, c := range cols {
+		writable[c] = true
+	}
+	out := make([]string, 0, len(only))
+	seen := make(map[string]bool, len(only))
+	for _, c := range only {
+		if seen[c] {
+			continue // 重复项去重（无害，不报错）
+		}
+		seen[c] = true
+		if !writable[c] {
+			return nil, fmt.Errorf("orm: %s 的列 %q 不能用于 OnlyColumns%s", meta.table, c, whyNotWritable(meta, c))
+		}
+		out = append(out, c)
+	}
+	return out, nil
+}
+
+// whyNotWritable 为「列不该出现在写入白名单里」给出具体原因，便于调用方定位。
+func whyNotWritable(meta *modelMeta, col string) string {
+	switch fi := fieldInfoForCol(meta, col); {
+	case fi == nil:
+		return "（模型中不存在这一列，请检查拼写）"
+	case fi.ignore:
+		return "（该字段的 db tag 为 \"-\"，不映射任何列）"
+	case fi.pk && fi.autoInc:
+		return "（自增主键由数据库发号，不参与写入）"
+	case fi.pk:
+		return "（主键列是 WHERE 条件，不参与写入）"
+	case fi.autoInc:
+		return "（自增列由数据库赋值，不由调用方指定）"
+	case fi.logic:
+		return "（逻辑删除列请用 DeleteById / Delete）"
+	}
+	return ""
+}
+
+// emptyColsHint 解释「筛完之后一列都不剩」的原因。
+//
+// 不能一律归咎于 OmitZero：OnlyColumns() 传空、或白名单与模型不匹配时同样会走到这里，
+// 此时提示「OmitZero 跳过全部零值列」会把人引向完全无关的排查方向。
+func emptyColsHint(cfg writeConfig) string {
+	switch {
+	case cfg.onlySet && cfg.omitZero:
+		return "（OnlyColumns 白名单为空，或 OmitZero 跳过了其中全部零值列）"
+	case cfg.onlySet:
+		return "（OnlyColumns 白名单为空）"
+	case cfg.omitZero:
+		return "（OmitZero 跳过了全部零值列）"
+	}
+	return ""
 }
 
 // Ptr 返回 v 的指针，便于把可空列声明为指针类型并安全赋值：
@@ -82,11 +160,18 @@ func Insert[T any](ctx context.Context, db *DB, entity *T, opts ...WriteOption) 
 	cfg := applyWriteOptions(opts...)
 	ev := reflect.ValueOf(entity).Elem()
 	cols := writableCols(meta)
+	if cfg.onlySet {
+		filtered, err := filterOnlyCols(meta, cols, cfg.only)
+		if err != nil {
+			return err
+		}
+		cols = filtered
+	}
 	if cfg.omitZero {
 		cols = filterOmitZeroCols(meta, ev, cols)
 	}
 	if len(cols) == 0 {
-		return fmt.Errorf("orm: %s 无可写字段（OmitZero 跳过全部零值列）", meta.table)
+		return fmt.Errorf("orm: %s 无可写字段%s", meta.table, emptyColsHint(cfg))
 	}
 	phIdx := 0
 	nextPh := func() string { phIdx++; return db.dialect.Placeholder(phIdx) }
@@ -141,11 +226,18 @@ func BatchInsert[T any](ctx context.Context, db *DB, entities []T, opts ...Write
 	meta := getMeta[T]()
 	cfg := applyWriteOptions(opts...)
 	cols := writableCols(meta)
+	if cfg.onlySet {
+		filtered, err := filterOnlyCols(meta, cols, cfg.only)
+		if err != nil {
+			return err
+		}
+		cols = filtered
+	}
 	if cfg.omitZero {
 		cols = filterOmitZeroCols(meta, reflect.ValueOf(&entities[0]).Elem(), cols)
 	}
 	if len(cols) == 0 {
-		return fmt.Errorf("orm: %s 无可写字段（OmitZero 跳过全部零值列）", meta.table)
+		return fmt.Errorf("orm: %s 无可写字段%s", meta.table, emptyColsHint(cfg))
 	}
 	phIdx := 0
 	nextPh := func() string { phIdx++; return db.dialect.Placeholder(phIdx) }
@@ -197,11 +289,18 @@ func Upsert[T any](ctx context.Context, db *DB, entity *T, conflictCols []string
 	cfg := applyWriteOptions(opts...)
 	ev := reflect.ValueOf(entity).Elem()
 	cols := writableCols(meta)
+	if cfg.onlySet {
+		filtered, err := filterOnlyCols(meta, cols, cfg.only)
+		if err != nil {
+			return err
+		}
+		cols = filtered
+	}
 	if cfg.omitZero {
 		cols = filterOmitZeroCols(meta, ev, cols)
 	}
 	if len(cols) == 0 {
-		return fmt.Errorf("orm: %s 无可写字段（OmitZero 跳过全部零值列）", meta.table)
+		return fmt.Errorf("orm: %s 无可写字段%s", meta.table, emptyColsHint(cfg))
 	}
 	cc := conflictCols
 	if len(cc) == 0 {
@@ -361,11 +460,18 @@ func BatchUpsert[T any](ctx context.Context, db *DB, entities []T, conflictCols 
 	meta := getMeta[T]()
 	cfg := applyWriteOptions(opts...)
 	cols := writableCols(meta)
+	if cfg.onlySet {
+		filtered, err := filterOnlyCols(meta, cols, cfg.only)
+		if err != nil {
+			return err
+		}
+		cols = filtered
+	}
 	if cfg.omitZero {
 		cols = filterOmitZeroCols(meta, reflect.ValueOf(&entities[0]).Elem(), cols)
 	}
 	if len(cols) == 0 {
-		return fmt.Errorf("orm: %s 无可写字段（OmitZero 跳过全部零值列）", meta.table)
+		return fmt.Errorf("orm: %s 无可写字段%s", meta.table, emptyColsHint(cfg))
 	}
 	cc := conflictCols
 	if len(cc) == 0 {
@@ -579,11 +685,18 @@ func UpdateById[T any](ctx context.Context, db *DB, entity *T, opts ...WriteOpti
 	cfg := applyWriteOptions(opts...)
 	ev := reflect.ValueOf(entity).Elem()
 	cols := updateCols(meta)
+	if cfg.onlySet {
+		filtered, err := filterOnlyCols(meta, cols, cfg.only)
+		if err != nil {
+			return err
+		}
+		cols = filtered
+	}
 	if cfg.omitZero {
 		cols = filterOmitZeroCols(meta, ev, cols)
 	}
 	if len(cols) == 0 {
-		return fmt.Errorf("orm: %s 无可更新字段（OmitZero 跳过全部零值列）", meta.table)
+		return fmt.Errorf("orm: %s 无可更新字段%s", meta.table, emptyColsHint(cfg))
 	}
 	vi := resolveVersion(meta, db)
 	phIdx := 0
@@ -647,11 +760,18 @@ func Update[T any](ctx context.Context, db *DB, q *Query[T], entity *T, opts ...
 	cfg := applyWriteOptions(opts...)
 	ev := reflect.ValueOf(entity).Elem()
 	cols := updateCols(meta)
+	if cfg.onlySet {
+		filtered, err := filterOnlyCols(meta, cols, cfg.only)
+		if err != nil {
+			return err
+		}
+		cols = filtered
+	}
 	if cfg.omitZero {
 		cols = filterOmitZeroCols(meta, ev, cols)
 	}
 	if len(cols) == 0 {
-		return fmt.Errorf("orm: %s 无可更新字段（OmitZero 跳过全部零值列）", meta.table)
+		return fmt.Errorf("orm: %s 无可更新字段%s", meta.table, emptyColsHint(cfg))
 	}
 	phIdx := 0
 	nextPh := func() string { phIdx++; return db.dialect.Placeholder(phIdx) }

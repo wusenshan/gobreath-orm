@@ -132,13 +132,22 @@ func (User) TableName() string { return "users" }
 
 | 写法 | 含义 |
 |---|---|
-| `db:"id,pk"` | 该列为（复合前的）主键 |
+| `db:"id,pk"` | 该列为主键（**仅支持单列主键**，见下方说明） |
 | `db:"id,pk,autoincrement"` | 主键且自增，插入后自动回填 |
 | `db:"profile,json"` | 以 JSON 文本读写该列 |
 | `db:"-"` | 忽略该字段（不参与任何 SQL） |
 | `db:"user_name"` | 自定义列名（不写则按蛇形自动推导，如 `UserName` → `user_name`） |
 
 > 若字段名为 `ID` 或 `Id` 且未声明 `pk`，框架会自动把它当作主键。
+
+> ⚠️ **复合主键尚未支持，声明多个 `pk` 会直接 panic。**
+> 给两个及以上 `,pk` 列时，模型解析阶段即抛错：
+> `orm: 结构体 T 声明了 2 个主键列（tenant_id, user_id），但复合主键尚未支持；请只保留一个 ,pk 列，或改用显式条件（Eq / In）代替按主键操作`。
+>
+> 之所以选择「硬失败」而不是「只取一个」：在加上这道闸门之前，多出来的 `,pk` 是**静默截断**的 ——
+> 主键只认最后一列，`DeleteById` / `UpdateById` / `Upsert` 生成的 WHERE 会少一半条件，
+> **可能命中并改写多行**；`AutoMigrate` 还会为每个 `,pk` 列各生成一个内联 `PRIMARY KEY`，
+> 产出 MySQL 1068 / PG `multiple primary keys` 级别的非法 DDL —— 两者都不报错、不警告。
 
 > ⚠️ **最常见的坑：`db` tag 必须用双引号包裹。**
 > 正确：`db:"id,pk,autoincrement"`（引号包裹）
@@ -547,7 +556,34 @@ Repo 层同样支持：`repo.Insert(ctx, &User{Name: "alice"}, orm.OmitZero())`�
 - 指针 / 接口 / 切片 / 映射 字段永不被跳过（NULL 语义交给 driver）。
 - `OmitZero` 是**用户主动开启**的，默认行为不变（零值照常入库），确定性优先。
 
-### 3. ormgen 从 DDL 自动出指针
+### 3. OnlyColumns：只更新指定列（精确、不猜）
+
+`OmitZero` 的判据是「值是否为零」，而有时你想表达的是「本次只动这几列，别的一律不碰」—— 两者并不等价。`UpdateById` / `Update` 默认写入**全部**可写列，实体上没赋值的字段会被一并写回：
+
+```go
+type Article struct {
+    Id        int64     `db:"id,pk,autoincrement"`
+    Title     string    `db:"title"`
+    Body      string    `db:"body"`
+    CreatedAt time.Time `db:"created_at"`
+}
+
+// 只想改标题，但 CreatedAt 是零值 —— 这一句会把 created_at 抹成 0001-01-01
+orm.UpdateById(ctx, db, &Article{Id: 1, Title: "新标题"})
+
+// 用白名单明确表达意图
+orm.UpdateById(ctx, db, &Article{Id: 1, Title: "新标题"}, orm.OnlyColumns("title"))
+// UPDATE "articles" SET "title" = ? WHERE "id" = ?
+```
+
+行为要点：
+
+- 列名必须是模型的真实列名。**拼错、或指向主键 / 自增 / 逻辑删除列时直接报错**，不做静默忽略 —— 静默忽略会让「我以为更新了 name，其实 SQL 里根本没有它」一直藏着。
+- 与 `OmitZero` 叠加时先取白名单、再按零值过滤：`OnlyColumns("title", "body")` + `OmitZero()` 只会写入其中非零值的那几列。
+- 白名单内的重复列名自动去重，不报错；传空（`OnlyColumns()`）会报「白名单为空」，而不是发出没有 SET 子句的 SQL。
+- 适用于把「本次更新哪些字段」当作业务语义显式表达出来的场景（例如 PATCH 接口只允许改若干字段），而不是依赖「零值跳过」这类隐式规则去猜。
+
+### 4. ormgen 从 DDL 自动出指针
 
 用 `ormgen -ddl` 生成模型时，对 **可空且无默认值** 的列会自动生成指针类型（如 `*int`、`*time.Time`），天然贴合「可空 = 可能 NULL」语义；`NOT NULL` 或带 `DEFAULT` 的列仍生成值类型：
 
