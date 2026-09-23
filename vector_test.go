@@ -79,8 +79,10 @@ func TestVectorNearestMySQL(t *testing.T) {
 	if sql != want {
 		t.Fatalf("MySQL Nearest SQL 错误:\n got = %s\nwant = %s", sql, want)
 	}
-	if len(args) != 1 || args[0] != "[0.1,0.2,0.3]" {
-		t.Fatalf("MySQL Nearest 参数错误: %v", args)
+	// MySQL 的 ? 是位置型占位符：dist 列与 ORDER BY 各写一个 ? 就要两个参数
+	// （同一个向量值传两遍）。见 dialect.go 的 positionalPlaceholder。
+	if len(args) != 2 || args[0] != "[0.1,0.2,0.3]" || args[1] != "[0.1,0.2,0.3]" {
+		t.Fatalf("MySQL Nearest 参数错误（应为两份向量副本）: %v", args)
 	}
 }
 
@@ -98,9 +100,12 @@ func TestVectorNearestWithWhereFilter(t *testing.T) {
 	if !strings.Contains(sql, "ORDER BY VECTOR_DISTANCE(`embedding`, STRING_TO_VECTOR(?), 'COSINE') ASC LIMIT 5") {
 		t.Fatalf("应包含余弦排序+LIMIT: %s", sql)
 	}
-	// 参数顺序：向量优先（占位符 1），随后是 title 过滤值
-	if len(args) != 2 || args[0] != "[0.1,0.2,0.3]" || args[1] != "go" {
-		t.Fatalf("参数顺序/值错误: %v", args)
+	// 参数按占位符出现次序：dist 列的向量 → WHERE 的 title → ORDER BY 的向量。
+	// MySQL 的 ? 是位置型、逐个消耗参数，两处距离表达式各要一份向量 ——
+	// 原先这里断言 len(args)==2（三个 ? 配两个参数），把「MySQL 上必然报
+	// "sql: expected 3 arguments, got 2"」的坏行为固化了。
+	if len(args) != 3 || args[0] != "[0.1,0.2,0.3]" || args[1] != "go" || args[2] != "[0.1,0.2,0.3]" {
+		t.Fatalf("参数顺序/值错误（应为 [向量 go 向量]）: %v", args)
 	}
 }
 

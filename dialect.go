@@ -238,6 +238,21 @@ var (
 	SQLite Dialect = sqliteDialect{}
 )
 
+// positionalPlaceholder 报告方言的占位符是否是「位置型」——即同一个占位符在同一 SQL 里
+// 出现 N 次，就必须传 N 个参数。
+//
+// PG 的 $n 是**引用型**：`"col" <-> $1 AS dist` 与 `ORDER BY "col" <-> $1` 两处引用的是
+// 同一个参数，只占一个槽位。MySQL / SQLite 的 ? 是**位置型**：服务端按出现次序逐个消耗
+// 参数，同一个值要在两处出现就得传两遍，否则 database/sql 直接报
+// "sql: expected N arguments, got M"（见 convert.go 的 driverArgsConnLocked）。
+//
+// 判据取「两个不同序号是否渲染成同一个字符串」，而不是给 Dialect 接口加方法：后者会让
+// 外部自实现方言编译不过。这个判据反而自带方言无关性 —— 自实现方言只要用 ? 就会被
+// 正确识别为位置型。
+func positionalPlaceholder(d Dialect) bool {
+	return d.Placeholder(1) == d.Placeholder(2)
+}
+
 func itoa(i int) string {
 	if i == 0 {
 		return "0"

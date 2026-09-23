@@ -499,7 +499,7 @@ func contains(ss []string, s string) bool {
 	return false
 }
 
-// Build 生成最终 SQL 与参数。向量（若有）恒为第一个占位符。
+// Build 生成最终 SQL 与参数。向量（若有）通常落在第一个占位符上。
 func (q *Query[T]) Build() (string, []any) {
 	d := q.dialect
 	// 投影已被完全指定时（聚合 SUM/AVG/... 或 Pluck 的单列投影），不要再追加向量距离列：
@@ -514,8 +514,28 @@ func (q *Query[T]) Build() (string, []any) {
 		return idx
 	}
 
-	if q.hasVector {
-		add(serializeVector(q.vector))
+	// 向量参数「按需」分配 —— 分配参数与写出占位符必须是同一个动作，不能在开头无条件注入。
+	//
+	// 渲染距离表达式的地方共三处：投影里的 dist 列（受 noVecCol 控制）、距离阈值过滤
+	// （受 vecFilterOn 控制）、按距离排序（聚合时整段跳过）。三者都可能同时是关的，
+	// 于是 SQL 里一个占位符都没有、args 里却多出一个向量：lib/pq 会直接报
+	// "bind message supplies 1 parameters, but prepared statement requires 0"，
+	// MySQL / SQLite 的 prepared 路径同样失败。
+	//
+	// 真实触发场景是 Nearest(...) + Count / Sum —— RAG 里「统计某向量邻域内有多少条」：
+	// agg 关掉距离列与距离排序，投影只剩 COUNT(*)，这个向量参数本就不该存在。
+	//
+	// 同一处还要区分占位符是不是「位置型」：PG 的 $n 可以让 dist 列与按距离排序引用同一个
+	// $1，MySQL / SQLite 的 ? 则必须按出现次数各传一个（位置型逐个消耗参数），
+	// 否则 database/sql 报 "sql: expected 2 arguments, got 1"。
+	reuseVec := !positionalPlaceholder(d)
+	vecIdx := 0
+	vecPH := func() int {
+		if vecIdx != 0 && reuseVec {
+			return vecIdx
+		}
+		vecIdx = add(serializeVector(q.vector))
+		return vecIdx
 	}
 
 	sel := "*"
@@ -536,7 +556,7 @@ func (q *Query[T]) Build() (string, []any) {
 		sel = strings.Join(quoted, ", ")
 	}
 	if q.hasVector && !noVecCol {
-		dist := fmt.Sprintf("%s AS dist", d.VectorDistance(q.vecCol, d.Placeholder(1), q.vectorMetric))
+		dist := fmt.Sprintf("%s AS dist", d.VectorDistance(q.vecCol, d.Placeholder(vecPH()), q.vectorMetric))
 		if sel == "*" {
 			sel = "*" + ", " + dist
 		} else {
@@ -555,7 +575,7 @@ func (q *Query[T]) Build() (string, []any) {
 	}
 
 	if q.hasVector && q.vecFilterOn {
-		clause := fmt.Sprintf("%s < %s", d.VectorDistance(q.vecCol, d.Placeholder(1), q.vectorMetric), d.Placeholder(add(q.vecFilter)))
+		clause := fmt.Sprintf("%s < %s", d.VectorDistance(q.vecCol, d.Placeholder(vecPH()), q.vectorMetric), d.Placeholder(add(q.vecFilter)))
 		if len(q.groups) > 0 {
 			sql += " AND " + clause
 		} else {
@@ -589,7 +609,7 @@ func (q *Query[T]) Build() (string, []any) {
 				if q.aggFn != "" {
 					continue
 				}
-				ords = append(ords, fmt.Sprintf("%s %s", d.VectorDistance(q.vecCol, d.Placeholder(1), q.vectorMetric), ascDesc(o.asc)))
+				ords = append(ords, fmt.Sprintf("%s %s", d.VectorDistance(q.vecCol, d.Placeholder(vecPH()), q.vectorMetric), ascDesc(o.asc)))
 			} else {
 				ords = append(ords, fmt.Sprintf("%s %s", d.QuoteIdent(o.col), ascDesc(o.asc)))
 			}
@@ -598,7 +618,7 @@ func (q *Query[T]) Build() (string, []any) {
 			sql += " ORDER BY " + strings.Join(ords, ", ")
 		}
 	} else if q.hasVector && q.aggFn == "" {
-		sql += fmt.Sprintf(" ORDER BY %s", d.VectorDistance(q.vecCol, d.Placeholder(1), q.vectorMetric))
+		sql += fmt.Sprintf(" ORDER BY %s", d.VectorDistance(q.vecCol, d.Placeholder(vecPH()), q.vectorMetric))
 	}
 
 	// 分页：LIMIT 必须写在 OFFSET 之前。「只有 OFFSET 没有 LIMIT」的合法性按方言区分：
