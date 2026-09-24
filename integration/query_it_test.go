@@ -381,8 +381,12 @@ func TestMaxOfTimeColumn(t *testing.T) {
 
 // ---------------------------------------------------------------- 小工具
 
+// placeholderOf 返回该后端的占位符前缀。**必须按方言判断，不能按后端名** ——
+// PG 的两条驱动路径（pgx 与 lib/pq）都用 $n 引用型占位符，而 backend.name 是
+// 后端标识（"postgres" / "postgres-libpq"），拿它判方言会让 lib/pq 拿到 "?"，
+// 拼出 PG 无法解析的 SQL。
 func placeholderOf(b backend) string {
-	if b.name == "postgres" {
+	if b.dialect == orm.PG {
 		return "$"
 	}
 	return "?"

@@ -11,6 +11,10 @@ import (
 	// 驱动由本模块（而非框架）导入，主模块保持零依赖。
 	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/jackc/pgx/v5/stdlib"
+	// lib/pq 与 pgx 都是 README 里公开列出的 PG 驱动，且同为 database/sql 路径
+	// （driver 名 "postgres"）。两条必须都真库验证：两者交给 database/sql 的
+	// **值类型并不一致**（见 TestMain 里的说明）。
+	_ "github.com/lib/pq"
 	_ "modernc.org/sqlite"
 )
 
@@ -22,6 +26,10 @@ type backend struct {
 	driver  string
 	dsn     string
 	dialect orm.Dialect
+	// dsnEnv 是提供本后端 DSN 的环境变量名，仅用于报错提示。
+	// 同一个环境变量可以支撑多个后端（PG 的 pgx / lib/pq 共用一个 DSN），
+	// 所以不能用 name 去拼，否则提示会指向一个不存在的变量名。
+	dsnEnv string
 	// maxOpen > 0 时同时限制最大连接数（SQLite 内存库必须为 1，
 	// 否则每条连接看到的是各自独立的库，建的表互相不可见）。
 	maxOpen int
@@ -40,13 +48,22 @@ func TestMain(m *testing.M) {
 	}}
 	// PG / MySQL 需显式提供 DSN：没设就跳过，避免 CI 上误报。
 	if dsn := os.Getenv("ORM_IT_PG_DSN"); dsn != "" {
-		backends = append(backends, backend{
-			name: "postgres", driver: "pgx", dsn: dsn, dialect: orm.PG,
-		})
+		// 同一个 DSN 挂两条后端，把 README 里公开承诺的**两条 PG 驱动路径**都真库走一遍。
+		// 必要性：两者虽同为 database/sql，交给上层 scan 的**值类型并不一致** ——
+		//   · 文本列：pgx 给 string，lib/pq 给 []byte
+		//   · numeric / uuid / 数组等：lib/pq 一律给 []byte（或 string），不转成数值
+		//   · pgvector 的 vector 列：pgx 给 string，lib/pq 给 []byte
+		// 框架的 scan 分派（model.go 的 setterFor / setVectorField）必须同时吃下这两种形态。
+		// 只挂 pgx 等于只验了一半，而 README 主示例给的恰恰是 lib/pq。
+		// 两者共用同一台库、顺序执行（无 t.Parallel），resetSchema 会互相清场，不冲突。
+		backends = append(backends,
+			backend{name: "postgres", driver: "pgx", dsn: dsn, dialect: orm.PG, dsnEnv: "ORM_IT_PG_DSN"},
+			backend{name: "postgres-libpq", driver: "postgres", dsn: dsn, dialect: orm.PG, dsnEnv: "ORM_IT_PG_DSN"},
+		)
 	}
 	if dsn := os.Getenv("ORM_IT_MYSQL_DSN"); dsn != "" {
 		backends = append(backends, backend{
-			name: "mysql", driver: "mysql", dsn: dsn, dialect: orm.MySQL,
+			name: "mysql", driver: "mysql", dsn: dsn, dialect: orm.MySQL, dsnEnv: "ORM_IT_MYSQL_DSN",
 		})
 	}
 	os.Exit(m.Run())
@@ -68,8 +85,11 @@ func openDB(t *testing.T, b backend) *orm.DB {
 	sqlDB := db.SQL()
 	t.Cleanup(func() { _ = sqlDB.Close() })
 	if err := sqlDB.Ping(); err != nil {
-		t.Fatalf("[%s] Ping 失败（检查 ORM_IT_%s_DSN）：%v",
-			b.name, b.name, err)
+		hint := b.dsnEnv
+		if hint == "" {
+			hint = "DSN 环境变量"
+		}
+		t.Fatalf("[%s] Ping 失败（检查 %s）：%v", b.name, hint, err)
 	}
 	return db
 }

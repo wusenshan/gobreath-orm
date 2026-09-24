@@ -10,6 +10,11 @@ require (
 	// 最低 Go 版本顶上去，与仓库「支持 1.23」的承诺冲突；v1.9.3 的 go 指令仍是 1.21+。
 	github.com/go-sql-driver/mysql v1.9.3
 	github.com/jackc/pgx/v5 v5.5.5
+	// PG 的第二条驱动路径：README 把 lib/pq（驱动名 postgres）与 pgx 并列为可选驱动，
+	// 且主示例给的是前者 —— 两条都必须在真库上验证。两者交给 database/sql 的
+	// 值形态并不相同（numeric / uuid / text[] / vector：pgx 给 string、lib/pq 给 []byte），
+	// 详见 integration/README.md「PG 的两条驱动路径都会真跑」。
+	github.com/lib/pq v1.12.3
 	github.com/wusenshan/gobreath-orm v0.1.3
 	modernc.org/sqlite v1.34.5
 )

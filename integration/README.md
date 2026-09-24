@@ -33,6 +33,33 @@ docker compose down -v        # 清理
 换版本这件事会影响其它 MySQL 用例的方言行为，是否上 CI 请自行判断；本地单跑可以直接
 `docker run -p 3308:3306 mysql:9` 再把 `ORM_IT_MYSQL_DSN` 指过去。
 
+## PG 的两条驱动路径都会真跑
+
+README 把 `github.com/lib/pq`（驱动名 `postgres`）与 `github.com/jackc/pgx/v5/stdlib`
+（驱动名 `pgx`）并列为可选 PG 驱动，**主示例给的还是前者** —— 所以两条都得验。
+只需提供一个 `ORM_IT_PG_DSN`，harness 会在同一个 DSN 上铺开两条后端：
+`postgres`（pgx）与 `postgres-libpq`（lib/pq）。两者顺序执行、各自 `resetSchema`，互不干扰。
+
+**它们交给 `database/sql` 的类型并不一样**（同一台库上 `Scan(&any)` 取 `%T` 实测）：
+
+| 服务端列类型 | pgx | lib/pq |
+|---|---|---|
+| `numeric` | `string` | `[]byte` |
+| `uuid` | `string` | `[]byte` |
+| `text[]` | `string` | `[]byte` |
+| `vector`（pgvector） | `string` | `[]byte` |
+| `jsonb` / `bytea` | `[]byte` | `[]byte` |
+| `text` / `varchar` | `string` | `string` |
+| `int2/4/8`、`float4/8`、`bool` | `int64` / `float64` / `bool` | 同左 |
+| `timestamptz` | `time.Time`（会话时区） | `time.Time`（归一到 UTC） |
+
+「同为 database/sql」不等于「形态相同」。框架**自己**分派类型的只有模型字段扫描
+（`assignString` / `assignFloat` ...），它的 `case []byte` 分支**只在 lib/pq 下会被走到**；
+而 `RawQuery` / `RawOne` 的标量路径与聚合都直接 `rows.Scan`，由标准库 `convertAssign` 兜住。
+两条路径各有一条用例守着（`TestModelScanAcrossDrivers` / `TestCrossDriverValueParity`），
+前者手工建 `NUMERIC` / `UUID` / `TEXT[]` 列，故意制造「服务端类型 ≠ Go 字段类型」——
+`AutoMigrate` 按 Go 类型反推 DDL，建不出这些列，也就造不出这个前提。
+
 ## CI
 
 `.github/workflows/ci.yml` 里有一个独立的 `integration` job（ubuntu，service 容器起
@@ -101,6 +128,8 @@ pgx / mysql / sqlite 驱动，放进主模块会把它们写进 `go.sum`，破�
 | `TestWriteOptionsOnRealDB` | `OnlyColumns` / `OmitZero` 及其组合；非法列必须报错 |
 | `TestDbConfigMethodsExecutable` | `DB` 的配置方法逐项验「可观测效果」（日志 / 钩子 / 软删 / 乐观锁 …） |
 | `TestVectorPathOnRealDB` | 向量路径按能力分级：存储级（建列 / 写 / 读回）与距离级（排序 / 阈值 / 聚合） |
+| `TestCrossDriverValueParity` | `RawOne` 标量路径：两条 PG 驱动读出的值一致（该路径的转换由标准库负责） |
+| `TestModelScanAcrossDrivers` | **模型字段路径**：`NUMERIC` / `UUID` / `TEXT[]` 列在 pgx 与 lib/pq 下都落到强类型字段 |
 
 ## 向量用例按能力分级
 
