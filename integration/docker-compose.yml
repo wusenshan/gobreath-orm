@@ -25,7 +25,11 @@ services:
       retries: 20
 
   mysql:
-    # 8.0：注意 MySQL 要到 9.0 才有原生 VECTOR 类型，8.0 下向量相关用例会跳过。
+    # 8.0：MySQL 要到 9.0 才有 VECTOR 类型，9.0+ 还带 STRING_TO_VECTOR 存取。
+    # 8.0 下向量用例会**整条**跳过（连存储级都跑不了）；换成 mysql:9 可让「建列 / 写入 /
+    # 读回」这一级真正跑起来（距离级仍会跳过 —— 距离函数只有 HeatWave on OCI /
+    # MySQL AI / Percona 9.7+ 提供）。
+    # 是否换、是否上 CI 请自行判断：换版本会同时改变其它用例的 MySQL 方言行为。
     image: mysql:8.0
     environment:
       MYSQL_ROOT_PASSWORD: gobreath

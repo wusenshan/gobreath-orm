@@ -278,7 +278,7 @@ hits, _ := orm.SelectList(ctx, db,
 - **阈值 `WithinDistance` 的量纲**：Cosine 距离在 `[0,2]`，L2/L1 在 `[0,+∞)`，设阈值前先了解所选度量的取值范围。
 - **索引**：百万级以上务必建 HNSW / VECTOR 索引（见 4.3），否则退化为全表扫描。
 - **MySQL 社区版 / 商业版无向量检索函数（最致命）**：`VECTOR_DISTANCE()` 与 `VECTOR INDEX` 仅由 **MySQL HeatWave on OCI** 与 **MySQL AI** 提供，社区版 / 商业版发行包并不包含（dev.mysql.com 官方 Note 原话）。社区版能建 `VECTOR(N)` 列、能 `STRING_TO_VECTOR()` / `VECTOR_TO_STRING()` / `VECTOR_DIM()` 存取，但一旦执行距离查询就报 `FUNCTION VECTOR_DISTANCE does not exist`。因此"一套 API 跨库通用"实际是：**PostgreSQL(pgvector) 完整可用；MySQL 仅部署在 HeatWave / MySQL AI 时可用**。接入前务必用下文 §7 自检。
-- **MySQL 距离度量无 `MANHATTAN`**：`VECTOR_DISTANCE` 支持的度量只有 `COSINE` / `DOT` / `EUCLIDEAN`，**没有 `MANHATTAN`**（`MANHATTAN` 只在 Oracle Database 的 `VECTOR_DISTANCE` 里，是另一个产品）。所以 `orm.L1`（曼哈顿）在 MySQL 上无法映射，切勿在 MySQL 方言下使用 `orm.L1`。
+- **MySQL 的距离度量随发行版而变，`MANHATTAN` 不是标准配置**：Oracle MySQL / HeatWave 的 `VECTOR_DISTANCE` 只支持 `COSINE` / `DOT` / `EUCLIDEAN`，**没有 `MANHATTAN`**；而 **Percona Server for MySQL 9.7.2+** 的 `DISTANCE()` / `VECTOR_DISTANCE()` 额外支持 `MANHATTAN` 与 `EUCLIDEAN_SQUARED`。框架把 `orm.L1` 映射为 `'MANHATTAN'`，因此 `orm.L1` **只在带该度量的发行版（如 Percona 9.7+）上能用**，在 Oracle MySQL / HeatWave 上会报未知度量。另外三个度量（`orm.Cosine` / `orm.L2` / `orm.InnerProduct`）不受影响。
 
 ---
 
@@ -362,13 +362,18 @@ LIMIT 3;
 
 | 检查项 | PostgreSQL | MySQL（社区 / 商业版） | MySQL（HeatWave / MySQL AI） |
 |---|---|---|---|
-| 向量类型 / 列 | ✅ `vector(N)` | ✅ `VECTOR(N)` | ✅ `VECTOR(N)` |
-| 写入 / 读取向量 | ✅ | ✅ `STRING_TO_VECTOR` | ✅ |
-| 距离函数 | ✅ `<=>` `<->` `<#>` `<+>` | ❌ 函数不存在 | ✅ `VECTOR_DISTANCE` |
+| 向量类型 / 列 | ✅ `vector(N)` | ✅ `VECTOR(N)`（9.0+） | ✅ `VECTOR(N)` |
+| 写入 / 读取向量 | ✅ 文本 `"[1,2,3]"` | ✅ 写用 `STRING_TO_VECTOR`；**读回是二进制**（框架已解码） | ✅ |
+| 驱动前提 | pgx / lib/pq | **`go-sql-driver/mysql` ≥ v1.9.0** | 同左 |
+| 距离函数 | ✅ `<=>` `<->` `<#>` `<+>` | ❌ 函数不存在（实测 9.7.2 报 `ERROR 1305`） | ✅ `VECTOR_DISTANCE` |
 | 向量索引 | ✅ HNSW | ❌ 不支持 | ✅ `VECTOR INDEX` |
-| `orm.L1` 曼哈顿 | ✅ `<+>` | ❌ 无 MANHATTAN 度量 | ❌ 无 MANHATTAN 度量 |
+| `orm.L1` 曼哈顿 | ✅ `<+>` | ❌ 无 MANHATTAN 度量 | ❌ 无（Percona 9.7+ 才有） |
 
-**结论**：gobreath-orm 向量检索在 **PostgreSQL 上开箱即用**；在 **MySQL 上仅当数据库是 HeatWave on OCI 或 MySQL AI 时可用**，社区 / 商业版只能存、不能查。接入前用 7.1 / 7.2 的自检命令确认目标库能力。
+> **MySQL 9 的两个前提**（都是实测出来的，别等上线才发现）：
+> ① **驱动必须 ≥ `go-sql-driver/mysql` v1.9.0** —— VECTOR 是 MySQL 9.0 引入的新字段类型码 242（`MYSQL_TYPE_VECTOR`），v1.8.x 不认识它，读向量列会直接报 `unknown field type 242`：错在驱动层，升级服务端但不同步升驱动一样走不通。
+> ② **`VECTOR` 列底层是 BLOB**，`SELECT` 回来的是小端序 float32 **裸字节**、不是 `"[1,2,3]"` 文本；框架的读回路径会按载荷形态自动分派（`[` 开头按文本、否则按二进制解码），调用方无需处理。
+
+**结论**：gobreath-orm 向量检索在 **PostgreSQL 上开箱即用**；在 **MySQL 上仅当数据库是 HeatWave on OCI 或 MySQL AI 时可用**，社区 / 商业版只能存、不能查（`orm.L1` 另需 Percona 9.7+ 之类带该度量的发行版）。接入前用 7.1 / 7.2 的自检命令确认目标库能力。
 
 ---
 

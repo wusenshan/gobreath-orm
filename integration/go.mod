@@ -3,10 +3,12 @@ module github.com/wusenshan/gobreath-orm/integration
 go 1.23
 
 require (
-	// 刻意不用 v1.9+：mysql 驱动自 v1.10.0 起把 go.mod 抬到 go 1.24.0，
-	// 会连带把本模块的最低 Go 版本顶上去，与仓库「支持 1.23」的承诺冲突。
-	// v1.8.1 的方言行为与新版一致，做集成测试足够。
-	github.com/go-sql-driver/mysql v1.8.1
+	// 必须 ≥ v1.9.0：MySQL 9.0 的 VECTOR 列是新的字段类型码 242（MYSQL_TYPE_VECTOR），
+	// v1.8.x 不认识它会直接报 "unknown field type 242"，向量读回连驱动都过不去
+	// （v1.9.0 changelog: "Add support for VECTOR type introduced in MySQL 9.0. (#1609)"）。
+	// 同时刻意**不升到 v1.10.0**：它把 go.mod 抬到 go 1.24.0，会连带把本模块的
+	// 最低 Go 版本顶上去，与仓库「支持 1.23」的承诺冲突；v1.9.3 的 go 指令仍是 1.21+。
+	github.com/go-sql-driver/mysql v1.9.3
 	github.com/jackc/pgx/v5 v5.5.5
 	github.com/wusenshan/gobreath-orm v0.1.3
 	modernc.org/sqlite v1.34.5

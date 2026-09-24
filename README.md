@@ -995,6 +995,8 @@ db := orm.Open("mysql", dsn).WithLogger(func(level orm.LogLevel, query string, a
 gobreath-orm 内置向量近邻检索，**一套 API 同时适配 Postgres（pgvector）与 MySQL 9+（原生 VECTOR 类型）**——SQL 由方言自动分发，业务代码不用关心底层差异：
 
 > ⚠️ **MySQL 跨库可用性前提**：`VECTOR_DISTANCE()` 与 `VECTOR INDEX` 仅由 **MySQL HeatWave on OCI** / **MySQL AI** 提供，社区版 / 商业版发行包**不包含**（dev.mysql.com 官方 Note 原话）。社区版能建 `VECTOR(N)` 列、能 `STRING_TO_VECTOR()` 存取，但距离查询会报 `FUNCTION VECTOR_DISTANCE does not exist`。接入前务必用 [VECTOR.md §7](VECTOR.md) 的自检命令确认目标库能力。
+>
+> ⚠️ **MySQL 侧还有两个容易踩的前提（均为真库实测）**：① 驱动必须用 **`go-sql-driver/mysql` ≥ v1.9.0** —— VECTOR 是 MySQL 9.0 新增的字段类型码 242（`MYSQL_TYPE_VECTOR`），v1.8.x 不认识它，读向量列直接报 `unknown field type 242`（错在驱动层，只升服务端没用）；② `VECTOR` 列底层是 BLOB，`SELECT` 回来是**小端序 float32 裸字节**而非 `"[1,2,3]"` 文本，框架已按载荷形态自动分派（文本 / 二进制），调用方无需处理。
 
 | 数据库 | 启用方式 | 框架生成的检索语法 |
 |---|---|---|
@@ -1283,7 +1285,7 @@ cities, err := orm.SelectList(ctx, db,
 | 数据库 | `Open` 驱动名 | 默认方言 | 备注 |
 |---|---|---|---|
 | Postgres | `postgres` / `pgx` | Postgres | 默认；支持 jsonb、向量 `<->`（pgvector） |
-| MySQL | `mysql` | MySQL | 支持 `JSON_CONTAINS`；向量类型 `VECTOR(N)` 社区版可建可存，但向量检索函数 `VECTOR_DISTANCE` 与向量索引仅 HeatWave on OCI / MySQL AI 提供（社区版查询会报函数不存在），详见 [VECTOR.md §6/§7](VECTOR.md) |
+| MySQL | `mysql` | MySQL | 支持 `JSON_CONTAINS`；向量类型 `VECTOR(N)` 社区版可建可存（**驱动须 ≥ `go-sql-driver/mysql` v1.9.0**，否则读列报 `unknown field type 242`），但向量检索函数 `VECTOR_DISTANCE` 与向量索引仅 HeatWave on OCI / MySQL AI 提供（社区版查询会报函数不存在），详见 [VECTOR.md §6/§7](VECTOR.md) |
 | SQLite | `sqlite` / `sqlite3` | SQLite | 支持 `json_extract`；无 `json_contains` 函数，`JsonContains` 由方言展开为 `json_each` 等价语义；无原生向量类型 |
 
 新增方言只需实现 `Dialect` 接口（`QuoteIdent` / `Placeholder` / `JsonPath` / `JsonContains` / `VectorDistance` / `VectorBind` / `UpsertSuffix` / `SupportsLastInsertID` / `InsertReturning`）并在 `dialectForDriver` 注册。另有 `upsertReturningDialect` / `upsertPKCapturingDialect` 两个**可选**接口（用类型断言探测）用于 `Upsert` 后回填自增主键 —— 不实现它们不会报错，只是不回填。

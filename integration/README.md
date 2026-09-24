@@ -26,6 +26,13 @@ docker compose down -v        # 清理
 端口选 5433 / 3307 是为了避开本机已装的 PostgreSQL（5432）。用 `pgvector/pgvector`
 而不是 `postgres` 是因为向量相关用例需要 `vector` 扩展，`initdb/01-vector.sql` 会自动创建。
 
+**关于 MySQL 版本**：compose 钉的是 `mysql:8.0`，而 8.0 **没有** `VECTOR` 类型，于是
+向量用例在 MySQL 上会连「存储级」都跳过（详见下文「向量用例按能力分级」）。想让 MySQL 的
+存储级真正跑起来，换成 **`mysql:9`**（≥ 9.0 有 `VECTOR(N)` 与 `STRING_TO_VECTOR`）即可 ——
+实测 9.7.2 社区版能建表、能存取，但**没有** `VECTOR_DISTANCE` 函数，所以距离级仍然跳过。
+换版本这件事会影响其它 MySQL 用例的方言行为，是否上 CI 请自行判断；本地单跑可以直接
+`docker run -p 3308:3306 mysql:9` 再把 `ORM_IT_MYSQL_DSN` 指过去。
+
 ## CI
 
 `.github/workflows/ci.yml` 里有一个独立的 `integration` job（ubuntu，service 容器起
@@ -42,8 +49,14 @@ pgvector + mysql，端口与本地一致）。它**不依赖 `initdb/` 挂载** 
 pgx / mysql / sqlite 驱动，放进主模块会把它们写进 `go.sum`，破坏这个卖点，CI 也会被
 迫下载一堆无关包。这里沿用 `examples/` 已经确立的嵌套模块约定（`replace` 指回 `..`）。
 
-另外 mysql 驱动刻意钉在 `v1.8.1`：自 `v1.10.0` 起它的 `go.mod` 抬到 `go 1.24.0`，
-会连带把本模块的最低 Go 版本顶上去，与仓库支持 1.23 的承诺冲突。
+另外 mysql 驱动钉在 **`v1.9.3`**，上下都有理由：
+
+- **不能低于 `v1.9.0`**：MySQL 9.0 为 VECTOR 引入了新字段类型码 242（`MYSQL_TYPE_VECTOR`），
+  v1.8.x 不认识它，读向量列时**驱动层**直接报 `unknown field type 242` —— 实测 MySQL 9.7.2
+  上，用 v1.8.1 连「把向量写进去再读回来」都做不到（v1.9.0 changelog:
+  "Add support for VECTOR type introduced in MySQL 9.0. (#1609)"）。
+- **不升到 `v1.10.0`**：它把 `go.mod` 抬到 `go 1.24.0`，会连带把本模块的最低 Go 版本顶上去，
+  与仓库支持 1.23 的承诺冲突；`v1.9.3` 的 go 指令仍是 1.21+。
 
 ## mock 测试验不到什么
 
@@ -82,6 +95,36 @@ pgx / mysql / sqlite 驱动，放进主模块会把它们写进 `go.sum`，破�
 | `TestJsonQuery` / `TestJsonContains` | JSON 路径比较与片段包含 |
 | `TestDryRunIsExecutable` | `DryRun` 的 SQL **直接在真库执行**（不只是字符串对得上） |
 | `TestBatchInsertVarLimit` | 批量插入的绑定参数上限（取证，见下） |
+| `TestRepoLayerFullWalk` | `Repo[T]` 门面**每一个方法**都真跑（含事务提交 / 回滚） |
+| `TestQueryPredicateMatrix` | 每个谓词构造器都真执行，并用行数断言核对语义 |
+| `TestJoinVariantsExecutable` | 六种 JOIN 变体 + 别名；`Count` 与 `SelectList` 口径一致 |
+| `TestWriteOptionsOnRealDB` | `OnlyColumns` / `OmitZero` 及其组合；非法列必须报错 |
+| `TestDbConfigMethodsExecutable` | `DB` 的配置方法逐项验「可观测效果」（日志 / 钩子 / 软删 / 乐观锁 …） |
+| `TestVectorPathOnRealDB` | 向量路径按能力分级：存储级（建列 / 写 / 读回）与距离级（排序 / 阈值 / 聚合） |
+
+## 向量用例按能力分级
+
+向量能力**不是一个布尔值**，`TestVectorPathOnRealDB` 按两级探测，走到哪级跑哪级：
+
+| 级别 | 内容 | 需要什么 |
+|---|---|---|
+| **tier 1 存储级** | 建向量列、写入、单行读回、列表读回、`UpdateById` 改向量 | 有 `VECTOR` 类型即可 |
+| **tier 2 距离级** | 按距离排序、阈值过滤、聚合 × 向量、`Pluck` + 度量切换 | 还要有距离函数 |
+
+分级的起因是一个教训：早期把「没有距离函数」直接等价于「整条向量路径跳过」，
+于是 MySQL 上**能跑的那一半也从没跑过** —— 而读回恰恰就坏在那里（详见下面的第 7 条）。
+
+实测口径（各后端在日志里留下原始证据）：
+
+| 后端 | tier 1 | tier 2 |
+|---|---|---|
+| PostgreSQL + pgvector | ✅ | ✅ |
+| MySQL 9.7.2 社区版 | ✅（`VECTOR(3)` / `STRING_TO_VECTOR`） | ❌ `ERROR 1305: FUNCTION VECTOR_DISTANCE does not exist` |
+| MySQL 8.0（compose 默认） | ❌ 连 `VECTOR` 类型都没有 | ❌ |
+| SQLite | ❌ 无向量运算符 | ❌ |
+
+用例入口先 `DROP TABLE IF EXISTS` 保证幂等：上一轮若在某个 `t.Fatalf` 中断就没走到收尾，
+残留行会让计数断言成倍偏大（实测踩过 `Nearest + Count = 6`）。
 
 ## 曾经的缺口：已修复，现为回归测试
 
@@ -140,6 +183,47 @@ modernc 驱动只能按 `TEXT` 返回（实测形态是 Go 的 `time.Time.String
 （`DO UPDATE` 命中时返回的也是目标行），MySQL 在 `ON DUPLICATE KEY UPDATE` 末尾追加
 官方的 `` `id` = LAST_INSERT_ID(`id`) `` 技巧（否则走到更新分支时 `LAST_INSERT_ID()` 不指向该行）。
 批量 `BatchUpsert` 仍不回填，与 `BatchInsert` 保持一致。
+
+### 6. `Delete` 的实参顺序在位置型方言上错位（逻辑删除静默 no-op）
+
+`Delete` 发出的是 `UPDATE t SET deleted_at = <ph> WHERE col = <ph>`，但实参原先**先按 WHERE
+分配、后补 SET**：位置型方言（MySQL / SQLite 的 `?` 按出现次序逐个取用）拿到的是
+`[条件值, 删除值]`，WHERE 于是把**删除时间戳**绑给了字符串列，条件匹配 0 行 ——
+**不报错、不删除**（真库实测 `visible=4 unscoped=4`，一行都没删掉）。
+
+PG 因为 `$1/$2` 自带序号而完全免疫，所以 PG 集成测试与 mock 断言都看不见它。
+**教训：计数类断言（`Count` / 行数）是「参数顺序错位」的结构性盲区**，必须逐位断言
+`args[i]` 与占位符的对应关系（`delete_args_test.go` 就是这么写的）。
+
+修法：SET 的实参在 WHERE 之前分配，占位符顺序与实参顺序严格对齐。
+
+### 7. 向量列「写得进去、读不回来」；MySQL 侧还不是文本
+
+写方向的序列化（`serializeVector`）早就有，读方向却只有通用兜底：
+
+- **PG**：`vector` 列经驱动交回的是文本 `"[1,2,3]"`，落到 `[]float32` 字段上报
+  `orm: 无法把 string 赋给 []float32 字段`。
+- **MySQL**：`VECTOR` 列底层是 BLOB（worklog 原文 `Field_vector : public Field_blob`），
+  `SELECT` 回来的是**小端序 float32 裸字节**，根本不是文本 —— 纯文本解析必然失败。
+
+修法：`setterFor` 按 `f.vector` 分派给 `setVectorField`，后者按载荷形态分派
+（`[` 开头走文本，否则按二进制解码）。文本形态的证据来自 PG 实测，二进制形态的样例取自
+MySQL 官方文档（`STRING_TO_VECTOR("[3.14,2024,18]") = 0xC3F548400000FD4400009041`，
+逐字节核对小端 float32）。
+
+**MySQL 侧另有一个驱动级前提**：VECTOR 是 MySQL 9.0 新增的字段类型码 242
+（`MYSQL_TYPE_VECTOR`），`go-sql-driver/mysql` 要到 **v1.9.0** 才认识它；v1.8.x 读向量列时
+直接报 `unknown field type 242`。本模块的驱动因此从 v1.8.1 升到 v1.9.3（理由见上文
+「为什么单独一个模块」）。
+
+**mutation check**：把读路径临时退回纯文本解析后重跑，**只有 MySQL 子用例失败**，报错正是
+预期的二进制乱码（`向量文本第 0 个分量 "fff?\xcd\xcc\xcc..." 无法解析`，`ff 66 66 3F`
+小端即 `0.9`），PG 照过 —— 证明这条用例确实拦得住该 bug，而不是「碰巧全绿」。
+
+**已知限制（未改）**：「向量列存 NULL」目前无法表达 —— `serializeVector` 对 `[]float32{}`
+与 nil 切片**都**产出 `"[]"`，而 PG 的 `vector` 列至少 1 维，写 `"[]"` 会报
+`ERROR: vector must have at least 1 dimension (SQLSTATE 22000)`。需要 NULL 向量时，
+只能用 `OnlyColumns` 把该列排除在写入之外。
 
 ## 保留的方言差异（有意不修）
 
