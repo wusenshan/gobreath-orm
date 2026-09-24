@@ -95,8 +95,9 @@ func TestConventionSoftDeleteIntByGoName(t *testing.T) {
 	if !strings.Contains(recQuery, `UPDATE "conv_int_users" SET "del" = ? WHERE "id" = ? AND "del" = 0`) {
 		t.Fatalf("约定(int) 软删 SQL 不符合预期: %s", recQuery)
 	}
-	if len(recArgs) != 2 || recArgs[1] != int64(1) {
-		t.Fatalf("约定(int) 软删末参应为 1，实际 %v", recArgs)
+	// 参数与占位符同序：SET 的占位符在 WHERE 之前 → [逻辑值 1, 条件值 5]。
+	if len(recArgs) != 2 || recArgs[0] != int64(1) || recArgs[1] != int64(5) {
+		t.Fatalf("约定(int) 软删参数应为 [逻辑值 1, 条件值 5]，实际 %v", recArgs)
 	}
 }
 

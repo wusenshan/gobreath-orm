@@ -97,9 +97,12 @@ func TestSoftDeleteIntColumn(t *testing.T) {
 	if !strings.Contains(recQuery, `UPDATE "orders" SET "deleted" = ? WHERE "id" = ? AND "deleted" = 0`) {
 		t.Fatalf("int 列软删 SQL 不符合预期: %s", recQuery)
 	}
-	// 参数顺序：WHERE 的 5 先入参，逻辑列值 1 后入参（驱动将 int 转 int64）
-	if len(recArgs) != 2 || recArgs[1] != int64(1) {
-		t.Fatalf("int 列软删末参应为 1，实际 %v", recArgs)
+	// 参数顺序必须与 SQL 里的占位符同序：SET 在 WHERE 之前，故逻辑列值 1 先入参，
+	// WHERE 的 5 后入参。这里曾经反过来断言（"WHERE 的 5 先入参，逻辑列值 1 后入参"），
+	// 把 bug 当成了契约 —— 位置型方言（MySQL / SQLite）的 ? 不带序号，顺序反了就会
+	// 把条件值绑到 SET 上、时间/标志值绑到 WHERE 上，条件是「删除静默不生效」。
+	if len(recArgs) != 2 || recArgs[0] != int64(1) || recArgs[1] != int64(5) {
+		t.Fatalf("int 列软删参数应为 [逻辑值 1, 条件值 5]，实际 %v", recArgs)
 	}
 
 	// Unscoped 后 Delete 变物理删除

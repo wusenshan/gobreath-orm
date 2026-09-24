@@ -979,18 +979,33 @@ func Delete[T any](ctx context.Context, db *DB, q *Query[T]) error {
 	args := []any{}
 	idx := 0
 	add := func(v any) int { idx++; args = append(args, v); return idx }
-	w := whereSQL(q.groups, d, add)
-	if w == "" {
-		return fmt.Errorf("orm: Delete 必须有条件，禁止全表删除")
-	}
+
 	if li := resolveLogic(meta, db); li != nil && !q.unscoped {
+		// 参数分配顺序必须与占位符在 SQL 里的出现顺序一致：SET 在 WHERE 之前，
+		// 所以「被删除的值」要先分配，条件值后分配。
+		//
+		// 这里曾经把 whereSQL 放在前面（先给 WHERE 分配、再给 SET 分配），在 PG 上因为
+		// $n 自带序号而完全正确，在 MySQL / SQLite 上却生成
+		// `UPDATE t SET deleted_at = ? WHERE col = ?` + args=[条件值, 时间值] ——
+		// 两个值互换：WHERE 拿时间值去比字符串列必然命中 0 行，于是**删除静默不生效**
+		// （不报错、不删、返回值也是 nil）；而 SET 侧那个非法值因为没有任何行被匹配到，
+		// 连 MySQL 严格模式的类型检查都不会触发，所以两边都不留痕迹。
 		setPart := fmt.Sprintf("%s = %s", d.QuoteIdent(li.col), d.Placeholder(add(li.deletedValue())))
-		sqlStr := fmt.Sprintf("UPDATE %s SET %s WHERE %s", quoteTable(meta.finalTable(db.prefix), d), setPart, w)
+		w := whereSQL(q.groups, d, add)
+		if w == "" {
+			return fmt.Errorf("orm: Delete 必须有条件，禁止全表删除")
+		}
+		sqlStr := fmt.Sprintf("UPDATE %s SET %s WHERE %s",
+			quoteTable(meta.finalTable(db.prefix), d), setPart, w)
 		if s := logicSuffix(li, d, false); s != "" {
 			sqlStr += " AND " + s
 		}
 		_, err := db.execContext(ctx, sqlStr, args...)
 		return err
+	}
+	w := whereSQL(q.groups, d, add)
+	if w == "" {
+		return fmt.Errorf("orm: Delete 必须有条件，禁止全表删除")
 	}
 	sqlStr := fmt.Sprintf("DELETE FROM %s WHERE %s", quoteTable(meta.finalTable(db.prefix), d), w)
 	_, err := db.execContext(ctx, sqlStr, args...)

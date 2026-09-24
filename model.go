@@ -2,8 +2,10 @@ package orm
 
 import (
 	"database/sql"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"math"
 	"reflect"
 	"strconv"
 	"strings"
@@ -394,6 +396,13 @@ func (m *modelMeta) buildScanPlan(cols []string) *scanPlan {
 // 其余类型（结构体、切片、map，以及 JSON 列）一律回落到通用的 setField，
 // 行为与未特化时完全一致。
 func setterFor(f *fieldInfo) scanSetter {
+	if f.vector {
+		// 向量列必须走专用 setter：驱动交回来的是 "[1,0,0]" 这样的**文本**，
+		// 落到 []float32 / [3]float32 字段上，通用兜底只会报
+		// "orm: 无法把 string 赋给 []float32 字段"。
+		dim := f.vectorDim
+		return func(fv reflect.Value, val any) error { return setVectorField(fv, val, dim) }
+	}
 	if f.json {
 		return jsonUnmarshalVal
 	}
@@ -524,6 +533,156 @@ func prepareTarget(fv reflect.Value, val any) (reflect.Value, bool) {
 		return fv.Elem(), true
 	}
 	return fv, true
+}
+
+// ---- 向量列 ----
+
+// parseVectorText 解析向量列的文本形式（pgvector 的 "[1,2,3]"、以及 MySQL
+// STRING_TO_VECTOR / TO_VECTOR 的输出格式），返回各分量。
+// 空向量 "[]" 返回空切片（不是错误）。
+func parseVectorText(s string) ([]float64, error) {
+	s = strings.TrimSpace(s)
+	s = strings.TrimPrefix(s, "[")
+	s = strings.TrimSuffix(s, "]")
+	if strings.TrimSpace(s) == "" {
+		return nil, nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]float64, len(parts))
+	for i, p := range parts {
+		f, err := strconv.ParseFloat(strings.TrimSpace(p), 64)
+		if err != nil {
+			return nil, fmt.Errorf("orm: 向量文本第 %d 个分量 %q 无法解析：%w", i, strings.TrimSpace(p), err)
+		}
+		out[i] = f
+	}
+	return out, nil
+}
+
+// looksLikeVectorText 判断驱动返回的字节串是文本形式（"[1,2,3]"）还是 MySQL 的二进制形式。
+//
+// 只看跳过前导空白后的第一个字节是不是 '['：PG 与 MySQL 的 VECTOR_TO_STRING / FROM_VECTOR
+// 都产出列表文本；而 MySQL 的 VECTOR 列本身按 BLOB 返回二进制，首字节是某个 float32
+// 的最低有效字节，是 '['（0x5B）的概率极低 —— 即便撞上，后续的维度校验也会把它拦下来。
+func looksLikeVectorText(b []byte) bool {
+	for _, c := range b {
+		switch c {
+		case ' ', '\t', '\n', '\r':
+			continue
+		}
+		return c == '['
+	}
+	return false
+}
+
+// parseVectorBinary 解码 MySQL 的 VECTOR 二进制形式。
+//
+// MySQL 的 VECTOR 列底层是 BLOB：N 个小端序 IEEE-754 单精度浮点依次排布
+// （官方 worklog 原文 "Field_vector : public Field_blob"，精度 = sizeof(float)）。
+// 文档样例可逐字节核对：STRING_TO_VECTOR("[3.14,2024,18]") = 0xC3F548400000FD4400009041
+//   - 3.14f = 0x4048F5C3 → 小端字节 C3 F5 48 40
+//   - 2024f = 0x44FD0000 → 小端字节 00 00 FD 44
+//   - 18f = 0x41900000 → 小端字节 00 00 90 41
+//
+// 也就是说 MySQL 下 `SELECT emb FROM t` 拿回的是裸字节、而不是 "[..]" 文本 —— 读路径必须
+// 自己解码，否则向量列会「写得进去、读不回来」（PG 走文本、MySQL 走二进制，两条路都要通）。
+func parseVectorBinary(b []byte, dim int) ([]float64, error) {
+	if len(b)%4 != 0 {
+		return nil, fmt.Errorf("orm: 向量二进制长度 %d 不是 4 的倍数（MySQL 每个分量 4 字节单精度浮点）", len(b))
+	}
+	n := len(b) / 4
+	if dim > 0 && n != dim {
+		return nil, fmt.Errorf("orm: 向量二进制解出 %d 维，与字段声明的 %d 维不符（db tag 的 ,vector(%d)）", n, dim, dim)
+	}
+	out := make([]float64, n)
+	for i := 0; i < n; i++ {
+		out[i] = float64(math.Float32frombits(binary.LittleEndian.Uint32(b[i*4:])))
+	}
+	return out, nil
+}
+
+// parseVectorPayload 按载荷形态分派：文本（"[1,2,3]"）走文本解析，其余按 MySQL 的
+// VECTOR 二进制解码。空载荷返回空切片（真正的 SQL NULL 由 prepareTarget 在上层处理）。
+func parseVectorPayload(b []byte, dim int) ([]float64, error) {
+	if len(b) == 0 {
+		return nil, nil
+	}
+	if looksLikeVectorText(b) {
+		return parseVectorText(string(b))
+	}
+	return parseVectorBinary(b, dim)
+}
+
+// setVectorField 把驱动返回的向量值写回 []float32 / []float64 / 其定长数组字段。
+//
+// 背景：写方向的序列化（serializeVector：[]float32 → "[..]"）早就有了，读方向却一直
+// 缺 —— 于是「向量列能写进去、读不回来」：PG 的 vector 列经驱动交回的是文本，落到
+// []float32 字段上会报 `orm: 无法把 string 赋给 []float32 字段`。RAG 场景里检索结果
+// 本身就要读向量列（拿去做二次召回 / 展示），这个缺口必须在框架层补上，
+// 否则每个调用方都要退回 RawQuery。
+//
+// dim > 0（db tag 写了 ,vector(N)）时校验维度，不一致直接报错 —— 静默截断/补零
+// 只会把问题推迟到更难定位的地方。
+func setVectorField(fv reflect.Value, val any, dim int) error {
+	target, ok := prepareTarget(fv, val)
+	if !ok {
+		return nil
+	}
+	var floats []float64
+	switch v := val.(type) {
+	case []float64:
+		floats = v
+	case []float32:
+		floats = make([]float64, len(v))
+		for i, x := range v {
+			floats[i] = float64(x)
+		}
+	case string:
+		parsed, err := parseVectorPayload([]byte(v), dim)
+		if err != nil {
+			return err
+		}
+		floats = parsed
+	case []byte:
+		parsed, err := parseVectorPayload(v, dim)
+		if err != nil {
+			return err
+		}
+		floats = parsed
+	default:
+		return fmt.Errorf("orm: 无法把 %T 解析为向量（期望 \"[..]\" 文本或浮点切片）", val)
+	}
+	if dim > 0 && len(floats) != dim {
+		return fmt.Errorf("orm: 向量维度不匹配：字段声明为 %d 维（db tag 的 ,vector(%d)），数据库返回 %d 维",
+			dim, dim, len(floats))
+	}
+
+	setElem := func(ev reflect.Value, f float64) {
+		if ev.Kind() == reflect.Float32 {
+			ev.SetFloat(float64(float32(f)))
+			return
+		}
+		ev.SetFloat(f)
+	}
+	switch target.Kind() {
+	case reflect.Slice:
+		out := reflect.MakeSlice(target.Type(), len(floats), len(floats))
+		for i, f := range floats {
+			setElem(out.Index(i), f)
+		}
+		target.Set(out)
+	case reflect.Array:
+		if target.Len() != len(floats) {
+			return fmt.Errorf("orm: 向量维度不匹配：字段是 [%d]，数据库返回 %d 维",
+				target.Len(), len(floats))
+		}
+		for i, f := range floats {
+			setElem(target.Index(i), f)
+		}
+	default:
+		return fmt.Errorf("orm: 向量列的字段类型应为 []float32 / []float64 或其定长数组，实际 %s", target.Type())
+	}
+	return nil
 }
 
 // ---- 按类别赋值。target 必须已是解引用后、非 NULL 的目标值。----
