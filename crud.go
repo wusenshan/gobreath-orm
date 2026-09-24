@@ -658,7 +658,11 @@ func Page[T any](ctx context.Context, db *DB, q *Query[T], page, size int) (*Pag
 	if size < 1 {
 		size = 10
 	}
-	list, err := SelectList(ctx, db, q.Limit(size).Offset((page-1)*size))
+	// 分页参数只能落在内部副本上：q 属于调用方，直接 q.Limit(size).Offset(...)
+	// 会把这些值写回它的 Query，之后复用它做列表查询就会静默只取 size 行。
+	qq := *q
+	qq.limit, qq.offset = size, (page-1)*size
+	list, err := SelectList(ctx, db, &qq)
 	if err != nil {
 		return nil, err
 	}

@@ -373,14 +373,22 @@ func (q *Query[T]) Unscoped() *Query[T] {
 	return q
 }
 
-// applyLogic 若模型存在生效的软删除列且未显式 Unscoped，返回一个追加了「未删除」过滤条件的新查询。
+// applyLogic 返回一个可能追加了「未删除」过滤条件的新查询：模型存在生效的软删除列
+// 且未显式 Unscoped 时追加条件，否则原样复制一份。
 // 条件作为独立的 AND 组追加，与原条件正确衔接；新查询标记 unscoped 以防重复叠加。
+//
+// ⚠️ 无论是否真的加了条件，都**必须返回副本**，不能把 q 原样还回去：
+// 调用方（SelectList / SelectOne / Count / 聚合 / DryRun）紧接着链的是**就地修改**的
+// WithDialect / WithPrefix / Limit。短路径上返回原对象，这些写入就会落到调用方的 Query 上，
+// 于是调用方被上一次查询的方言、表前缀乃至 LIMIT 粘住 —— 例如 SelectOne 之后
+// 复用同一个 q 查列表，会静默只返回 1 行（不报错）。
+// 这个坑只在「无软删除列 / 已 Unscoped」时出现，带软删除列的模型因为本来就返回副本而免疫。
 func (q *Query[T]) applyLogic(meta *modelMeta, db *DB) *Query[T] {
-	li := resolveLogic(meta, db)
-	if li == nil || q.unscoped {
-		return q
-	}
 	c := *q
+	li := resolveLogic(meta, db)
+	if li == nil || c.unscoped {
+		return &c
+	}
 	c.groups = append(append([][]where{}, q.groups...), []where{{
 		col: li.col, op: li.notDeletedCond(), raw: true,
 	}})

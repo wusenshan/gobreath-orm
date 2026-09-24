@@ -495,6 +495,24 @@ sql, args = orm.DryRun(db, q)   // 补上 db 的方言 / 表前缀 / 软删除�
 `ToSQL` 适合单测断言 SQL 与快速排查；`DryRun` 会带上 db 级配置（对标 GORM 的 DryRun），
 适合把语句交给 DBA 复核慢查询。
 
+### 复用查询（`Query` 可以安全复用）
+
+`Query[T]` 是可复用的：所有查询入口（`SelectList` / `SelectOne` / `Count` / `Exists` /
+`Page` / 聚合 / `Pluck` / `DryRun`）都只在**内部副本**上补本次查询的上下文 —— db 的方言、
+表前缀、软删除条件，以及内部自身需要的 `LIMIT` —— 不会修改你传入的 `q`。
+
+```go
+q := orm.NewQuery[Post]().LikeRight(postTitle, "go ")
+
+first, _ := orm.SelectOne(ctx, db, q)   // 内部补 LIMIT 1；q 本身不受影响
+n, _ := orm.Count(ctx, db, q)           // 仍是「全部匹配行」的数量
+all, _ := orm.SelectList(ctx, db, q)    // 仍能取到全部匹配行，不会只剩 1 行
+p, _ := orm.Page(ctx, db, q, 1, 10)     // 分页的 LIMIT / OFFSET 同样只作用于本次调用
+```
+
+因此 `q.ToSQL()` 在任何入口调用前后都**逐字不变**（它只反映查询构造器自身的状态，不补
+db 级方言与表前缀）；要看「这条查询在某个 db 上真正会执行什么」，用 `orm.DryRun(db, q)`。
+
 ### 事务（Transaction）
 
 ```go
