@@ -513,6 +513,12 @@ p, _ := orm.Page(ctx, db, q, 1, 10)     // 分页的 LIMIT / OFFSET 同样只作
 因此 `q.ToSQL()` 在任何入口调用前后都**逐字不变**（它只反映查询构造器自身的状态，不补
 db 级方言与表前缀）；要看「这条查询在某个 db 上真正会执行什么」，用 `orm.DryRun(db, q)`。
 
+**写入入口同样遵守这条契约**：`UpdatePartial(db, q, sets)` 的 `sets` 只经参数传递、
+不会写进 `q` —— 之后在同一 `q` 上继续链 `.Set()` / 再跑 `UpdateSets`，不会被上一轮的
+残留字段污染。另外，按条件写入的入口（`Update` / `UpdateSets` / `Delete` / `ForceDelete`）
+与读路径一样尊重 `q.Table()`：分表场景下同一个 `q` 查哪张表就写哪张表，不会静默落到
+默认表上。
+
 ### 事务（Transaction）
 
 ```go

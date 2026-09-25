@@ -2,6 +2,7 @@ package orm
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"strings"
@@ -268,11 +269,18 @@ func BatchInsert[T any](ctx context.Context, db *DB, entities []T, opts ...Write
 }
 
 // bindVal 返回部分更新 / map 更新时字段应绑定的参数值；向量列序列化为文本 [..]。
-func bindVal(meta *modelMeta, col string, val any) any {
-	if fi := fieldInfoForCol(meta, col); fi != nil && fi.vector {
-		return serializeVector(val)
+// bindVal 返回部分更新 / map 更新时字段应绑定的参数值：
+// JSON 列先 marshal 成 []byte（与实体路径的 argFor 同口径，否则 map[string]any
+// 原样交给驱动会报 unsupported type），向量列序列化为文本 [..]。
+func bindVal(meta *modelMeta, col string, val any) (any, error) {
+	fi := fieldInfoForCol(meta, col)
+	if fi != nil && fi.json {
+		return json.Marshal(val)
 	}
-	return val
+	if fi != nil && fi.vector {
+		return serializeVector(val), nil
+	}
+	return val, nil
 }
 
 // ---- Upsert（插入或更新，方言分发）----
@@ -800,7 +808,7 @@ func Update[T any](ctx context.Context, db *DB, q *Query[T], entity *T, opts ...
 		return fmt.Errorf("orm: Update 必须有条件，禁止全表更新")
 	}
 	sqlStr := fmt.Sprintf("UPDATE %s SET %s WHERE %s",
-		quoteTable(meta.finalTable(db.prefix), db.dialect), strings.Join(setParts, ", "), w)
+		quoteTable(queryTable(q, meta, db), db.dialect), strings.Join(setParts, ", "), w)
 	if s := logicSuffix(resolveLogic(meta, db), db.dialect, q.unscoped); s != "" {
 		sqlStr += " AND " + s
 	}
@@ -835,20 +843,32 @@ func checkSetCols(meta *modelMeta, sets map[string]any) error {
 //	  Eq(orm.Col[User](func(u *User) *int64 { return &u.Id }), 1).
 //	  Set("name", "bob").Set("age", 30))
 func UpdateSets[T any](ctx context.Context, db *DB, q *Query[T]) (int64, error) {
+	return updateSetsImpl[T](ctx, db, q, q.sets)
+}
+
+// updateSetsImpl 是 UpdateSets / UpdatePartial 的共用实现。sets 由调用方显式传入：
+// UpdatePartial 此前直接写 q.sets = sets，把调用方的 Query 改掉 —— 之后在同一 q 上
+// 链 .Set() 会追加到这份旧 map（Set 只在 map 为 nil 时新建），残留字段混进下一次
+// UPDATE，静默多更新一列。凡框架入口都不得修改调用方传入的 Query。
+func updateSetsImpl[T any](ctx context.Context, db *DB, q *Query[T], sets map[string]any) (int64, error) {
 	meta := getMeta[T]()
-	if len(q.sets) == 0 {
+	if len(sets) == 0 {
 		return 0, fmt.Errorf("orm: UpdateSets 至少需要 Set 一个字段")
 	}
-	if err := checkSetCols(meta, q.sets); err != nil {
+	if err := checkSetCols(meta, sets); err != nil {
 		return 0, err
 	}
 	d := db.dialect
 	phIdx := 0
 	nextPh := func() string { phIdx++; return d.Placeholder(phIdx) }
-	setParts := make([]string, 0, len(q.sets))
-	args := make([]any, 0, len(q.sets))
-	for col, val := range q.sets {
-		args = append(args, bindVal(meta, col, val))
+	setParts := make([]string, 0, len(sets))
+	args := make([]any, 0, len(sets))
+	for col, val := range sets {
+		bv, err := bindVal(meta, col, val)
+		if err != nil {
+			return 0, fmt.Errorf("orm: 列 %q 绑定失败：%w", col, err)
+		}
+		args = append(args, bv)
 		ph := nextPh()
 		if fi := fieldInfoForCol(meta, col); fi != nil && fi.vector {
 			ph = d.VectorBind(ph)
@@ -862,7 +882,7 @@ func UpdateSets[T any](ctx context.Context, db *DB, q *Query[T]) (int64, error) 
 		return 0, fmt.Errorf("orm: UpdateSets 必须有条件，禁止全表更新")
 	}
 	sqlStr := fmt.Sprintf("UPDATE %s SET %s WHERE %s",
-		quoteTable(meta.finalTable(db.prefix), d), strings.Join(setParts, ", "), w)
+		quoteTable(queryTable(q, meta, db), d), strings.Join(setParts, ", "), w)
 	if s := logicSuffix(resolveLogic(meta, db), d, q.unscoped); s != "" {
 		sqlStr += " AND " + s
 	}
@@ -874,10 +894,21 @@ func UpdateSets[T any](ctx context.Context, db *DB, q *Query[T]) (int64, error) 
 }
 
 // UpdatePartial 是 UpdateSets 的 map 入口：直接以 sets map 指定待更新字段，
-// 条件仍来自 q（Eq/In 等链式方法）。返回受影响行数。
+// 条件仍来自 q（Eq/In 等链式方法）。不修改调用方的 Query。返回受影响行数。
 func UpdatePartial[T any](ctx context.Context, db *DB, q *Query[T], sets map[string]any) (int64, error) {
-	q.sets = sets
-	return UpdateSets(ctx, db, q)
+	return updateSetsImpl[T](ctx, db, q, sets)
+}
+
+// queryTable 返回「按条件写入」入口（Update / UpdateSets / Delete / ForceDelete）
+// 应使用的物理表名：q 显式指定的表（q.Table，如分表 / 视图）优先，否则回退到
+// 模型元数据推导的表名。此前这些入口一律用 meta.finalTable(db.prefix)，把
+// q.Table 静默忽略掉 —— 读路径（走 Build()）尊重 q.table，写路径却写到默认表。
+// 前缀口径与读路径一致：db.prefix 为准（读路径也是 WithPrefix(db.prefix) 覆盖）。
+func queryTable[T any](q *Query[T], meta *modelMeta, db *DB) string {
+	if q.table != "" {
+		return applyPrefix(q.table, db.prefix, q.tableExplicit)
+	}
+	return meta.finalTable(db.prefix)
 }
 
 // UpdateByIdSets 按主键更新 sets 中的字段（map 形式的部分更新）。
@@ -911,7 +942,11 @@ func UpdateByIdSets[T any](ctx context.Context, db *DB, id any, sets map[string]
 		if hasVersion && col == vi.colName {
 			continue // 版本列由「自增 + WHERE 旧值」处理
 		}
-		args = append(args, bindVal(meta, col, val))
+		bv, err := bindVal(meta, col, val)
+		if err != nil {
+			return 0, fmt.Errorf("orm: 列 %q 绑定失败：%w", col, err)
+		}
+		args = append(args, bv)
 		ph := nextPh()
 		if fi := fieldInfoForCol(meta, col); fi != nil && fi.vector {
 			ph = d.VectorBind(ph)
@@ -1000,7 +1035,7 @@ func Delete[T any](ctx context.Context, db *DB, q *Query[T]) error {
 			return fmt.Errorf("orm: Delete 必须有条件，禁止全表删除")
 		}
 		sqlStr := fmt.Sprintf("UPDATE %s SET %s WHERE %s",
-			quoteTable(meta.finalTable(db.prefix), d), setPart, w)
+			quoteTable(queryTable(q, meta, db), d), setPart, w)
 		if s := logicSuffix(li, d, false); s != "" {
 			sqlStr += " AND " + s
 		}
@@ -1011,7 +1046,7 @@ func Delete[T any](ctx context.Context, db *DB, q *Query[T]) error {
 	if w == "" {
 		return fmt.Errorf("orm: Delete 必须有条件，禁止全表删除")
 	}
-	sqlStr := fmt.Sprintf("DELETE FROM %s WHERE %s", quoteTable(meta.finalTable(db.prefix), d), w)
+	sqlStr := fmt.Sprintf("DELETE FROM %s WHERE %s", quoteTable(queryTable(q, meta, db), d), w)
 	_, err := db.execContext(ctx, sqlStr, args...)
 	return err
 }
@@ -1039,7 +1074,7 @@ func ForceDelete[T any](ctx context.Context, db *DB, q *Query[T]) error {
 	if w == "" {
 		return fmt.Errorf("orm: ForceDelete 必须有条件，禁止全表删除")
 	}
-	sqlStr := fmt.Sprintf("DELETE FROM %s WHERE %s", quoteTable(meta.finalTable(db.prefix), db.dialect), w)
+	sqlStr := fmt.Sprintf("DELETE FROM %s WHERE %s", quoteTable(queryTable(q, meta, db), db.dialect), w)
 	_, err := db.execContext(ctx, sqlStr, args...)
 	return err
 }
