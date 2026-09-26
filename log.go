@@ -32,7 +32,37 @@ type LogFunc func(level LogLevel, query string, args []any, dur time.Duration, e
 //
 //	2026-08-24 17:20:00 INFO  (   1.2ms) SELECT * FROM users WHERE id = $1 args=[1]
 //	2026-08-24 17:20:01 ERROR (   3.4ms) SELECT * FROM x: err=ERROR: relation "x" does not exist
-func DefaultLogger(w io.Writer) LogFunc {
+//
+// ⚠️ 安全提示：为便于本地排查，它会**原样打印绑定参数**（args=%v）。若 SQL 会带上
+// 密码、Token、手机号、身份证号等敏感值（登录 / 支付 / 实名类写入很常见），这些值
+// 会以明文落进日志文件。生产环境请改用 DefaultLoggerMasked 传入脱敏函数，或直接
+// 自定义 LogFunc 接到你们的日志库。
+func DefaultLogger(w io.Writer) LogFunc { return defaultLogger(w, nil) }
+
+// MaskArgsFunc 是绑定参数的脱敏钩子，配合 DefaultLoggerMasked 使用。
+// query 为本次执行的 SQL，返回一份用于打印的参数副本。
+type MaskArgsFunc func(query string, args []any) []any
+
+// DefaultLoggerMasked 与 DefaultLogger 行为一致，区别是打印前先经 mask 处理一份参数
+// **副本**：脱敏只影响日志文本，真实执行用的参数不受任何影响。mask 为 nil 时等同
+// DefaultLogger。
+//
+// 示例（长度超过 4 的字符串只留首尾两字符）：
+//
+//	logger := orm.DefaultLoggerMasked(os.Stdout, func(_ string, args []any) []any {
+//		out := make([]any, len(args))
+//		for i, a := range args {
+//			if s, ok := a.(string); ok && len(s) > 4 {
+//				out[i] = s[:2] + "***" + s[len(s)-2:]
+//				continue
+//			}
+//			out[i] = a
+//		}
+//		return out
+//	})
+func DefaultLoggerMasked(w io.Writer, mask MaskArgsFunc) LogFunc { return defaultLogger(w, mask) }
+
+func defaultLogger(w io.Writer, mask MaskArgsFunc) LogFunc {
 	if w == nil {
 		w = os.Stderr
 	}
@@ -46,7 +76,11 @@ func DefaultLogger(w io.Writer) LogFunc {
 		default:
 			tag = "INFO "
 		}
-		msg := fmt.Sprintf("%s (  %8s) %s args=%v", tag, dur, query, args)
+		logArgs := args
+		if mask != nil {
+			logArgs = mask(query, args)
+		}
+		msg := fmt.Sprintf("%s (  %8s) %s args=%v", tag, dur, query, logArgs)
 		if err != nil {
 			msg += " err=" + err.Error()
 		}

@@ -165,7 +165,20 @@ func (q *Query[T]) Set(col ColExpr, val any) *Query[T] {
 }
 
 // Select 指定返回列；不调用则默认 *。向量检索时会自动追加距离列。
+//
+// 每个参数必须是**单个**列名，可带表别名前缀（如 "u.name"）。不支持把多个列名写在
+// 同一个字符串里：每个参数都会作为整体标识符加引号，Select("name, age") 会拼出
+// `name, age` 这样一段非法列名 —— 框架自己不报错，只在数据库侧以 unknown column
+// 暴露，错误信息也指不回调用处。
+// 多列请逐个传入：Select("name", "age")；表达式列请改用原生 SQL（RawQuery）。
 func (q *Query[T]) Select(cols ...string) *Query[T] {
+	for _, c := range cols {
+		if c == "" || strings.ContainsAny(c, ", \t\r\n()") {
+			panic(fmt.Sprintf("orm: Select 的每个参数必须是单个列名（可带前缀，如 \"u.name\"），"+
+				"不能为空、也不能把多列写在同一个字符串里：收到 %q。"+
+				"请改为逐个传入，例如 Select(\"name\", \"age\")", c))
+		}
+	}
 	q.selects = cols
 	return q
 }
@@ -226,9 +239,19 @@ func (q *Query[T]) NotLikeRight(col ColExpr, val string) *Query[T] {
 func (q *Query[T]) NotLikeLeft(col ColExpr, val string) *Query[T] {
 	return q.addWhere(col.name, "NOT LIKE", []any{"%" + val})
 }
+
+// In 集合匹配。**空切片（或 nil）不是错误输入**：按「空集合的成员判定恒为假」的集合
+// 语义折叠为恒假条件（1 = 0），即「没有任何行匹配」—— 这正是动态多选条件「一个都没勾」
+// 时期望的结果，且不会生成非法的 `IN ()`（MySQL 1064 / PG 42601 / SQLite 1）。
+//
+// 注意：折叠后不绑定任何参数。若不带条件地用在 Update / Delete 上，会因「无条件」
+// 被直接拒绝（禁止全表更新/删除），而不是把整表数据当成命中集合。
 func (q *Query[T]) In(col ColExpr, vals []any) *Query[T] {
 	return q.addWhere(col.name, "IN", vals)
 }
+
+// NotIn 反向集合匹配。空切片（或 nil）同样不是错误输入：`NOT IN ()` 是非法 SQL，
+// 按集合语义折叠为恒真条件（「所有行都匹配」），即整条条件被省略。
 func (q *Query[T]) NotIn(col ColExpr, vals []any) *Query[T] {
 	return q.addWhere(col.name, "NOT IN", vals)
 }
@@ -303,7 +326,16 @@ func (q *Query[T]) Having(col ColExpr, op string, val any) *Query[T] {
 
 // Nearest 向量近邻检索：按默认度量（L2 欧几里得）生成距离排序并 LIMIT k。
 // 文本语义相似度检索（如 RAG）建议改用 NearestBy(..., Cosine)。
+//
+// k 必须为正整数：k <= 0 会被跳过 LIMIT 生成，退化成「全表逐行算距离 + 全量排序」，
+// 大表上直接把 CPU 与临时空间打满（而且查询「成功」返回，没有任何提示）。
+// 确需无上限的全量距离排序，请写明一个明确上限，或用原生 SQL（RawQuery）表达。
 func (q *Query[T]) Nearest(col ColExpr, vec any, k int) *Query[T] {
+	if k <= 0 {
+		panic(fmt.Sprintf("orm: Nearest/NearestBy 的 k 必须为正整数（收到 %d）：k <= 0 会让查询退化为「无 LIMIT 的全表距离排序」，"+
+			"大表上会打满 CPU 与临时空间；请传入明确的上限（如 k = 100）", k))
+	}
+	q.guardLastPaging("Nearest 的 k")
 	q.hasVector = true
 	q.vecCol = col.name
 	q.vector = vec
@@ -341,8 +373,19 @@ func (q *Query[T]) WithinDistanceBy(col ColExpr, vec any, threshold float64, m V
 	return q.WithinDistance(col, vec, threshold)
 }
 
-func (q *Query[T]) Limit(n int) *Query[T]  { q.limit = n; return q }
-func (q *Query[T]) Offset(n int) *Query[T] { q.offset = n; return q }
+// Limit 设置返回行数上限；与 Last 互斥（见 Last 的说明）。
+func (q *Query[T]) Limit(n int) *Query[T] {
+	q.guardLastPaging("Limit")
+	q.limit = n
+	return q
+}
+
+// Offset 设置跳过行数；与 Last 互斥（见 Last 的说明）。
+func (q *Query[T]) Offset(n int) *Query[T] {
+	q.guardLastPaging("Offset")
+	q.offset = n
+	return q
+}
 
 // Distinct 让本次查询使用 SELECT DISTINCT 去重（对标 SQL 的 SELECT DISTINCT）。
 // 常与 GroupBy / 聚合场景配合；向量检索（hasVector）时仅作用于普通列，距离列 dist 不受影响。
@@ -362,9 +405,65 @@ func (q *Query[T]) ForUpdate() *Query[T] {
 //
 // ⚠️ 安全提示：Last 的内容不经占位符参数化、直接拼接进 SQL，仅可用于可信/静态片段，
 // 切勿拼接任何来自用户输入的字符串，否则会造成 SQL 注入。
+//
+// Last 与 Limit / Offset（含 Nearest 的 k）互斥：两者都会生成分页子句，同时使用会得到
+// 重复/错序的 SQL（如 "... LIMIT 10 ORDER BY id DESC LIMIT 1"），框架此前照拼不误，
+// 只有数据库执行时才报语法错误。需要自定义分页时，把整段分页写进 Last 并不要调用
+// Limit / Offset。
 func (q *Query[T]) Last(sql string) *Query[T] {
+	q.guardLastPaging("Last")
 	q.last = sql
 	return q
+}
+
+// guardLastPaging 校验「自定义尾片段（Last）」不与「框架分页（Limit / Offset / Nearest 的 k）」
+// 拼出重复分页子句。参数 other 是触发方名称，用于报错定位。
+//
+// 只在**尾片段自带分页子句**（LIMIT / OFFSET / FETCH）时才判为冲突：
+// 那样会拼出 "SELECT ... LIMIT 10 ORDER BY id DESC LIMIT 1" 这类非法 SQL
+// （数据库只会报语法错误，错误信息指向不了调用处）。
+// 而「SKIP LOCKED」「NOWAIT」「FOR SHARE」这类与分页无关的尾片段和 Limit 同用是合法且常见的
+// 写法（队列式抢锁：`FOR UPDATE SKIP LOCKED LIMIT 1`），不做限制。
+// 两种书写顺序都能拦到：先 Last 再 Limit、先 Limit 再 Last。
+func (q *Query[T]) guardLastPaging(other string) {
+	if q.last == "" || (q.limit <= 0 && q.offset <= 0) {
+		return
+	}
+	if kw := lastPagingClause(q.last); kw != "" {
+		panic(fmt.Sprintf("orm: Last 与 %s 不能同时使用：Last 片段里已有 %s 分页子句，"+
+			"框架还会再拼一段 LIMIT/OFFSET，最终 SQL 会出现两个分页子句（形如 "+
+			"\"... LIMIT 10 ORDER BY id DESC LIMIT 1\"），数据库只会报语法错误、难以定位到调用处。"+
+			"请二选一：自定义分页时把整段（含 ORDER BY 与 LIMIT/OFFSET）写进 Last 并不要再调 Limit/Offset；"+
+			"或改用框架分页、把 Last 留给 SKIP LOCKED 这类非分页尾子句", other, kw))
+	}
+}
+
+// lastPagingClause 返回尾片段中出现的第一处分页关键字（LIMIT / OFFSET / FETCH），无则返回空串。
+// 按整词匹配（两侧需为非标识符字符），避免把 SKIP LOCKED 之类的片段误判为分页。
+func lastPagingClause(sql string) string {
+	up := " " + strings.ToUpper(stripLeadingComments(sql)) + " "
+	for _, kw := range []string{"LIMIT", "OFFSET", "FETCH"} {
+		idx := 0
+		for {
+			p := strings.Index(up[idx:], kw)
+			if p < 0 {
+				break
+			}
+			p += idx
+			before, after := up[p-1], up[p+len(kw)]
+			if !isIdentChar(before) && !isIdentChar(after) {
+				return kw
+			}
+			idx = p + len(kw)
+		}
+	}
+	return ""
+}
+
+// isIdentChar 判断字节是否可出现在 SQL 标识符/数字里（用于整词匹配）。
+func isIdentChar(c byte) bool {
+	return c == '_' || c == '"' || c == '`' || c == '[' || c == ']' ||
+		(c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
 }
 
 // Unscoped 关闭本次查询/删除的逻辑删除自动过滤，用于查询已删除数据或物理删除。
@@ -510,6 +609,10 @@ func contains(ss []string, s string) bool {
 // Build 生成最终 SQL 与参数。向量（若有）通常落在第一个占位符上。
 func (q *Query[T]) Build() (string, []any) {
 	d := q.dialect
+	// 兜底再校验一次 Last 与分页互斥：setter（Limit/Offset/Last/Nearest）已经拦过，
+	// 这里覆盖直接改字段的路径（如分页辅助函数），保证任何一条构造路径都不会产出
+	// 两段分页子句的非法 SQL。
+	q.guardLastPaging("Limit/Offset（含 Nearest 的 k）")
 	// 投影已被完全指定时（聚合 SUM/AVG/... 或 Pluck 的单列投影），不要再追加向量距离列：
 	// 结果集会从 1 列变成 2 列，Scan 单值直接报 "expected 1 destination arguments in Scan"。
 	// 另外聚合时的向量排序也要跳过（见下方 ORDER BY），否则是非法 SQL。
@@ -723,6 +826,20 @@ func whereSQL(groups [][]where, d Dialect, add func(any) int) string {
 			}
 			switch w.op {
 			case "IN", "NOT IN":
+				// 空集合是动态条件里最常见的边界（多选条件一个都没勾）：
+				// `IN ()` / `NOT IN ()` 是非法 SQL（MySQL 1064 / PG 42601 / SQLite 1），
+				// 这里按集合语义折叠成常量条件，且不绑定任何参数：
+				//   IN(空)     → 恒假：1 = 0（没有任何行匹配）
+				//   NOT IN(空) → 恒真：整条条件省略（其所在 OR 组退化为 TRUE，参与 AND 无影响）
+				// 与 Go / SQL 里「空集合的成员判定恒为假」一致，也避免「忘记传条件」
+				// 直接抛出一条数据库语法错误。折叠不引用该列，故 jsonPath 分支也无副作用。
+				if len(w.vals) == 0 {
+					if w.op == "NOT IN" {
+						continue // 恒真：不产生任何条件
+					}
+					parts = append(parts, "1 = 0")
+					continue
+				}
 				phs := make([]string, 0, len(w.vals))
 				for _, v := range w.vals {
 					phs = append(phs, d.Placeholder(add(v)))
@@ -736,6 +853,12 @@ func whereSQL(groups [][]where, d Dialect, add func(any) int) string {
 				n := add(w.vals[0])
 				parts = append(parts, fmt.Sprintf("%s %s %s", colExpr, w.op, d.Placeholder(n)))
 			}
+		}
+		if len(parts) == 0 {
+			// 组内条件全部被折叠掉（如 NotIn(空) 恒真）：整组省略。
+			// 语义上等价于 TRUE，参与外层 AND 不改变结果；
+			// 必须在这里 continue —— 否则会拼出一个空的 "()"，那才是真正的非法 SQL。
+			continue
 		}
 		if len(parts) == 1 {
 			groupStrs = append(groupStrs, parts[0])

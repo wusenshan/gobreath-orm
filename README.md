@@ -165,6 +165,32 @@ func (User) TableName() string { return "users" }
 > 默认关闭是为了兼容旧行为（不校验）；一旦任一 `Open` 开启，全局进入严格模式（越严越安全）。
 > `go vet` 也能静态拦截同类笔误，此开关作为运行时兜底，建议在 CI / 启动阶段开启以便第一时间暴露。
 
+> ✅ **嵌入结构体（公共字段复用）会被扁平化展开。**
+> `Base` / `AuditFields` 这类公共字段复用是 Go 的常规写法（对标 GORM 的 `gorm:"embedded"`），
+> 框架把**匿名嵌入**的字段直接展开成外层的列，读写与查询构造都用真实列名：
+>
+> ```go
+> type Audit struct {
+>     CreatedAt time.Time `db:"created_at"`
+>     UpdatedAt time.Time `db:"updated_at"`
+> }
+>
+> type User struct {
+>     ID   int64  `db:"id,pk,autoincrement"`
+>     Name string `db:"name"`
+>     Audit // 展开为 created_at / updated_at 两列，而不是一个叫 audit 的列
+> }
+> ```
+>
+> 于是 `AutoMigrate` 建出的是两个真列，`orm.Col[User](func(u *User) *time.Time { return &u.CreatedAt })`
+> 解析出 `created_at`、读回的值写进 `u.Audit.CreatedAt`。嵌入里的字段同样可以写
+> `,pk` / `,logic` / `,json` / `,vector` 等修饰符。
+>
+> 三条边界：① **未导出**的嵌入类型（`audit`）不参与映射，静默跳过；② 显式 `db:"-"`
+> 跳过整组嵌入字段；③ 匿名嵌入**指针类型**（`*Audit`）暂不支持、解析时直接报错
+> （nil 指针的读写语义未定义），请改用值嵌入。展开后若与外层字段撞列名，
+> 解析期直接报错，而不是静默二选一。
+
 ### 2. 打开连接
 
 推荐用结构体配置（`orm.Config`），字段具名、顺序无关，前缀 / 日志等一次性配齐：
@@ -771,13 +797,21 @@ orm.NewQuery[User]().
     ForUpdate().
     Last("SKIP LOCKED")
 
-// 其他方言特有尾语法：OFFSET ... FETCH ...、窗口函数提示、数据库 hint 等
-orm.NewQuery[User]().Limit(10).Last("FETCH NEXT 10 ROWS ONLY")
+// 其他方言特有尾语法：窗口函数提示、数据库 hint 等（MySQL 的执行时间上限）
+orm.NewQuery[User]().Eq(statusCol, 1).Last("/*+ MAX_EXECUTION_TIME(1000) */")
 ```
 
 > ⚠️ **安全提示**：`Last` 的内容**不经占位符参数化、直接拼接进 SQL**，只允许放可信 / 静态片段，**切勿拼接任何用户输入**，否则会造成 SQL 注入。
 
 `ForUpdate` 与 `Last` 的拼接顺序固定为：`... LIMIT/OFFSET → FOR UPDATE → Last`，即 `Last` 永远在最末尾。
+
+> ⚠️ **`Last` 与框架分页互斥**：`Last` 片段里若自带 `LIMIT` / `OFFSET` / `FETCH` 分页子句，就
+> 不能再调 `Limit` / `Offset`（含 `Nearest` 的 k）—— 两者会拼出两段分页子句
+> （形如 `... LIMIT 10 ORDER BY id DESC LIMIT 1`），数据库只报语法错误、定位不到调用处。
+> 现改为**构造期即 panic**。自定义分页请二选一：要么用 `Limit` / `Offset`；要么把整段
+> （含 `ORDER BY` 与 `LIMIT/OFFSET`）写进 `Last` 而不要再调 `Limit` / `Offset`。
+> `SKIP LOCKED`、`FOR SHARE`、数据库 hint 这类**非分页**尾片段与 `Limit` 同用不受影响
+> （队列式抢锁的 `FOR UPDATE SKIP LOCKED LIMIT 1` 正是推荐写法）。
 
 ---
 
@@ -1180,6 +1214,16 @@ db, _ := orm.Open(orm.Config{
 - 副本为空时所有请求回落主库；`MultiSourceConfig` 与本配置**完全等价**（仅别名），当前统一走同一套路由。
 - 事务内（`db.Transaction`）自动回落主库，避免读副本造成的不一致。
 - 路由选择内部加锁（`sync.Mutex`），并发安全。
+- **判定细节**：判定前会剥掉 SQL 开头的注释（`/* */`、`--`、MySQL 的 `#`），所以
+  `/* trace-id */ UPDATE ...` 这类带前导注释的写语句不会被误判成读。悲观锁读
+  （`FOR UPDATE` 等）走主库。
+- **CTE（`WITH ...`）单独按词法判定**：前缀永远是 `WITH`，分不出只读还是「CTE + 写」，
+  因此对整条语句做一次词法扫描 —— 跳过字符串字面量、引号标识符与注释、按**词**比对写关键字，
+  任一处命中即判写；**只有纯粹不包含写关键字的 CTE 才走副本**。所以
+  `WITH x AS (SELECT insert_count FROM t) SELECT ...`（`insert_count` 是标识符）与
+  `WITH x AS (SELECT ... WHERE name = 'UPDATE') SELECT ...`（`UPDATE` 在字符串里）
+  都仍判为读；而 PG 的 `WITH m AS (DELETE ... RETURNING *) INSERT ...`（写在 CTE 内部、
+  主句仍是 `SELECT`）正确判为写。字符串 / 注释未闭合等无法可靠判定的情况，一律保守判写。
 
 ---
 

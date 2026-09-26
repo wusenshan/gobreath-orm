@@ -72,13 +72,37 @@ func resolveColumn[T any, F any](picker func(*T) *F) string {
 	target := reflect.ValueOf(ptr).Pointer() // 该指针持有的地址（即字段地址）
 
 	rt := tv.Type()
-	for i := 0; i < rt.NumField(); i++ {
-		f := tv.Field(i)
-		if f.CanAddr() && f.Addr().Pointer() == target {
-			return columnName(rt.Field(i))
-		}
+	if col, ok := resolveColumnIn(tv, rt, target); ok {
+		return col
 	}
 	panic("orm: 无法从 picker 闭包解析出字段，请确认闭包返回的是该结构体的字段指针")
+}
+
+// resolveColumnIn 在结构体 v（类型 t）中按字段地址反查列名，找不到时 ok=false。
+//
+// 必须递归进匿名嵌入结构体：嵌入的字段是 **promoted** 的，`&t.CreatedAt` 拿到的地址
+// 属于内嵌的 Base，外层 t 的直接字段里根本没有它，只扫一层必然漏。反过来，嵌入字段
+// 与外层结构体可能同地址（偏移 0），只扫一层还会把「选了嵌入里的第一个字段」误判成
+// 「选了整个嵌入字段」，返回伪列名 "base" —— 这正是扁平化之前 Col 静默返回错误列名的原因。
+// 嵌入字段自身不是列（已被展开），故不参与匹配。
+func resolveColumnIn(v reflect.Value, t reflect.Type, target uintptr) (string, bool) {
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		fv := v.Field(i)
+		if !fv.CanAddr() {
+			continue
+		}
+		if f.Anonymous && f.Type.Kind() == reflect.Struct && f.Tag.Get("db") != "-" {
+			if col, ok := resolveColumnIn(fv, f.Type, target); ok {
+				return col, true
+			}
+			continue
+		}
+		if fv.Addr().Pointer() == target {
+			return columnName(f), true
+		}
+	}
+	return "", false
 }
 
 func columnName(f reflect.StructField) string {

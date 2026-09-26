@@ -209,6 +209,36 @@ type IdxUser struct {
 
 func (IdxUser) TableName() string { return "it_idx_users" }
 
+// ZeroUser 供「批量写入 + OmitZero」的真库取证：主键非自增（显式指定，
+// 便于逐行比对），name / age 都允许零值 —— 「首行全零、后续行非零」
+// 正是旧实现静默丢数据的触发条件。
+type ZeroUser struct {
+	ID   int64  `db:"id,pk"`
+	Name string `db:"name"`
+	Age  int    `db:"age"`
+}
+
+func (ZeroUser) TableName() string { return "it_zero_users" }
+
+// TypedUser / TypedNote 验证 Preload 的键比较：父表主键（int64）与子表外键（int）
+// 在 Go 侧是**不同的整数类型**，数据库里的值却完全相同。旧实现用 reflect.DeepEqual
+// 比较键，int(1) != int64(1)，关联被整片漏掉且不报任何错。
+type TypedUser struct {
+	ID    int64       `db:"id,pk"`
+	Name  string      `db:"name"`
+	Notes []TypedNote `db:"-" orm:"has_many;fk:user_id"`
+}
+
+func (TypedUser) TableName() string { return "it_typed_users" }
+
+type TypedNote struct {
+	ID     int64  `db:"id,pk"`
+	UserID int    `db:"user_id"`
+	Body   string `db:"body"`
+}
+
+func (TypedNote) TableName() string { return "it_typed_notes" }
+
 // ---------------------------------------------------------------- 列表达式
 
 var (
@@ -243,6 +273,7 @@ var (
 var itTables = []string{
 	"it_users", "it_orders", "it_posts", "it_comments", "it_accounts",
 	"it_docs", "it_idx_users", "it_uq_users", "t_pref_users",
+	"it_zero_users", "it_typed_users", "it_typed_notes",
 }
 
 func resetSchema(t *testing.T, db *orm.DB) {
@@ -253,7 +284,7 @@ func resetSchema(t *testing.T, db *orm.DB) {
 			t.Fatalf("DROP %s 失败：%v", tb, err)
 		}
 	}
-	if err := db.AutoMigrate(ctx, &User{}, &Order{}, &Post{}, &Comment{}, &Account{}, &Doc{}, &UqUser{}); err != nil {
+	if err := db.AutoMigrate(ctx, &User{}, &Order{}, &Post{}, &Comment{}, &Account{}, &Doc{}, &UqUser{}, &ZeroUser{}, &TypedUser{}, &TypedNote{}); err != nil {
 		t.Fatalf("AutoMigrate 失败：%v", err)
 	}
 	// 前缀只作用于「自动推导」的表名，所以 PrefUser 要挂在前缀 DB 上建。

@@ -127,6 +127,7 @@ type Config struct {
 // 兼容两种调用方式：
 //   - orm.Open("mysql", dsn)
 //   - orm.Open(orm.Config{Driver: "mysql", DSN: dsn})
+//
 // driver 支持：postgres/pgx → PG；mysql → MySQL；sqlite/sqlite3 → SQLite。
 func Open(args ...any) (*DB, error) {
 	cfg, err := parseOpenConfig(args...)
@@ -257,8 +258,15 @@ func (r *readWriteRouter) choose(query string) Executor {
 	return next
 }
 
+// isWriteQuery 判断一条 SQL 是否必须走主库（写语句或悲观锁读）。
+//
+// 判定前会先剥掉前导空白与注释：此前直接对原文 TrimSpace + ToUpper 取前缀，
+// `/* trace */ UPDATE ...`、`-- x\nDELETE ...`、`# comment\nINSERT ...` 这类带注释的
+// 写法全部被判成「读」并路由到只读副本，写操作在副本上直接报只读错误。
+// CTE（WITH ... AS (...) INSERT/UPDATE/DELETE）无法靠前缀廉价区分，
+// 一律保守判为写：宁可多走主库，也不能把写语句发到只读副本（与上方 FOR UPDATE 同口径）。
 func isWriteQuery(query string) bool {
-	trimmed := strings.TrimSpace(strings.ToUpper(query))
+	trimmed := strings.TrimSpace(strings.ToUpper(stripLeadingComments(query)))
 	if trimmed == "" {
 		return false
 	}
@@ -271,12 +279,161 @@ func isWriteQuery(query string) bool {
 		strings.Contains(trimmed, " FOR NO KEY UPDATE") {
 		return true
 	}
+	// WITH ... 既可能是只读 CTE（`WITH x AS (SELECT ...) SELECT ...`），
+	// 也可能是 CTE + 写（`WITH x AS (SELECT ...) UPDATE ...`），前缀无法区分。
+	// 做一次词法扫描：CTE 内部或主句任一处出现写关键字即判写 —— 只看主句会漏掉
+	// PG 的 data-modifying CTE（`WITH m AS (DELETE ... RETURNING *) INSERT ...`，
+	// 写在 CTE 里、主句仍是 SELECT）。扫描本身不可靠时（字符串 / 注释未闭合）
+	// 同样保守判写：宁可多走主库，也不能把写语句发到只读副本。
+	if strings.HasPrefix(trimmed, "WITH") {
+		hasWrite, reliable := withStatementHasWrite(trimmed)
+		return !reliable || hasWrite
+	}
 	for _, prefix := range []string{"INSERT", "UPDATE", "DELETE", "REPLACE", "CREATE", "ALTER", "DROP", "TRUNCATE", "MERGE", "CALL"} {
 		if strings.HasPrefix(trimmed, prefix) {
 			return true
 		}
 	}
 	return false
+}
+
+// stripLeadingComments 去掉 SQL 开头连续的空白与注释（/* ... */、-- ... 行注释、
+// MySQL 的 # 行注释），返回第一条真实语句的起始内容（大小写保持原样）。
+//
+// 只处理**开头**：读写路由只需要看清语句的第一个关键字，不做全文扫描。
+// 注释未闭合时返回空串（这类语句一定执行失败，交由数据库报错，此处不猜语义）。
+func stripLeadingComments(query string) string {
+	s := query
+	for {
+		s = strings.TrimLeft(s, " \t\r\n\f\v")
+		switch {
+		case strings.HasPrefix(s, "/*"):
+			end := strings.Index(s[2:], "*/")
+			if end < 0 {
+				return ""
+			}
+			s = s[2+end+2:]
+		case strings.HasPrefix(s, "--"), strings.HasPrefix(s, "#"):
+			if nl := strings.IndexAny(s, "\r\n"); nl >= 0 {
+				s = s[nl+1:]
+			} else {
+				return ""
+			}
+		default:
+			return s
+		}
+	}
+}
+
+// writeKeywords 是「出现在语句里即说明该语句有写副作用」的关键字（大写形式）。
+// 仅用于 CTE（WITH ...）语句的全文检索：普通语句靠前缀判定即可，
+// 不必承担全文检索的误判代价（误判的代价是只读查询被送到主库）。
+var writeKeywords = []string{
+	"INSERT", "UPDATE", "DELETE", "REPLACE", "MERGE",
+	"CREATE", "ALTER", "DROP", "TRUNCATE", "CALL",
+}
+
+// withStatementHasWrite 判断一条 WITH（CTE）语句是否含有写操作。
+//
+// 返回 (是否含写, 扫描是否可靠)。可靠 = 语句里的字符串字面量、引号标识符与注释
+// 全部正常闭合；遇到未闭合的情况返回 reliable=false，调用方必须保守按写处理
+// （这类语句多半本来就执行失败，此处不猜语义）。
+//
+// 检索以「词」为单位而非子串，因此两类经典误判都不成立：
+//   - `SELECT insert_count FROM t`：insert_count 是一个完整的标识符词，与 INSERT 不相等；
+//   - `WHERE name = 'UPDATE'`：UPDATE 在字符串字面量内，扫描时整段跳过。
+//
+// 同理，PG 的 "INSERT_LOG"、MySQL 的反引号形式这类引号标识符也整段跳过。
+func withStatementHasWrite(s string) (hasWrite, reliable bool) {
+	n := len(s)
+	for i := 0; i < n; {
+		c := s[i]
+		switch {
+		case c == '\'':
+			// 字符串字面量；'' 表示字面量内部的一个引号，不是结束。
+			i++
+			closed := false
+			for i < n {
+				if s[i] == '\'' {
+					if i+1 < n && s[i+1] == '\'' {
+						i += 2
+						continue
+					}
+					i++
+					closed = true
+					break
+				}
+				i++
+			}
+			if !closed {
+				return false, false
+			}
+		case c == '"' || c == '`':
+			// 引号标识符（PG "…"、MySQL `…`）：内部可能含写关键字，整段跳过。
+			i++
+			closed := false
+			for i < n {
+				if s[i] == c {
+					if i+1 < n && s[i+1] == c { // ANSI 的双写转义
+						i += 2
+						continue
+					}
+					i++
+					closed = true
+					break
+				}
+				i++
+			}
+			if !closed {
+				return false, false
+			}
+		case c == '-' && i+1 < n && s[i+1] == '-', c == '#':
+			// 行注释（-- 与 MySQL 的 #）：跳到行尾。
+			for i < n && s[i] != '\n' {
+				i++
+			}
+		case c == '/' && i+1 < n && s[i+1] == '*':
+			// 块注释；未闭合即不可靠。
+			i += 2
+			closed := false
+			for i+1 < n {
+				if s[i] == '*' && s[i+1] == '/' {
+					i += 2
+					closed = true
+					break
+				}
+				i++
+			}
+			if !closed {
+				return false, false
+			}
+		default:
+			if !isSQLWordChar(c) {
+				i++
+				continue
+			}
+			start := i
+			for i < n && isSQLWordChar(s[i]) {
+				i++
+			}
+			word := s[start:i]
+			for _, kw := range writeKeywords {
+				if word == kw {
+					return true, true
+				}
+			}
+		}
+	}
+	return false, true
+}
+
+// isSQLWordChar 判断字节是否属于 SQL 标识符 / 关键字的组成部分。
+// 调用方传入的语句已经 ToUpper，故只需覆盖大写字母、数字、下划线与 $。
+func isSQLWordChar(c byte) bool {
+	return c == '_' || c == '$' ||
+		(c >= 'A' && c <= 'Z') ||
+		(c >= 'a' && c <= 'z') ||
+		(c >= '0' && c <= '9')
 }
 
 func parseOpenConfig(args ...any) (Config, error) {
@@ -479,6 +636,16 @@ func (db *DB) Transaction(ctx context.Context, fn func(tx *DB) error) error {
 	if err != nil {
 		return err
 	}
+	// fn panic 时必须回滚：此前没有 defer 兜底，panic 会让已开启的事务既不提交也不回滚，
+	// 行锁与未提交写入滞留在连接上（只能等 *sql.Tx 被 GC 回收才释放），
+	// 连接池较小的服务会因此逐步耗尽连接、甚至拖住整张表的写。
+	// 这里 recover 后回滚，再把原 panic 抛出去，调用方的 panic 语义（含各自的 recover）保持可见。
+	defer func() {
+		if r := recover(); r != nil {
+			_ = tx.Rollback()
+			panic(r)
+		}
+	}()
 	if err := fn(db.WithExecutor(tx)); err != nil {
 		_ = tx.Rollback()
 		return err

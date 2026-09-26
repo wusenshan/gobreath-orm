@@ -42,7 +42,8 @@ func TestReadWriteRouterSingleReplica(t *testing.T) {
 	if got := r.choose("INSERT INTO users VALUES (1)"); got != primary {
 		t.Fatalf("INSERT 应路由到 primary，实际 %v", got)
 	}
-	// 边界：以注释开头或 CTE 写语句，目前 isWriteQuery 仍按前缀判定，此处仅验证正常路径
+	// 边界（带前导注释的写语句、CTE 一律判写）已移到 entry_guards_test.go 的
+	// TestGuardIsWriteQuerySeesPastLeadingComments；此处只验证常规路径的路由结果。
 	if got := r.choose("UPDATE users SET name='x'"); got != primary {
 		t.Fatalf("UPDATE 应路由到 primary，实际 %v", got)
 	}

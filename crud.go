@@ -87,6 +87,36 @@ func filterOmitZeroCols(meta *modelMeta, ev reflect.Value, cols []string) []stri
 	return out
 }
 
+// filterOmitZeroColsBatch 是 OmitZero 在**批量写入**下的正确语义：取各行「保留列」的并集，
+// 等价于「只有当所有行该列都是零值时才跳过该列」。
+//
+// 单行写入按本行零值动态剔除列是合理的；但批量写入的多行 VALUES 要求每行列数一致，
+// 此前实现用 entities[0] 一行的零值情况决定整批的列集合 —— 只要后续行有任何非零字段
+// 恰好落在「首行的零值列」里，该字段就被静默丢弃：SQL 里根本没有这一列、不报任何错，
+// 调用方以为已经写进去了。
+//
+// 这里按并集取列：任何一行非零的列都保留（不丢数据），只有**所有行**都为零值的列
+// 才跳过（保留 OmitZero「跳过没用的列」的本意）。注意不能用交集 —— 那会让首行零值
+// 的列被整批剔除，正是要修的那个 bug。
+//
+// 主键列由 filterOmitZeroCols 保证永不被剔除，故并集必然保留主键列。
+func filterOmitZeroColsBatch[T any](meta *modelMeta, entities []T, cols []string) []string {
+	keep := make(map[string]bool, len(cols))
+	for i := range entities {
+		ev := reflect.ValueOf(&entities[i]).Elem()
+		for _, c := range filterOmitZeroCols(meta, ev, cols) {
+			keep[c] = true
+		}
+	}
+	out := make([]string, 0, len(cols))
+	for _, c := range cols {
+		if keep[c] {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
 // filterOnlyCols 应用 OnlyColumns 白名单；未指定该选项时原样返回 cols。
 //
 // 白名单里出现「存在于模型但不属于本次可写列」的列（主键 / 自增 / 逻辑删除 / 被忽略）
@@ -235,7 +265,7 @@ func BatchInsert[T any](ctx context.Context, db *DB, entities []T, opts ...Write
 		cols = filtered
 	}
 	if cfg.omitZero {
-		cols = filterOmitZeroCols(meta, reflect.ValueOf(&entities[0]).Elem(), cols)
+		cols = filterOmitZeroColsBatch(meta, entities, cols)
 	}
 	if len(cols) == 0 {
 		return fmt.Errorf("orm: %s 无可写字段%s", meta.table, emptyColsHint(cfg))
@@ -476,7 +506,7 @@ func BatchUpsert[T any](ctx context.Context, db *DB, entities []T, conflictCols 
 		cols = filtered
 	}
 	if cfg.omitZero {
-		cols = filterOmitZeroCols(meta, reflect.ValueOf(&entities[0]).Elem(), cols)
+		cols = filterOmitZeroColsBatch(meta, entities, cols)
 	}
 	if len(cols) == 0 {
 		return fmt.Errorf("orm: %s 无可写字段%s", meta.table, emptyColsHint(cfg))
@@ -827,6 +857,14 @@ func checkSetCols(meta *modelMeta, sets map[string]any) error {
 		fi := fieldInfoForCol(meta, col)
 		if fi == nil || fi.ignore {
 			return fmt.Errorf("orm: %s 不存在列 %q（UpdateSets/UpdateByIdSets 的字段名必须是模型中的真实列名）", meta.table, col)
+		}
+		if fi.pk {
+			// 主键通常被别的表当外键引用：改名会让引用它的行静默指向不存在的目标（或指向另一行），
+			// 关联数据当场失联；框架的 DeleteById / UpdateById 也都是按「旧主键」定位行的。
+			// 此前 UpdateSets / UpdatePartial 允许 `{"id": 99}` 静默改主键，属数据损坏级用法。
+			// 确需调整主键，请用原生 SQL（RawExec）并在业务侧自行处理关联一致性。
+			return fmt.Errorf("orm: %s 的 %q 是主键列，UpdateSets/UpdateByIdSets/UpdatePartial 不允许修改主键；"+
+				"确需调整主键请用原生 SQL（RawExec）并自行处理关联数据", meta.table, col)
 		}
 	}
 	return nil

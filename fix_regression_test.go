@@ -118,3 +118,133 @@ func TestOffsetWithoutLimit(t *testing.T) {
 		t.Fatalf("未设置 Limit/Offset 时不应出现 LIMIT，实际 %s", sqlStr)
 	}
 }
+
+// ---------------------------------------------------------------- 空集合条件
+
+// In(空) 必须折叠为恒假（1 = 0），而不是拼出非法的 `IN ()`（MySQL 1064 / PG 42601 /
+// SQLite 1）。动态多选条件「一个都没勾」是常态输入，不能把非法 SQL 抛给数据库。
+func TestInEmptySliceFoldsToFalse(t *testing.T) {
+	col := ColExpr{name: "age"}
+	for _, vals := range [][]any{nil, {}} {
+		sqlStr, args := NewQuery[auditVecUser]().WithDialect(PG).In(col, vals).Build()
+		if !strings.Contains(sqlStr, "1 = 0") {
+			t.Fatalf("In(空) 应折叠为 1 = 0，实际 %s", sqlStr)
+		}
+		if strings.Contains(sqlStr, "IN") {
+			t.Fatalf("In(空) 不应出现 IN 子句，实际 %s", sqlStr)
+		}
+		if len(args) != 0 {
+			t.Fatalf("In(空) 折叠后不应绑定参数，实际 %v", args)
+		}
+	}
+}
+
+// NotIn(空) 按集合语义是恒真（所有行匹配），整条条件应被省略 —— 剩余条件照常生效。
+func TestNotInEmptySliceOmitsCondition(t *testing.T) {
+	q := NewQuery[auditVecUser]().WithDialect(PG).
+		Eq(ColExpr{name: "id"}, int64(1)).
+		NotIn(ColExpr{name: "age"}, []any{})
+	sqlStr, args := q.Build()
+	if strings.Contains(sqlStr, "NOT IN") {
+		t.Fatalf("NotIn(空) 不应出现 NOT IN 子句，实际 %s", sqlStr)
+	}
+	if !strings.Contains(sqlStr, `"id" = $1`) {
+		t.Fatalf("其余条件应保留，实际 %s", sqlStr)
+	}
+	if len(args) != 1 {
+		t.Fatalf("只应绑定剩余条件的参数，实际 %v", args)
+	}
+}
+
+// ---------------------------------------------------------------- 批量写入 + OmitZero
+
+// batchZeroUser 刻意让 pk 无自增、字段可全零，便于构造「首行全零、后续行非零」的场景。
+type batchZeroUser struct {
+	ID   int64  `db:"id,pk"`
+	Name string `db:"name"`
+	Age  int    `db:"age"`
+}
+
+func (batchZeroUser) TableName() string { return "bz_users" }
+
+// 批量写入 + OmitZero 的列集合必须取「所有行的交集」，而不是只按 entities[0] 决定。
+// 旧实现下首行的零值列（name）会被整批剔除，第二行的 name="later" 静默丢失：
+// SQL 里根本没有这一列、不报错，调用方以为写进去了。
+func TestBatchInsertOmitZeroMultiRowKeepsLaterNonZero(t *testing.T) {
+	exec := &auditExecutor{}
+	db := NewDB(exec, PG)
+	rows := []batchZeroUser{
+		{ID: 1, Name: "", Age: 0},      // 首行全零 —— 旧实现据此定列
+		{ID: 2, Name: "later", Age: 0}, // 第二行 name 非零，必须留在列集合里
+	}
+	if err := BatchInsert(context.Background(), db, rows, OmitZero()); err != nil {
+		t.Fatalf("BatchInsert 失败：%v", err)
+	}
+	if !strings.Contains(exec.query, `"name"`) {
+		t.Fatalf("后续行的非零列 name 被丢弃，SQL=%s", exec.query)
+	}
+	if strings.Contains(exec.query, `"age"`) {
+		t.Fatalf("所有行都为零值的列 age 应被跳过，SQL=%s", exec.query)
+	}
+	if len(exec.args) != 4 {
+		t.Fatalf("两行 × 两列应绑定 4 个参数，实际 %d 个：%v", len(exec.args), exec.args)
+	}
+	if exec.args[1] != "" || exec.args[3] != "later" {
+		t.Fatalf("参数顺序应为 [1 \"\" 2 later]，实际 %v", exec.args)
+	}
+}
+
+// BatchUpsert 走的是同一条列决策路径，必须与 BatchInsert 行为一致。
+func TestBatchUpsertOmitZeroMultiRowKeepsLaterNonZero(t *testing.T) {
+	exec := &auditExecutor{}
+	db := NewDB(exec, PG)
+	rows := []batchZeroUser{
+		{ID: 1, Name: "", Age: 7},
+		{ID: 2, Name: "later", Age: 7},
+	}
+	if err := BatchUpsert(context.Background(), db, rows, []string{"id"}, OmitZero()); err != nil {
+		t.Fatalf("BatchUpsert 失败：%v", err)
+	}
+	if !strings.Contains(exec.query, `"name"`) {
+		t.Fatalf("后续行的非零列 name 被丢弃，SQL=%s", exec.query)
+	}
+	if !strings.Contains(exec.query, `"age"`) {
+		t.Fatalf("两行都非零的 age 应保留，SQL=%s", exec.query)
+	}
+	if len(exec.args) != 6 {
+		t.Fatalf("两行 × 三列应绑定 6 个参数，实际 %d 个：%v", len(exec.args), exec.args)
+	}
+	if exec.args[1] != "" || exec.args[4] != "later" {
+		t.Fatalf("参数顺序应为 [1 \"\" 7 2 later 7]，实际 %v", exec.args)
+	}
+}
+
+// 全行都是零值的列仍应被跳过（OmitZero 的本意不能被修复改成「一律不跳过」）。
+func TestBatchInsertOmitZeroDropsAllZeroColumn(t *testing.T) {
+	exec := &auditExecutor{}
+	db := NewDB(exec, PG)
+	rows := []batchZeroUser{{ID: 1, Name: "", Age: 0}, {ID: 2, Name: "", Age: 0}}
+	if err := BatchInsert(context.Background(), db, rows, OmitZero()); err != nil {
+		t.Fatalf("BatchInsert 失败：%v", err)
+	}
+	if !strings.Contains(exec.query, `("id")`) {
+		t.Fatalf("两行全零时列集合应只剩主键列，SQL=%s", exec.query)
+	}
+}
+
+// ---------------------------------------------------------------- Select 列名校验
+
+// Select 的每个参数必须是单个列名：多列写在一个字符串里会被整体加引号，
+// 拼出 `name, age` 这种非法列名 —— 框架不报错、只在数据库侧以 unknown column 暴露。
+func TestSelectRejectsMultiColumnString(t *testing.T) {
+	for _, bad := range []string{"name, age", "name age", "COUNT(*)", ""} {
+		bad := bad
+		assertPanics(t, "Select("+bad+")", func() { NewQuery[auditVecUser]().Select(bad) })
+	}
+	// 合法用法不受影响：逐个传入、带表别名前缀。
+	q := NewQuery[auditVecUser]().WithDialect(PG).Select("id", "u.name")
+	sqlStr, _ := q.Build()
+	if !strings.Contains(sqlStr, `"id"`) || !strings.Contains(sqlStr, "name") {
+		t.Fatalf("合法列名应正常拼进 SQL，实际 %s", sqlStr)
+	}
+}

@@ -16,21 +16,25 @@ import (
 
 // fieldInfo 结构体字段的元数据。
 type fieldInfo struct {
-	goName  string
-	colName string
-	pk      bool
-	autoInc bool
-	ignore  bool
-	json    bool    // true 表示字段以 JSON 形式读写（db tag 含 ",json"）
-	vector  bool    // true 表示字段为向量列（db tag 含 ",vector"），读写时序列化为文本 [..]
-	vectorDim int   // 向量维度（db tag 含 ",vector(N)" 时解析出 N；0 表示未指定维度）
-	logic   bool    // true 表示该字段是逻辑删除列（db tag 含 ",logic"）
-	nologic bool    // true 表示显式退出约定软删除匹配（db tag 含 ",nologic"）
-	version bool    // true 表示该字段是乐观锁版本列（db tag 含 ",version"）
-	unique  bool    // true 表示该列需唯一约束（db tag 含 ",unique"），仅 AutoMigrate 使用
-	index   bool    // true 表示该列需二级索引（db tag 含 ",index"），仅 AutoMigrate 使用
-	typ     reflect.Type
-	rawTag  string  // 原始 struct tag 字符串（仅用于 StrictTagCheck 模式下的格式校验）
+	goName    string
+	colName   string
+	pk        bool
+	autoInc   bool
+	ignore    bool
+	json      bool // true 表示字段以 JSON 形式读写（db tag 含 ",json"）
+	vector    bool // true 表示字段为向量列（db tag 含 ",vector"），读写时序列化为文本 [..]
+	vectorDim int  // 向量维度（db tag 含 ",vector(N)" 时解析出 N；0 表示未指定维度）
+	logic     bool // true 表示该字段是逻辑删除列（db tag 含 ",logic"）
+	nologic   bool // true 表示显式退出约定软删除匹配（db tag 含 ",nologic"）
+	version   bool // true 表示该字段是乐观锁版本列（db tag 含 ",version"）
+	unique    bool // true 表示该列需唯一约束（db tag 含 ",unique"），仅 AutoMigrate 使用
+	index     bool // true 表示该列需二级索引（db tag 含 ",index"），仅 AutoMigrate 使用
+	typ       reflect.Type
+	rawTag    string // 原始 struct tag 字符串（仅用于 StrictTagCheck 模式下的格式校验）
+	// idx 是该字段相对模型根结构体的 reflect 路径。普通字段为单级（[i]），
+	// 匿名嵌入结构体被扁平化展开后为多级（[嵌入字段下标, 内层下标, ...]）。
+	// 取值 / 赋值一律走 FieldByIndex，因此 meta.fields 的下标不再等于结构体字段下标。
+	idx []int
 }
 
 // modelMeta 一张表的模型元数据（字段、列、主键）。
@@ -102,71 +106,38 @@ func parseMeta(typ reflect.Type) *modelMeta {
 	// 已保存的指针会指向**旧底层数组**的副本，值当时是对的但与 m.fields 断开同步。
 	var pkIdxs []int
 	logicIdx, versionIdx := -1, -1
-	for i := 0; i < typ.NumField(); i++ {
-		f := typ.Field(i)
-		if f.PkgPath != "" { // 非导出字段
-			continue
-		}
-		tag := f.Tag.Get("db")
-		raw := string(f.Tag)
-		// guard（仅 StrictTagCheck 模式）：db tag 必须用引号包裹（标准 struct tag 格式
-		// `db:"col,pk"`）。写成 `db:col,pk`（无引号）时 reflect 读不到 key，Tag.Get("db")
-		// 返回空，字段会退化成「仅按字段名映射」，pk/autoincrement 等全部丢失，导致自增主键
-		// 被当成普通列写入 0 值 —— 这类问题很难排查。默认关闭以兼容旧行为；开启后启动即 panic。
-		if strictTagCheck.Load() {
-			validateDbTag(raw, typ.Name(), f.Name)
-		}
-		if tag == "-" {
-			m.fields = append(m.fields, fieldInfo{goName: f.Name, ignore: true, rawTag: raw})
-			continue
-		}
-		fi := fieldInfo{goName: f.Name, typ: f.Type, rawTag: raw}
-		if tag != "" {
-			parts := strings.Split(tag, ",")
-			fi.colName = parts[0]
-			for _, p := range parts[1:] {
-				if strings.HasPrefix(p, "vector") {
-					fi.vector = true
-					if n := parseVectorDim(p); n > 0 {
-						fi.vectorDim = n
-					}
-					continue
-				}
-				switch p {
-				case "pk":
-					fi.pk = true
-				case "autoincrement", "autoinc", "auto_increment":
-					fi.autoInc = true
-				case "json":
-					fi.json = true
-				case "logic":
-					fi.logic = true
-				case "nologic":
-					fi.nologic = true
-				case "version":
-					fi.version = true
-				case "unique":
-					fi.unique = true
-				case "index":
-					fi.index = true
-				}
-			}
-		}
-		if fi.colName == "" {
-			fi.colName = toSnake(f.Name)
-		}
+	// seen 记录已占用的列名 → 字段来源，用于检出列名冲突（含嵌入展开后与外层撞名）。
+	// 静默让其中一个胜出会把「这一列到底是谁」变成猜谜，故解析期直接报错。
+	seen := make(map[string]string)
+	// register 把一个字段登记进元数据：追加到 fields、维护列清单，并收集
+	// pk / logic / version 的下标。匿名嵌入展开出来的字段也走这里，
+	// 因此它们与外层字段被同等对待（嵌入里的 ,pk / ,logic / ,version 同样生效）。
+	register := func(fi fieldInfo) {
 		m.fields = append(m.fields, fi)
+		if fi.ignore {
+			return
+		}
+		if prev, ok := seen[fi.colName]; ok {
+			panic(fmt.Errorf("orm: 结构体 %s 的列 %q 被重复声明（%s 与 %s）："+
+				"请用 db tag 给其中一个指定不同的列名，或用 `db:\"-\"` 跳过不需要的那个",
+				typ.Name(), fi.colName, prev, fi.goName))
+		}
+		seen[fi.colName] = typ.Name() + "." + fi.goName
 		m.columns = append(m.columns, fi.colName)
 		if fi.pk {
 			pkIdxs = append(pkIdxs, len(m.fields)-1)
 		}
 		if fi.logic {
 			logicIdx = len(m.fields) - 1
-			m.logicIsTime = isTimeType(f.Type)
+			m.logicIsTime = isTimeType(fi.typ)
 		}
 		if fi.version {
 			versionIdx = len(m.fields) - 1
 		}
+	}
+	// 字段收集（含匿名嵌入结构体的扁平化展开）见 collectFields。
+	for _, fi := range collectFields(typ, nil, 0) {
+		register(fi)
 	}
 	// 未显式声明主键时，沿用「字段名 ID / Id」的约定推断。
 	if len(pkIdxs) == 0 {
@@ -196,6 +167,112 @@ func parseMeta(typ reflect.Type) *modelMeta {
 	}
 	m.tagChecked = strictTagCheck.Load()
 	return m
+}
+
+// maxEmbedDepth 限制嵌入结构体的展开层数。Go 的值类型嵌套本就不可能无限深
+// （会编译失败），这里仍加一道闸，避免异常嵌套把解析拖死。
+const maxEmbedDepth = 8
+
+// collectFields 递归收集 typ 的可映射字段，顺序与声明顺序一致。
+//
+// **匿名嵌入的结构体会被扁平化展开**：内层字段与外层字段一起出现在列清单里
+// （如 `Base` 里的 `CreatedAt` 直接成为模型的 created_at 列），取值路径记录在
+// fieldInfo.idx —— 一条 reflect 的多级索引，读写与行映射据此定位到嵌入结构体里的字段。
+//
+// 在这之前框架把嵌入字段当成**一个普通列**：AutoMigrate 建出伪列（Base → `base TEXT`）、
+// Insert 把整个结构体当参数绑定（驱动报 unsupported type）、Col 因匿名字段与外层结构体
+// 同地址而返回伪列名 —— 最后这条最危险：不报错，却生成指向错误列的查询条件。
+// 后来改成解析期 panic 以堵住静默错误，代价是这类模型直接不可用（升级即崩）。
+// 扁平化才是用户真正想要的语义：GORM 的 `gorm:"embedded"` 也是这个方向。
+//
+// prefix 是到达 typ 的字段路径（最外层为 nil），depth 是当前嵌入层数。
+func collectFields(typ reflect.Type, prefix []int, depth int) []fieldInfo {
+	var out []fieldInfo
+	for i := 0; i < typ.NumField(); i++ {
+		f := typ.Field(i)
+		if f.PkgPath != "" { // 非导出字段
+			continue
+		}
+		tag := f.Tag.Get("db")
+		raw := string(f.Tag)
+		// guard（仅 StrictTagCheck 模式）：db tag 必须用引号包裹（标准 struct tag 格式
+		// `db:"col,pk"`）。写成 `db:col,pk`（无引号）时 reflect 读不到 key，Tag.Get("db")
+		// 返回空，字段会退化成「仅按字段名映射」，pk/autoincrement 等全部丢失，导致自增主键
+		// 被当成普通列写入 0 值 —— 这类问题很难排查。默认关闭以兼容旧行为；开启后启动即 panic。
+		if strictTagCheck.Load() {
+			validateDbTag(raw, typ.Name(), f.Name)
+		}
+		idx := make([]int, 0, len(prefix)+1)
+		idx = append(append(idx, prefix...), i)
+
+		// 匿名嵌入：结构体就地展开；指针暂不支持（见下）；其它 Kind
+		// （如匿名嵌入的命名基本类型 `type MyInt int`）按普通列处理，
+		// 与 Go 提升字段的语义一致。
+		if f.Anonymous && tag != "-" {
+			switch f.Type.Kind() {
+			case reflect.Struct:
+				if depth >= maxEmbedDepth {
+					panic(fmt.Errorf("orm: 结构体 %s 的嵌入层数超过 %d 层，请检查是否有异常嵌套",
+						typ.Name(), maxEmbedDepth))
+				}
+				out = append(out, collectFields(f.Type, idx, depth+1)...)
+				continue
+			case reflect.Ptr:
+				panic(fmt.Errorf("orm: 结构体 %s 匿名嵌入了指针类型 %s，暂不支持："+
+					"行映射要在扫描时按需 new、取连接键要先判空，nil 指针的读写语义未定义；"+
+					"请改为值嵌入 %s，或把需要的字段平铺声明在 %s 上",
+					typ.Name(), f.Type.String(), f.Type.Elem().String(), typ.Name()))
+			}
+		}
+		if tag == "-" {
+			out = append(out, fieldInfo{goName: f.Name, ignore: true, rawTag: raw, idx: idx})
+			continue
+		}
+		out = append(out, parseFieldInfo(f, idx))
+	}
+	return out
+}
+
+// parseFieldInfo 解析单个字段的 db tag（列名与 pk / autoincrement / json / vector /
+// logic / version / unique / index 等修饰符）。idx 是该字段相对模型根结构体的路径。
+func parseFieldInfo(f reflect.StructField, idx []int) fieldInfo {
+	fi := fieldInfo{goName: f.Name, typ: f.Type, rawTag: string(f.Tag), idx: idx}
+	tag := f.Tag.Get("db")
+	if tag != "" {
+		parts := strings.Split(tag, ",")
+		fi.colName = parts[0]
+		for _, p := range parts[1:] {
+			if strings.HasPrefix(p, "vector") {
+				fi.vector = true
+				if n := parseVectorDim(p); n > 0 {
+					fi.vectorDim = n
+				}
+				continue
+			}
+			switch p {
+			case "pk":
+				fi.pk = true
+			case "autoincrement", "autoinc", "auto_increment":
+				fi.autoInc = true
+			case "json":
+				fi.json = true
+			case "logic":
+				fi.logic = true
+			case "nologic":
+				fi.nologic = true
+			case "version":
+				fi.version = true
+			case "unique":
+				fi.unique = true
+			case "index":
+				fi.index = true
+			}
+		}
+	}
+	if fi.colName == "" {
+		fi.colName = toSnake(f.Name)
+	}
+	return fi
 }
 
 // validateDbTag 检查 struct tag 原始字符串里是否出现了「无引号的 db tag」笔误。
@@ -294,6 +371,10 @@ type scanPlan struct {
 	cols   []string // 构建时的列清单，用于哈希碰撞时逐项复核
 	fields []int32  // 结果列下标 → meta.fields 下标；-1 表示该列不映射到任何字段
 	set    []scanSetter
+	// dupCols 记录「同名且都映射到字段」的重复列（按出现顺序去重）。
+	// 非空表示结果集有歧义：第 2 个同名列会覆盖第 1 个的值，调用方必须报错，
+	// 详见 newRowScannerMeta。
+	dupCols []string
 }
 
 func (p *scanPlan) matches(cols []string) bool {
@@ -387,6 +468,24 @@ func (m *modelMeta) buildScanPlan(cols []string) *scanPlan {
 			p.set[i] = setterFor(f)
 		}
 	}
+	// 复查重名列：JOIN 多表后 SELECT *（两张表都有 id / name）时，结果集会带两列同名，
+	// 上面「取最后一个匹配字段」会让后一列静默覆盖前一列的值 —— 数据级错误且毫无提示。
+	// 这里把「同名 + 至少映射到一个字段」的列记下来，交由 newRowScannerMeta 返回错误。
+	// 只在确有字段映射时才记录：不映射到任何字段的重复列（如自定义投影里重复出现的
+	// 计算列）不会造成错值，保持原有宽松行为。
+	if len(cols) > 1 {
+		count := make(map[string]int, len(cols))
+		for _, c := range cols {
+			count[c]++
+		}
+		seen := make(map[string]bool, len(cols))
+		for i, c := range cols {
+			if count[c] > 1 && p.fields[i] >= 0 && !seen[c] {
+				seen[c] = true
+				p.dupCols = append(p.dupCols, c)
+			}
+		}
+	}
 	return p
 }
 
@@ -431,6 +530,7 @@ func setterFor(f *fieldInfo) scanSetter {
 // 注意它持有可变状态（vals），不可跨 goroutine 共享。
 type rowScanner struct {
 	plan *scanPlan
+	meta *modelMeta // 用于按 fieldInfo.idx 定位字段（嵌入字段的路径是多级的）
 	vals []any
 	ptrs []any
 }
@@ -447,8 +547,17 @@ func newRowScannerMeta(rows *sql.Rows, meta *modelMeta) (*rowScanner, error) {
 		return nil, err
 	}
 	plan := meta.scanPlanFor(cols)
+	// 结果集带重名列时立刻报错，而不是「最后一个同名列静默胜出」：
+	// 后者会把不想要的那一列的值写进字段（如 JOIN 后 SELECT *，两表都有 id，
+	// 结构体的 Id 拿到的是被 JOIN 表的值），既不报错也无任何提示。
+	if len(plan.dupCols) > 0 {
+		return nil, fmt.Errorf("orm: 结果集中列名 %s 重复出现，无法确定各自映射到哪个字段（多表 JOIN 后 SELECT * 时常见）："+
+			"请用 Select 显式指定列，必要时用 AS 起唯一别名",
+			"`"+strings.Join(plan.dupCols, "`, `")+"`")
+	}
 	s := &rowScanner{
 		plan: plan,
+		meta: meta,
 		vals: make([]any, len(cols)),
 		ptrs: make([]any, len(cols)),
 	}
@@ -469,7 +578,9 @@ func (s *rowScanner) scanInto(rows *sql.Rows, dest any) error {
 		if fi < 0 {
 			continue
 		}
-		if err := setters[i](rv.Field(int(fi)), vals[i]); err != nil {
+		// 按 fieldInfo.idx 定位：嵌入字段被扁平化后路径是多级的，
+		// fields 里的下标也不再等于结构体字段下标。
+		if err := setters[i](rv.FieldByIndex(s.meta.fields[fi].idx), vals[i]); err != nil {
 			return err
 		}
 	}
@@ -856,7 +967,9 @@ func setBoolField(fv reflect.Value, val any) error {
 func fieldByCol(ev reflect.Value, meta *modelMeta, col string) reflect.Value {
 	for i := range meta.fields {
 		if meta.fields[i].colName == col {
-			return ev.Field(i)
+			// 嵌入字段扁平化后路径是多级的，且 meta.fields 的下标不再等于结构体字段
+			// 下标（忽略字段也占位），必须按记录的 idx 取。
+			return ev.FieldByIndex(meta.fields[i].idx)
 		}
 	}
 	return reflect.Value{}

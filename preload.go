@@ -3,7 +3,9 @@ package orm
 import (
 	"context"
 	"fmt"
+	"math"
 	"reflect"
+	"strconv"
 	"strings"
 )
 
@@ -99,84 +101,109 @@ func preloadReflect(ctx context.Context, db *DB, slice reflect.Value, relations 
 			parentKeyValues = collectPK(slice, parentMeta)
 		}
 
-		// 加载子对象（复用 scanStruct，按列 IN 查询）
-		var children []reflect.Value
+		// 加载子对象（复用 scanStruct，按列 IN 查询）。两侧的连接列随关系方向不同：
+		// belongs_to 用子表主键对父表外键；has_one/has_many 用子表外键对父表主键。
+		matchCol := childFKCol
 		if kind == "belongs_to" {
-			rows, err := queryListReflect(ctx, db, childElemType, childMeta, childMeta.pk.colName, parentKeyValues)
-			if err != nil {
-				return err
-			}
-			children = rows
-		} else {
-			rows, err := queryListReflect(ctx, db, childElemType, childMeta, childFKCol, parentKeyValues)
+			matchCol = childMeta.pk.colName
+		}
+		// 先滤掉 nil / 零值键再查询：`IN (0)` 会把「外键恰好为 0」的脏数据挂到尚未落库的父对象上，
+		// 而这类父子关系并不存在。零值键在匹配阶段同样被判为「不关联」（见 keyOf），语义一致。
+		keys := validKeys(parentKeyValues)
+		var children []reflect.Value
+		if len(keys) > 0 {
+			rows, err := queryListReflect(ctx, db, childElemType, childMeta, matchCol, keys)
 			if err != nil {
 				return err
 			}
 			children = rows
 		}
 
-		// 把子对象按外键值挂回到每个父对象
+		// 把子对象按连接列挂回到每个父对象。
+		// 先给子对象建「连接列值 → 子对象」索引再匹配：此前是「每个父对象 × 每个子对象」的
+		// 双重反射比较，1000 个父对象配上 1000 个子对象就是 100 万次比较。
+		idx := indexChildren(children, childMeta, matchCol)
+
 		for i := 0; i < slice.Len(); i++ {
 			ev := derefValue(slice.Index(i))
 			field := ev.FieldByName(rel)
 			if !field.IsValid() || !field.CanSet() {
 				continue
 			}
-			switch kind {
-			case "belongs_to":
-				pv := fieldByColName(ev, parentMeta, parentFKCol)
-				matched := findChild(children, childMeta.pk.colName, pv)
-				setChild(field, matched)
-			default: // has_many / has_one：子表外键 == 父主键
-				pv := fieldByColName(ev, parentMeta, parentMeta.pk.colName)
-				if kind == "has_many" {
-					setChildren(field, children, childMeta, childFKCol, pv)
-				} else {
-					matched := findChild(children, childFKCol, pv)
-					setChild(field, matched)
-				}
+			var pv any
+			if kind == "belongs_to" {
+				pv = fieldByColName(ev, parentMeta, parentFKCol)
+			} else {
+				pv = fieldByColName(ev, parentMeta, parentMeta.pk.colName)
+			}
+			if kind == "has_many" {
+				setChildren(field, idx, pv)
+			} else { // has_one / belongs_to：取首个匹配（与历史行为一致）
+				setChild(field, idx.first(pv))
 			}
 		}
 	}
 	return nil
 }
 
+// preloadInChunk 单条 IN 查询携带的最大键数量。
+//
+// 大批量 Preload（例如一次加载 5 万个父对象）会把 5 万个占位符塞进一条 SQL：
+// MySQL 的 max_allowed_packet、PG 的 65535 个绑定参数上限、SQLite 的变量数上限
+// （默认 999）都会直接报错 —— SQLite 甚至只有 999，几千行数据就挂。
+// 这里按固定大小切片，逐个分片查询再合并结果，行为与单条查询一致（顺序不变）。
+const preloadInChunk = 500
+
 // queryListReflect 按「col IN (vals)」查询并返回反射值切片（每个为 *T），复用 scanStruct 扫描整行。
+// 键数量超过 preloadInChunk 时自动分片查询后合并，避免撞上各数据库的绑定参数上限。
 func queryListReflect(ctx context.Context, db *DB, typ reflect.Type, meta *modelMeta, col string, vals []any) ([]reflect.Value, error) {
 	if len(vals) == 0 {
 		return nil, nil
 	}
 	d := db.dialect
-	phs := make([]string, len(vals))
-	args := make([]any, len(vals))
-	for i, v := range vals {
-		args[i] = v
-		phs[i] = d.Placeholder(i + 1)
-	}
-	sqlStr := fmt.Sprintf("SELECT * FROM %s WHERE %s IN (%s)",
-		quoteTable(meta.finalTable(db.prefix), d), d.QuoteIdent(col), strings.Join(phs, ", "))
-	if s := logicSuffix(resolveLogic(meta, db), d, false); s != "" {
-		sqlStr += " AND " + s
-	}
-	rows, err := db.queryContext(ctx, sqlStr, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	// 与 SelectList 同理：扫描器按查询构造一次，不在逐行里重建映射计划与缓冲。
-	sc, err := newRowScannerMeta(rows, meta)
-	if err != nil {
-		return nil, err
-	}
 	out := make([]reflect.Value, 0, len(vals))
-	for rows.Next() {
-		ptr := reflect.New(typ)
-		if err := sc.scanInto(rows, ptr.Interface()); err != nil {
+	for start := 0; start < len(vals); start += preloadInChunk {
+		end := start + preloadInChunk
+		if end > len(vals) {
+			end = len(vals)
+		}
+		chunk := vals[start:end]
+		phs := make([]string, len(chunk))
+		args := make([]any, len(chunk))
+		for i, v := range chunk {
+			args[i] = v
+			phs[i] = d.Placeholder(i + 1)
+		}
+		sqlStr := fmt.Sprintf("SELECT * FROM %s WHERE %s IN (%s)",
+			quoteTable(meta.finalTable(db.prefix), d), d.QuoteIdent(col), strings.Join(phs, ", "))
+		if s := logicSuffix(resolveLogic(meta, db), d, false); s != "" {
+			sqlStr += " AND " + s
+		}
+		rows, err := db.queryContext(ctx, sqlStr, args...)
+		if err != nil {
 			return nil, err
 		}
-		out = append(out, ptr)
+		// 与 SelectList 同理：扫描器按查询构造一次，不在逐行里重建映射计划与缓冲。
+		sc, err := newRowScannerMeta(rows, meta)
+		if err != nil {
+			rows.Close()
+			return nil, err
+		}
+		for rows.Next() {
+			ptr := reflect.New(typ)
+			if err := sc.scanInto(rows, ptr.Interface()); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			out = append(out, ptr)
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return nil, err
+		}
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // ---- 反射辅助 ----
@@ -244,24 +271,48 @@ func fieldByColName(ev reflect.Value, meta *modelMeta, col string) any {
 	return fv.Interface()
 }
 
-// findChild 在 children 中找「col 列值 == key」的首个匹配；未命中返回零值 reflect.Value。
-func findChild(children []reflect.Value, col string, key any) reflect.Value {
-	for _, c := range children {
-		cv := derefValue(c)
-		if sameKey(fieldByColName(cv, getMetaOf(c), col), key) {
-			return c
-		}
-	}
-	return reflect.Value{}
+// childIndex 子对象按连接列建好的索引：规范化键 → 子对象下标列表（保持查询返回顺序）。
+//
+// 有了它，把子对象挂回父对象只需按父侧键做一次 map 查找（O(1)），
+// 不再对每个父对象遍历整个子对象列表做反射比较。
+type childIndex struct {
+	children []reflect.Value
+	byKey    map[string][]int
 }
 
-// setChildren 把 children 中「childFKCol == key」的子对象 append 进 has_many 切片字段。
-func setChildren(field reflect.Value, children []reflect.Value, childMeta *modelMeta, childFKCol string, key any) {
-	target := reflect.MakeSlice(field.Type(), 0, len(children))
-	for _, c := range children {
-		cv := fieldByColName(derefValue(c), childMeta, childFKCol)
-		if sameKey(cv, key) {
-			target = reflect.Append(target, normalizeChild(c, field.Type().Elem()))
+// indexChildren 按 meta 的 col 列给子对象建索引。
+// 键为 nil / 零值的子对象不入索引：这类行没有有效的连接值，不该被当成任何一个父对象的关联。
+func indexChildren(children []reflect.Value, meta *modelMeta, col string) childIndex {
+	idx := childIndex{children: children, byKey: make(map[string][]int, len(children))}
+	for i, c := range children {
+		k, ok := keyOf(fieldByColName(derefValue(c), meta, col))
+		if !ok {
+			continue
+		}
+		idx.byKey[k] = append(idx.byKey[k], i)
+	}
+	return idx
+}
+
+// first 返回键匹配的首个子对象；未命中返回零值 reflect.Value。
+func (x childIndex) first(key any) reflect.Value {
+	k, ok := keyOf(key)
+	if !ok {
+		return reflect.Value{}
+	}
+	list := x.byKey[k]
+	if len(list) == 0 {
+		return reflect.Value{}
+	}
+	return x.children[list[0]]
+}
+
+// setChildren 把键匹配的子对象（可能有多个）append 进 has_many 切片字段。
+func setChildren(field reflect.Value, idx childIndex, key any) {
+	target := reflect.MakeSlice(field.Type(), 0, len(idx.children))
+	if k, ok := keyOf(key); ok {
+		for _, i := range idx.byKey[k] {
+			target = reflect.Append(target, normalizeChild(idx.children[i], field.Type().Elem()))
 		}
 	}
 	field.Set(target)
@@ -292,12 +343,90 @@ func normalizeChild(child reflect.Value, targetType reflect.Type) reflect.Value 
 	return child
 }
 
-// sameKey 比较两个键是否相等（标量主键/外键值）。
-func sameKey(a, b any) bool {
-	if a == nil || b == nil {
-		return a == nil && b == nil
+// keyOf 把主键/外键值归一成可直接比较的字符串键。
+//
+// 归一化的必要性：这两个值往往来自不同的地方 —— 数据库扫回来的是驱动给的 int64/[]byte，
+// 调用方在 Go 里手填的可能是 int/uint/int32。此前用 reflect.DeepEqual 比较，int64(7) 与
+// int(7) 判为不等，Preload 会把**明明存在的关联**静默留空（父对象字段全零，不报错、
+// 不提示，只能靠人工比对数据才发现）。这里统一按「数值 → 十进制数字」「字符串 → 原文」
+// 归一，跨整型宽度/有无符号也能正确匹配。
+//
+// 返回 ok=false 表示该值不能作为连接键：nil、数字 0、空字符串。
+// 这类值意味着父对象尚未落库、或外键为空，不应与任何子行关联：
+// 旧实现的 `IN (0)` 会把外键恰为 0 的脏数据挂到未保存的父对象上。
+func keyOf(v any) (string, bool) {
+	if v == nil {
+		return "", false
 	}
-	return reflect.DeepEqual(a, b)
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Ptr, reflect.Interface:
+		if rv.IsNil() {
+			return "", false
+		}
+		return keyOf(rv.Elem().Interface())
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		n := rv.Int()
+		if n == 0 {
+			return "", false
+		}
+		return "n:" + strconv.FormatInt(n, 10), true
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		n := rv.Uint()
+		if n == 0 {
+			return "", false
+		}
+		return "n:" + strconv.FormatUint(n, 10), true
+	case reflect.Float32, reflect.Float64:
+		f := rv.Float()
+		if f == 0 {
+			return "", false
+		}
+		// 整数值的浮点（1.0）与整型（1）也算同一个键：主外键类型不一致是常见用法。
+		if f == math.Trunc(f) && f >= -9.007199254740992e15 && f <= 9.007199254740992e15 {
+			return "n:" + strconv.FormatInt(int64(f), 10), true
+		}
+		return "f:" + strconv.FormatFloat(f, 'g', -1, 64), true
+	case reflect.Bool:
+		return "b:" + strconv.FormatBool(rv.Bool()), true
+	case reflect.String:
+		s := rv.String()
+		if s == "" {
+			return "", false
+		}
+		return "s:" + s, true
+	case reflect.Slice:
+		// 少数驱动/字段类型会以 []byte 交出主键值：数字按数字归一，其余按文本。
+		if b, isBytes := v.([]byte); isBytes {
+			if len(b) == 0 {
+				return "", false
+			}
+			if n, err := strconv.ParseInt(string(b), 10, 64); err == nil && n != 0 {
+				return "n:" + strconv.FormatInt(n, 10), true
+			}
+			s := string(b)
+			if s == "" {
+				return "", false
+			}
+			return "s:" + s, true
+		}
+	}
+	return fmt.Sprintf("v:%v", v), true
+}
+
+// validKeys 过滤掉 nil / 零值键，并去重（保留首次出现顺序），用于构造 IN 查询的参数。
+func validKeys(vals []any) []any {
+	out := make([]any, 0, len(vals))
+	seen := make(map[string]bool, len(vals))
+	for _, v := range vals {
+		k, ok := keyOf(v)
+		if !ok || seen[k] {
+			continue
+		}
+		seen[k] = true
+		out = append(out, v)
+	}
+	return out
 }
 
 func derefValue(v reflect.Value) reflect.Value {
