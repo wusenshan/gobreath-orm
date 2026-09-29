@@ -48,7 +48,7 @@ func aggReady[T any](q *Query[T], db *DB, fn string) (*Query[T], error) {
 	if len(qq.groupBy) > 0 || len(qq.havings) > 0 {
 		return nil, fmt.Errorf(
 			"orm: %s 不支持带 GROUP BY / HAVING 的查询（会返回多行，单值接口无法表达）；"+
-				"请改用 SelectList + Select(聚合表达式 AS 别名) 扫进自定义 DTO", fn)
+				"请改用 SelectSum / SelectCount 等聚合投影 + orm.Aggregate[DTO] 把分组结果扫进自定义结构体", fn)
 	}
 	return qq, nil
 }
@@ -275,7 +275,7 @@ func pluck[T any, F any](ctx context.Context, db *DB, q *Query[T], name string) 
 	}
 	qq := q.applyLogic(getMeta[T](), db).WithDialect(db.dialect).WithPrefix(db.prefix)
 	c := *qq
-	c.selects = []string{name}
+	c.selects = []selItem{{col: name}}
 	c.noVecCol = true // 单列投影：不要再追加向量距离列
 	sqlStr, args := c.Build()
 

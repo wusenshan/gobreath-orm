@@ -17,6 +17,7 @@ type where struct {
 	// JSON 相关：jsonPath 非空表示按路径查询 JSON 列；jsonContains 表示 @>/JSON_CONTAINS 包含查询
 	jsonPath     string
 	jsonContains bool
+	aggFn        string // HAVING 专用：非空表示左侧是 FN(col) 形式的聚合表达式
 }
 
 // order 排序项；vec=true 表示按向量距离排序。
@@ -36,6 +37,38 @@ type join struct {
 	on    string
 }
 
+// selItem 是 SELECT 投影里的一项。
+//
+// 刻意不接受任意 SQL 片段 —— 只允许三种由框架拼出的形态：
+//  1. 普通列：fn 为空 → 渲染被引号包裹的列名（可带表别名前缀 "u.name"）；
+//  2. 聚合列：fn 为白名单里的聚合函数名 → 渲染 FN(col)，col 为空时渲染 FN(*)；
+//  3. 别名：alias 非空 → 追加 AS "alias"。
+//
+// fn 与 col 都不由调用方以字符串形式给出：fn 取自框架内部的聚合白名单，
+// col 来自 ColExpr（列表达式），alias 需通过标识符规则校验（见 isValidAlias）。
+type selItem struct {
+	fn    string // 聚合函数名（SUM / AVG / MAX / MIN / COUNT），空表示普通列
+	col   string // 列名；fn 非空且 col 为空时渲染 FN(*)
+	alias string // AS 之后的列名，空表示不起别名
+}
+
+// sql 渲染单个投影项。表达式中的列名与别名一律走方言引号，不做字符串拼接。
+func (it selItem) sql(d Dialect) string {
+	var s string
+	switch {
+	case it.fn == "":
+		s = quoteIdentPath(d, it.col)
+	case it.col == "":
+		s = it.fn + "(*)"
+	default:
+		s = it.fn + "(" + quoteIdentPath(d, it.col) + ")"
+	}
+	if it.alias != "" {
+		s += " AS " + d.QuoteIdent(it.alias)
+	}
+	return s
+}
+
 // Query[T] 泛型查询构造器，对标 MyBatis-Plus 的 LambdaQueryWrapper。
 // 字段通过 Col[T](picker) 选择，条件方法链调用，自动处理占位符与 AND/OR 拼接。
 type Query[T any] struct {
@@ -43,7 +76,7 @@ type Query[T any] struct {
 	table         string
 	tableExplicit bool   // true 表示 .Table() 显式指定，前缀不再叠加
 	prefix        string // 来自 DB 的表前缀（仅在自动推导名上生效）
-	selects       []string
+	selects       []selItem
 	aggFn         string    // 聚合函数名（SUM / AVG / MAX / MIN / COUNT），非空时投影整体替换为 FN(aggCol)
 	aggCol        string    // 聚合列名；aggFn 为 COUNT 且此处为空时渲染 FN(*)
 	noVecCol      bool      // true 表示投影已完全确定，不要再追加向量距离列（聚合 / Pluck 使用）
@@ -179,7 +212,12 @@ func (q *Query[T]) Select(cols ...string) *Query[T] {
 				"请改为逐个传入，例如 Select(\"name\", \"age\")", c))
 		}
 	}
-	q.selects = cols
+	// 注意这里是「覆盖」而非 append：Select 表达的是「本次就只要这些列」，
+	// 与只有在调用方显式追加语义的聚合投影（SelectSum 等）不同。
+	q.selects = make([]selItem, 0, len(cols))
+	for _, c := range cols {
+		q.selects = append(q.selects, selItem{col: c})
+	}
 	return q
 }
 
@@ -321,6 +359,129 @@ func (q *Query[T]) GroupBy(col ColExpr) *Query[T] {
 
 func (q *Query[T]) Having(col ColExpr, op string, val any) *Query[T] {
 	q.havings = append(q.havings, where{col: col.name, op: op, vals: []any{val}})
+	return q
+}
+
+// ---- 聚合投影与聚合 HAVING（GROUP BY 检索专用）----
+//
+// 这一组 API 是「把分组结果映射回结构体」缺的另一半：Select / Having 只能表达
+// `GROUP BY "dept"`，表达不出 `SELECT SUM("amount") AS total ... HAVING SUM("amount") > ?`。
+//
+// 注入面控制：聚合函数名取自框架内部常量，列名来自 ColExpr（结构体 db tag 白名单），
+// 别名要过 isValidAlias —— 三者都没有接受任意字符串的路径，所以这里不引入新的注入面
+// （与 Select 的列名、Last 的尾片段保持同一口径）。
+
+// SelectCol 追加一个由列表达式指定的列，是 Select 的类型安全版本。
+//
+// GroupBy / Having / 聚合投影都收 ColExpr（列来自结构体 db tag 白名单），
+// Select 收裸字符串是历史 API；两者并存时建议优先用这一个，写错列名由列表达式拦，
+// 而不是等到 SQL 执行时数据库报 unknown column。
+func (q *Query[T]) SelectCol(col ColExpr) *Query[T] {
+	q.selects = append(q.selects, selItem{col: col.name})
+	return q
+}
+
+// isValidAlias 校验 AS 之后的别名：只允许 SQL 普通标识符形态（字母 / 下划线开头，
+// 其余字符为字母、数字、下划线）。别名会以方言引号拼进 SQL，放宽松了就是注入口子。
+func isValidAlias(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '_', c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
+		case c >= '0' && c <= '9':
+			if i == 0 {
+				return false // 不允许数字开头
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// SelectCount 追加 COUNT(*) AS alias。
+func (q *Query[T]) SelectCount(alias string) *Query[T] {
+	return q.appendAgg(selItem{fn: "COUNT", alias: alias})
+}
+
+// SelectSum 追加 SUM(col) AS alias。
+func (q *Query[T]) SelectSum(col ColExpr, alias string) *Query[T] {
+	return q.appendAgg(selItem{fn: "SUM", col: col.name, alias: alias})
+}
+
+// SelectAvg 追加 AVG(col) AS alias。
+func (q *Query[T]) SelectAvg(col ColExpr, alias string) *Query[T] {
+	return q.appendAgg(selItem{fn: "AVG", col: col.name, alias: alias})
+}
+
+// SelectMax 追加 MAX(col) AS alias。
+func (q *Query[T]) SelectMax(col ColExpr, alias string) *Query[T] {
+	return q.appendAgg(selItem{fn: "MAX", col: col.name, alias: alias})
+}
+
+// SelectMin 追加 MIN(col) AS alias。
+func (q *Query[T]) SelectMin(col ColExpr, alias string) *Query[T] {
+	return q.appendAgg(selItem{fn: "MIN", col: col.name, alias: alias})
+}
+
+// appendAgg 追加一个聚合投影项。
+//
+// alias 是**必填**的：不带别名时各方言给聚合列起的结果集列名不一致
+// （PG 是 `sum`，MySQL 是整段 `SUM(...)`,SQLite 又是一种写法），
+// 调用方无法用一个稳定的字段名把结果扫回结构体 —— 强校验好过映射落空、字段恒零。
+func (q *Query[T]) appendAgg(it selItem) *Query[T] {
+	if !isValidAlias(it.alias) {
+		panic(fmt.Sprintf("orm: 聚合投影必须给定一个合法的别名（收到 %q）："+
+			"别名只能是字母或下划线开头、由字母数字下划线组成。各方言对无名聚合列的命名不一致，"+
+			"不起别名的话结果无法稳定映射到结构体字段", it.alias))
+	}
+	q.selects = append(q.selects, it)
+	return q
+}
+
+// HavingCount 追加 HAVING COUNT(*) op val。
+//
+// COUNT 同样要带 fn：HAVING 左侧的渲染依赖它区分「聚合表达式」与「列名」，
+// fn 为空会让 COUNT(*) 退化成对空列名加引号（HAVING "" >= ? 这种非法片段）。
+func (q *Query[T]) HavingCount(op string, val any) *Query[T] {
+	return q.havingAgg("COUNT", "", op, val)
+}
+
+// HavingSum 追加 HAVING SUM(col) op val。
+func (q *Query[T]) HavingSum(col ColExpr, op string, val any) *Query[T] {
+	return q.havingAgg("SUM", col.name, op, val)
+}
+
+// HavingAvg 追加 HAVING AVG(col) op val。
+func (q *Query[T]) HavingAvg(col ColExpr, op string, val any) *Query[T] {
+	return q.havingAgg("AVG", col.name, op, val)
+}
+
+// HavingMax 追加 HAVING MAX(col) op val。
+func (q *Query[T]) HavingMax(col ColExpr, op string, val any) *Query[T] {
+	return q.havingAgg("MAX", col.name, op, val)
+}
+
+// HavingMin 追加 HAVING MIN(col) op val。
+func (q *Query[T]) HavingMin(col ColExpr, op string, val any) *Query[T] {
+	return q.havingAgg("MIN", col.name, op, val)
+}
+
+// havingAgg 追加一条聚合 HAVING 条件。fn 为空表示 COUNT(*)。
+//
+// op 与其他条件方法一样是原文运算符（= / > / <= …），由调用方保证合法性 ——
+// 这里保持既有口径，不额外收紧到枚举。
+func (q *Query[T]) havingAgg(fn, col, op string, val any) *Query[T] {
+	if op == "" {
+		panic(fmt.Sprintf("orm: Having 的运算符不能为空（聚合函数 %s）", fn))
+	}
+	if fn == "" {
+		panic("orm: havingAgg 内部错误：缺少聚合函数名（COUNT 也要显式给出）")
+	}
+	q.havings = append(q.havings, where{aggFn: fn, col: col, op: op, vals: []any{val}})
 	return q
 }
 
@@ -660,11 +821,11 @@ func (q *Query[T]) Build() (string, []any) {
 			sel = q.aggFn + "(" + quoteIdentPath(d, q.aggCol) + ")"
 		}
 	case len(q.selects) > 0:
-		quoted := make([]string, len(q.selects))
-		for i, c := range q.selects {
-			quoted[i] = quoteIdentPath(d, c)
+		parts := make([]string, len(q.selects))
+		for i, it := range q.selects {
+			parts[i] = it.sql(d)
 		}
-		sel = strings.Join(quoted, ", ")
+		sel = strings.Join(parts, ", ")
 	}
 	if q.hasVector && !noVecCol {
 		dist := fmt.Sprintf("%s AS dist", d.VectorDistance(q.vecCol, d.Placeholder(vecPH()), q.vectorMetric))
@@ -705,7 +866,13 @@ func (q *Query[T]) Build() (string, []any) {
 		var hs []string
 		for _, w := range q.havings {
 			n := add(w.vals[0])
-			hs = append(hs, fmt.Sprintf("%s %s %s", d.QuoteIdent(w.col), w.op, d.Placeholder(n)))
+			// 聚合 HAVING 的左侧是表达式而非列名，必须在这里（Build 期）才渲染：
+			// 构造器被调用时 WithDialect 可能尚未写入方言，那时渲染会用到错误的引号。
+			left := d.QuoteIdent(w.col)
+			if w.aggFn != "" {
+				left = selItem{fn: w.aggFn, col: w.col}.sql(d)
+			}
+			hs = append(hs, fmt.Sprintf("%s %s %s", left, w.op, d.Placeholder(n)))
 		}
 		sql += " HAVING " + strings.Join(hs, " AND ")
 	}
@@ -788,6 +955,36 @@ func (q *Query[T]) fromClause(d Dialect) string {
 		s += " ON " + j.on
 	}
 	return s
+}
+
+// countBuild 生成「统计行数」用的 SQL 与参数（Count / Exists / Page 的 total）。
+//
+// 不带 DISTINCT / GROUP BY 时走 COUNT(*) 快速路径；两者任一出现，就必须把原查询
+// 整体包进子查询再数外层行数。
+//
+// 后者修的是一个真实的错算：此前 Count 把 distinct / groupBy / havings 一律清掉，
+// 于是
+//
+//	· Distinct() 的查询：总数 **不去重**，比列表实际行数多；
+//	· GroupBy(...) 的查询：列表返回的是分组数，总数却是**全表行数**（差若干个数量级）。
+//
+// 两者都直接落在 Page 的 Total 上 —— 分页器显示的页数与列表能对上的行数不符，
+// 且全程不报错。（havings 必须保留，否则 GROUP BY + HAVING 的过滤结果没被数进去。
+// orders / limit / offset / forUpdate 则相反：它们在 COUNT 里无意义，
+// 部分方言还会直接拒绝出现在子查询里。）
+func (q *Query[T]) countBuild() (string, []any) {
+	c := *q
+	c.aggFn, c.aggCol = "", ""
+	c.noVecCol = true // COUNT 结果只有一列，别追加向量距离列
+	c.limit, c.offset = 0, 0
+	c.orders, c.forUpdate, c.last = nil, false, ""
+	if !c.distinct && len(c.groupBy) == 0 {
+		c.aggFn = "COUNT"
+		return c.Build()
+	}
+	inner, args := c.Build()
+	// 派生表必须有别名：MySQL 强制要求，PG 同样不允许无名子查询。
+	return fmt.Sprintf("SELECT COUNT(*) FROM (%s) %s", inner, c.dialect.QuoteIdent("_t")), args
 }
 
 // agg 返回一个「投影被替换成聚合函数」的新查询（原查询不被修改）。

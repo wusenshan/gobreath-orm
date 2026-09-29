@@ -489,8 +489,8 @@ last, err := orm.MaxOf(ctx, db, q, orm.TCol(func(u *User) *time.Time { return &u
 ```
 
 - **带 GROUP BY / HAVING 会直接报错**：那类查询返回多行，单值接口只能取到第一行，静默返回部分结果比报错危险。
-  分组聚合请用 `SelectList + Select(聚合表达式 AS 别名)` 扫进自定义 DTO —— 报错信息里也会给出这个提示。
-  分组聚合的结果映射见文末「路线图（Phase 2+）」。
+  分组聚合请用 `SelectSum` / `SelectCount` 等聚合投影 + `orm.Aggregate[DTO]`，把结果扫进自定义结构体
+  （见「分组聚合（GroupBy / Having）」一节）。
 
 ### 单列取值（Pluck）
 
@@ -760,15 +760,63 @@ if prefix != "" {
 
 ### 分组聚合（GroupBy / Having）
 
+**只按分组列取值**（不需要聚合值）时，用 `Select` + `GroupBy` 扫回原模型即可：
+
 ```go
-// SELECT status, COUNT(*) ... GROUP BY status HAVING COUNT(*) > 1
+// SELECT "status" FROM users GROUP BY "status" HAVING "status" > ?
+// （HAVING 作用在**列**上，分组本身已保证该列在每组内唯一）
 rows, err := orm.SelectList(ctx, db,
     orm.NewQuery[User]().
-        Select("status").
+        SelectCol(statusCol).
         GroupBy(statusCol).
         Having(statusCol, ">", 1),
 )
 ```
+
+**要算 `SUM` / `COUNT` 这类聚合值时**，`Select` 出于防注入刻意不接受表达式（见下方安全说明），
+请改用一组专用的聚合投影构造器，并把结果扫进自定义的结构体：
+
+```go
+// 结果 DTO：字段名 / db tag 对上 SelectSum / SelectCount 起的别名即可命中。
+type DeptStat struct {
+    Dept  string  `db:"dept"`
+    Total float64 `db:"total"`
+    Cnt   int64   `db:"cnt"`
+}
+
+// SELECT "dept", SUM("amount") AS "total", COUNT(*) AS "cnt"
+//   FROM sales GROUP BY "dept" HAVING SUM("amount") > ? ORDER BY "dept" ASC
+stats, err := orm.Aggregate[DeptStat](ctx, db,
+    orm.NewQuery[Sale]().
+        SelectCol(deptCol).                  // 分组列（也可用 Select("dept")）
+        SelectSum(amountCol, "total").       // SUM("amount") AS "total"
+        SelectCount("cnt").                  // COUNT(*) AS "cnt"
+        GroupBy(deptCol).
+        HavingSum(amountCol, ">", 100).      // HAVING SUM("amount") > ?
+        OrderBy(deptCol, true),
+)
+```
+
+| API | 作用 |
+|---|---|
+| `SelectCol(col ColExpr)` | 追加一个分组列（类型安全版 `Select`，列名来自 `db` tag 白名单） |
+| `SelectSum / SelectAvg / SelectMax / SelectMin(col, alias)` | 追加 `FN(col) AS alias` |
+| `SelectCount(alias)` | 追加 `COUNT(*) AS alias` |
+| `HavingCount(op, val)` | `HAVING COUNT(*) op ?`（其余同理：`HavingSum` / `HavingAvg` / `HavingMax` / `HavingMin`） |
+| `Aggregate[DTO](ctx, db, q)` | 执行并把分组结果逐行扫进 DTO（第二个类型参数由 `*Query[T]` 推导） |
+
+几点约定：
+
+- **别名必填**：不带别名时各方言给聚合列起的名字不一致（PG 是 `sum`，MySQL 是整段 `SUM(...)`），
+  DTO 无法用一个稳定的字段名把它接住。别名只允许字母 / 下划线开头、由字母数字下划线组成，
+  否则构造期 panic（框架最终会按方言给它加引号，所以这一步同时也是防注入的一环）。
+- **DTO 不需要任何新的元数据**：既有行映射本就按「结果集列名 == 字段的 `db` 列名」匹配，
+  而带 `AS` 的聚合列交给 `rows.Columns()` 的正是别名 —— 落到同一套逻辑上，也不需要给实体模型
+  加「只读列」tag（`db:"-"` 会同时让它不进 INSERT，反而更绕）。
+- **分组列请自行 `GroupBy` 补齐**：MySQL 默认开 `ONLY_FULL_GROUP_BY`、PG 强制要求非聚合投影列
+  必须出现在 `GROUP BY` 里，缺了会由数据库报错 —— 框架不替你猜分组键。
+- 处理后的行数 / 分页：`Count` 在这类带 `GROUP BY` 或 `DISTINCT` 的查询上会自动改成子查询计数
+  （``SELECT COUNT(*) FROM (<原查询>) "_t"``），所以 `Page` 的 `Total` 与列表行数口径一致。**
 
 ---
 
@@ -1334,7 +1382,10 @@ cities, err := orm.SelectList(ctx, db,
 
 `Distinct()` 与 `Select` / `Eq` / `OrderBy` / `Limit` / `Page` 等链式条件完全兼容，顺序随意。
 
-> `Select(cols ...string)` 只接受**列名**（会按方言加引号）。要投影 `COUNT(*)`、`SUM(score) * 2` 这类**表达式**，请用聚合 API（`Count` / `Sum` / `Avg` / …）或 `RawQuery` / `Query.Last()`。把表达式塞进 `Select` 会被当成标识符加引号：PostgreSQL 下报「列不存在」，SQLite 下更隐蔽 —— `SELECT "COUNT(*)"` 被视为字符串常量，**静默返回字面量而不是计数**。
+> `Select(cols ...string)` 只接受**列名**（会按方言加引号）。要投影 `SUM(col)`、`COUNT(*)` 这类**聚合表达式**，
+> 请用专用的 `SelectSum` / `SelectCount` 等构造器（见「分组聚合（GroupBy / Having）」），或走 `RawQuery`。
+> 把表达式塞进 `Select` 会被当成标识符加引号：PostgreSQL 下报「列不存在」，SQLite 下更隐蔽 ——
+> `SELECT "COUNT(*)"` 被视为字符串常量，**静默返回字面量而不是计数**。
 
 ---
 
@@ -1372,7 +1423,7 @@ cities, err := orm.SelectList(ctx, db,
 
 - `RawQuery` 体验增强：`IN` 占位符批量展开（slice → `(?, ?, ...)`）、`map[string]any` 结果集、流式游标（大结果集分批读取）
 - 钩子（`BeforeCreate / AfterUpdate` 等，实体级回调——当前 `Hook` 是 SQL 生命周期级，二者定位不同，后续可扩展）
-- 投影 `Select` 强类型化与聚合结果映射
+- ✅ 聚合结果的分组映射 —— 已在 v0.1.13 通过 `SelectSum` / `SelectCount` 聚合投影 + `Aggregate[DTO]` 落地（`SelectCol` 补上了类型安全的列选择；`Select(cols ...string)` 的字符串形式保留兼容）
 - ✅ 关联预加载 / 关联映射（relation preload / association mapping）—— 已在 v0.1.7 通过 `Preload` / `PreloadOne` 落地
 - ✅ 数据库迁移（migration）—— 已在 v0.1.7 通过 `AutoMigrate` 落地（建表 + 二级索引，暂不含删列 / 改列类型）
 

@@ -2,6 +2,7 @@ package orm
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"reflect"
@@ -600,19 +601,33 @@ func SelectList[T any](ctx context.Context, db *DB, q *Query[T]) ([]T, error) {
 		return nil, err
 	}
 	defer rows.Close()
+	return scanRows[T](rows)
+}
+
+// scanRows 把整个结果集扫进 R，是所有「多行结果」入口的共用实现。
+//
+// 存在的理由：凡是列表查询都得走同一套「扫描器构造 → 列映射 → 逐行 Scan」流程，
+// 一旦有人按自己方便再抄一份（历史上 Count 就抄丢过 JOIN），就会在某条路径上
+// 悄悄少掉一个环节。SelectList 与 Aggregate 是指定的两个使用者，新入口应当复用它。
+//
+// R 必须是结构体：行映射按 结果集列名 == 字段 db tag 列名 匹配，别的形态没有字段可落。
+func scanRows[R any](rows *sql.Rows) ([]R, error) {
+	if rt := reflect.TypeOf((*R)(nil)).Elem(); rt.Kind() != reflect.Struct {
+		return nil, fmt.Errorf("orm: 结果类型必须是结构体（收到 %s）：行映射按 db tag 把列匹配到字段上", rt)
+	}
 	// 扫描器按查询构造一次：列映射计划与扫描缓冲都与具体某一行无关，
 	// 逐行重建是列表路径上最大的一笔浪费。
-	sc, err := newRowScanner(rows, (*T)(nil))
+	sc, err := newRowScanner(rows, (*R)(nil))
 	if err != nil {
 		return nil, err
 	}
-	var out []T
+	var out []R
 	for rows.Next() {
-		var t T
-		if err := sc.scanInto(rows, &t); err != nil {
+		var r R
+		if err := sc.scanInto(rows, &r); err != nil {
 			return nil, err
 		}
-		out = append(out, t)
+		out = append(out, r)
 	}
 	return out, rows.Err()
 }
@@ -633,15 +648,14 @@ func SelectOne[T any](ctx context.Context, db *DB, q *Query[T]) (*T, error) {
 //
 // 与 SelectList 的口径一致性：JOIN 与主表别名会计入 —— INNER JOIN 会改变行数，
 // 此前 Count 手搓 FROM 把 JOIN 整个漏掉，带 JOIN 的查询算总数会与列表行数不符，
-// 分页页码因此对不上。ORDER BY / LIMIT / OFFSET、GROUP BY / HAVING 与
-// DISTINCT 不参与计数，语义始终是「符合条件的总行数」。
+// 分页页码因此对不上。ORDER BY / LIMIT / OFFSET 不参与计数。
+//
+// 语义始终是「列表那条 SQL 会返回多少行」：带 DISTINCT 或 GROUP BY（含 HAVING）时，
+// 计数改为对原查询加一层子查询（见 Query.countBuild），于是 Distinct 会去重、
+// GroupBy 数的是分组数 —— 两者都与列表行数一致，而不是退化为全表行数。
 func Count[T any](ctx context.Context, db *DB, q *Query[T]) (int64, error) {
 	qq := q.applyLogic(getMeta[T](), db).WithDialect(db.dialect).WithPrefix(db.prefix)
-	c := qq.agg("COUNT", "")
-	c.groupBy, c.havings, c.orders, c.distinct = nil, nil, nil, false
-	c.forUpdate, c.last = false, ""
-
-	sqlStr, args := c.Build()
+	sqlStr, args := qq.countBuild()
 	rows, err := db.queryContext(ctx, sqlStr, args...)
 	if err != nil {
 		return 0, err
