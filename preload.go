@@ -112,6 +112,15 @@ func preloadReflect(ctx context.Context, db *DB, slice reflect.Value, relations 
 			if childFKCol == "" {
 				childFKCol = toSnake(parentTypeName) + "_id"
 			}
+			// 这一支要拿父主键去拼 `IN (...)`，父类型没有主键时
+			// collectPK 会在 meta.pk.colName 上 nil 解引用直接 panic。
+			// 子类型有同样的防线（上面 childMeta.pk 检查），这里补齐到父侧，
+			// 把崩溃换成一句能定位到「哪个关系、哪个父模型」的错误。
+			if parentMeta.pk == nil {
+				return fmt.Errorf("orm: Preload 关系 %q（%s）要求父类型 %s 有主键（has_many/has_one "+
+					"靠父主键关联子表外键 %q），但该模型没有主键列；belongs_to 关系不需要父主键",
+					rel, kind, parentMeta.table, childFKCol)
+			}
 			parentKeyValues = collectPK(slice, parentMeta)
 		}
 		// 校验外键列确实属于对应模型：此前列名拼错时，belongs_to 会静默全空

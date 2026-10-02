@@ -80,6 +80,7 @@ type Query[T any] struct {
 	aggFn         string    // 聚合函数名（SUM / AVG / MAX / MIN / COUNT），非空时投影整体替换为 FN(aggCol)
 	aggCol        string    // 聚合列名；aggFn 为 COUNT 且此处为空时渲染 FN(*)
 	noVecCol      bool      // true 表示投影已完全确定，不要再追加向量距离列（聚合 / Pluck 使用）
+	selOne        bool      // true 表示投影固定为常量 1（Count 的子查询内层用，见 countBuild）
 	groups        [][]where // 每组内部 OR 连接，组间 AND 连接
 	orMode        bool      // 下一个条件是否与前一个 OR
 	orders        []order
@@ -94,6 +95,7 @@ type Query[T any] struct {
 	hasVector     bool
 	vecCol        string
 	vector        any
+	vecK          int // 向量近邻条数上限（Nearest 的 k）：与分页 limit 分开存放，见 Nearest
 	vecFilterOn   bool
 	vecFilter     float64
 	vectorMetric  VectorMetric   // 向量距离度量，默认 L2
@@ -299,11 +301,38 @@ func (q *Query[T]) Between(col ColExpr, lo, hi any) *Query[T] {
 func (q *Query[T]) IsNull(col ColExpr) *Query[T]    { return q.addRaw(col.name, "IS NULL") }
 func (q *Query[T]) IsNotNull(col ColExpr) *Query[T] { return q.addRaw(col.name, "IS NOT NULL") }
 
+// 比较运算符白名单：Json / Having 的 op 是**原样拼进 SQL** 的，不经过占位符，
+// 因此只能是白名单里的值 —— 一旦 op 来自配置或用户输入（"= 1 OR 1=1 --" 之类），
+// 任意拼接就是一条注入口子。构造期拦住，报错还能指回调用处。
+//
+// 两者范围不同：whereSQL 对 IN / NOT IN 有专门的渲染分支（多个占位符），
+// Json 因此额外接受它们；HAVING 的左侧是聚合表达式，只接受二元比较。
+var (
+	jsonCompareOps   = []string{"=", "!=", "<>", ">", ">=", "<", "<=", "LIKE", "NOT LIKE", "IN", "NOT IN"}
+	havingCompareOps = []string{"=", "!=", "<>", ">", ">=", "<", "<=", "LIKE", "NOT LIKE"}
+)
+
+// normalizeCompareOp 校验 op 是否在白名单内，并返回归一化形式（去空白、关键字大写）。
+func normalizeCompareOp(op, who string, allowed []string) string {
+	norm := strings.Join(strings.Fields(strings.ToUpper(op)), " ")
+	for _, a := range allowed {
+		if norm == a {
+			return norm
+		}
+	}
+	panic(fmt.Sprintf("orm: %s 的运算符 %q 不在白名单内（允许：%s）。"+
+		"op 会原样拼进 SQL、不经过占位符，故不接受任意片段 —— 运算符若来自配置或用户输入，"+
+		"请先在调用方把它映射到白名单里的值，否则这就是一条注入口子",
+		who, op, strings.Join(allowed, " / ")))
+}
+
 // Json 在 JSON 列上按路径做比较（路径串形如 "a.b.c"，无法用结构体字段 picker 选取，故为字符串）。
-// 支持的 op：= != > >= < <= LIKE。渲染按方言展开：
+// 支持的 op：= != > >= < <= LIKE NOT LIKE IN NOT IN（白名单校验，非法值直接 panic）。
+// 渲染按方言展开：
 // PG → "col"->'a'->>'b' = $1；MySQL/SQLite → JSON_EXTRACT("col", '$.a.b') = ?。
 func (q *Query[T]) Json(col ColExpr, path, op string, val any) *Query[T] {
-	return q.appendWhere(where{col: col.name, op: op, vals: []any{val}, jsonPath: path})
+	return q.appendWhere(where{col: col.name, op: normalizeCompareOp(op, "Json", jsonCompareOps),
+		vals: []any{val}, jsonPath: path})
 }
 
 // JsonContains 查询「JSON 列包含给定 JSON 片段」（最常用的 jsonb 场景）。
@@ -357,8 +386,12 @@ func (q *Query[T]) GroupBy(col ColExpr) *Query[T] {
 	return q
 }
 
+// Having 追加一条 HAVING 条件（对分组后的结果过滤，通常配合 GroupBy）。
+// op 只允许白名单里的二元比较符：= != <> > >= < <= LIKE NOT LIKE（见 normalizeCompareOp）。
+// 对聚合结果过滤请用 HavingCount / HavingSum / HavingAvg / HavingMax / HavingMin。
 func (q *Query[T]) Having(col ColExpr, op string, val any) *Query[T] {
-	q.havings = append(q.havings, where{col: col.name, op: op, vals: []any{val}})
+	q.havings = append(q.havings, where{col: col.name,
+		op: normalizeCompareOp(op, "Having", havingCompareOps), vals: []any{val}})
 	return q
 }
 
@@ -472,8 +505,9 @@ func (q *Query[T]) HavingMin(col ColExpr, op string, val any) *Query[T] {
 
 // havingAgg 追加一条聚合 HAVING 条件。fn 为空表示 COUNT(*)。
 //
-// op 与其他条件方法一样是原文运算符（= / > / <= …），由调用方保证合法性 ——
-// 这里保持既有口径，不额外收紧到枚举。
+// op 必须是白名单里的二元比较符（原来由调用方保证合法性、框架原样拼接，
+// op 一旦来自配置就是注入口子），空值同样拒绝 —— 空 op 曾渲染出
+// `HAVING "" >= $1`（对空列名加引号）。
 func (q *Query[T]) havingAgg(fn, col, op string, val any) *Query[T] {
 	if op == "" {
 		panic(fmt.Sprintf("orm: Having 的运算符不能为空（聚合函数 %s）", fn))
@@ -481,7 +515,8 @@ func (q *Query[T]) havingAgg(fn, col, op string, val any) *Query[T] {
 	if fn == "" {
 		panic("orm: havingAgg 内部错误：缺少聚合函数名（COUNT 也要显式给出）")
 	}
-	q.havings = append(q.havings, where{aggFn: fn, col: col, op: op, vals: []any{val}})
+	q.havings = append(q.havings, where{aggFn: fn, col: col,
+		op: normalizeCompareOp(op, "Having", havingCompareOps), vals: []any{val}})
 	return q
 }
 
@@ -500,7 +535,10 @@ func (q *Query[T]) Nearest(col ColExpr, vec any, k int) *Query[T] {
 	q.hasVector = true
 	q.vecCol = col.name
 	q.vector = vec
-	q.limit = k
+	// k 存进 vecK 而不是 limit：limit 是「调用方的分页」，会被 Page / Offset 改写，
+	// 也会在 Count 里被清掉（分页不该影响总数）。k 是近邻检索自身的上限，
+	// 必须独立于分页存在 —— 否则 Count 会把近邻查询的总数算成全表行数。
+	q.vecK = k
 	q.orders = append(q.orders, order{vec: true, asc: true})
 	return q
 }
@@ -535,14 +573,28 @@ func (q *Query[T]) WithinDistanceBy(col ColExpr, vec any, threshold float64, m V
 }
 
 // Limit 设置返回行数上限；与 Last 互斥（见 Last 的说明）。
+//
+// 负数没有统一语义，故直接拒绝：PostgreSQL 会报 "LIMIT must not be negative"、
+// MySQL 同样报错，而 SQLite 把负 LIMIT 解释为「无上限」—— 同一份代码在两个方言上
+// 一边报错一边静默返回全表。要「不限制行数」请干脆不要调用 Limit。
 func (q *Query[T]) Limit(n int) *Query[T] {
+	if n < 0 {
+		panic(fmt.Sprintf("orm: Limit 不接受负数（收到 %d）：各方言对负 LIMIT 的语义相反"+
+			"（PG / MySQL 直接报错，SQLite 解释为无上限），且框架此前会静默地不生成 LIMIT —— "+
+			"于是 Limit(-1) 看起来设了限制，实际返回全表。不限制行数请不要调用 Limit", n))
+	}
 	q.guardLastPaging("Limit")
 	q.limit = n
 	return q
 }
 
-// Offset 设置跳过行数；与 Last 互斥（见 Last 的说明）。
+// Offset 设置跳过行数；与 Last 互斥（见 Last 的说明）。负 OFFSET 同样是静默失效
+// （框架只在 offset > 0 时生成子句），故一并拒绝。
 func (q *Query[T]) Offset(n int) *Query[T] {
+	if n < 0 {
+		panic(fmt.Sprintf("orm: Offset 不接受负数（收到 %d）：负 OFFSET 会被静默丢弃"+
+			"（框架只在 offset > 0 时生成子句），于是跳过行数的意图无声消失", n))
+	}
 	q.guardLastPaging("Offset")
 	q.offset = n
 	return q
@@ -587,7 +639,7 @@ func (q *Query[T]) Last(sql string) *Query[T] {
 // 写法（队列式抢锁：`FOR UPDATE SKIP LOCKED LIMIT 1`），不做限制。
 // 两种书写顺序都能拦到：先 Last 再 Limit、先 Limit 再 Last。
 func (q *Query[T]) guardLastPaging(other string) {
-	if q.last == "" || (q.limit <= 0 && q.offset <= 0) {
+	if q.last == "" || (q.limit <= 0 && q.offset <= 0 && q.vecK <= 0) {
 		return
 	}
 	if kw := lastPagingClause(q.last); kw != "" {
@@ -812,6 +864,13 @@ func (q *Query[T]) Build() (string, []any) {
 
 	sel := "*"
 	switch {
+	case q.selOne && len(q.selects) == 0:
+		// Count 的子查询内层只关心「行数」：投影一个常量即可。默认投影 "*" 在内层
+		// 带 GROUP BY / HAVING 时是非法 SQL（PG 报 must appear in the GROUP BY
+		// clause，MySQL 在 ONLY_FULL_GROUP_BY 下同）。
+		// 调用方显式 Select 过的列保持原样 —— 那些列能与 GROUP BY 配套（如分组列本身），
+		// 换成常量反而丢失信息。
+		sel = "1"
 	case q.aggFn != "":
 		// 聚合投影：SUM/AVG/MAX/MIN/COUNT。列名同样走 quoteIdentPath，
 		// 与普通 Select 保持一致（支持 "u.name" 这种带别名的列路径）。
@@ -842,13 +901,19 @@ func (q *Query[T]) Build() (string, []any) {
 	}
 	sql := fmt.Sprintf("%s %s FROM %s", kw, sel, from)
 
+	// 是否已经写出 WHERE 必须看**渲染结果**，不能看 len(q.groups)：
+	// NotIn(空) 这类条件会被折叠成恒真并在 whereSQL 里整组省略（w == ""），
+	// 此时 groups 非空却没有 WHERE —— 再用 len(q.groups) > 0 判断就会拼出
+	// `SELECT ... FROM "t" AND "emb" <-> $1 < $2` 这种非法 SQL。
+	hasWhere := false
 	if w := whereSQL(q.groups, d, add); w != "" {
 		sql += " WHERE " + w
+		hasWhere = true
 	}
 
 	if q.hasVector && q.vecFilterOn {
 		clause := fmt.Sprintf("%s < %s", d.VectorDistance(q.vecCol, d.Placeholder(vecPH()), q.vectorMetric), d.Placeholder(add(q.vecFilter)))
-		if len(q.groups) > 0 {
+		if hasWhere {
 			sql += " AND " + clause
 		} else {
 			sql += " WHERE " + clause
@@ -906,15 +971,23 @@ func (q *Query[T]) Build() (string, []any) {
 	//     "LIMIT must not be negative"，见 nodeLimit.c recompute_limits），故不补
 	// 未知方言按 SQLite 兜底（与 migrate.go 的 dialectKind 策略一致）。
 	// Limit(0) 不会被当作「取 0 行」，未设 Limit/Offset 时仍不生成 LIMIT。
-	if q.limit > 0 {
-		sql += fmt.Sprintf(" LIMIT %d", q.limit)
+	//
+	// LIMIT 取「分页 limit」与「近邻 k（vecK）」中更严格的那个：k 是 Nearest 的
+	// 召回上限，独立于分页存在（Page / Offset 只改写 limit），两者并存时谁小听谁的。
+	lim := q.limit
+	if q.vecK > 0 && (lim <= 0 || q.vecK < lim) {
+		lim = q.vecK
+	}
+	if lim > 0 {
+		sql += fmt.Sprintf(" LIMIT %d", lim)
 	} else if q.offset > 0 {
-		// 同时覆盖值/指针两种持有方式，避免直传 `*mysqlDialect` 这类指针时漏判。
-		switch d.(type) {
-		case mysqlDialect, *mysqlDialect:
+		// 按方言种类决定补什么（与 migrate.go 的 dialectKind 同一口径）：
+		// 自定义方言只要实现 DialectKinder 就能被正确分类，不再一律落到 default。
+		switch dialectKind(d) {
+		case "mysql":
 			sql += " LIMIT 18446744073709551615"
-		case postgresDialect, *postgresDialect:
-			// PG 原生支持独立 OFFSET，无需补 LIMIT
+		case "postgres":
+			// PG 原生支持独立 OFFSET，且拒绝负数 LIMIT，无需补
 		default:
 			sql += " LIMIT -1"
 		}
@@ -959,8 +1032,8 @@ func (q *Query[T]) fromClause(d Dialect) string {
 
 // countBuild 生成「统计行数」用的 SQL 与参数（Count / Exists / Page 的 total）。
 //
-// 不带 DISTINCT / GROUP BY 时走 COUNT(*) 快速路径；两者任一出现，就必须把原查询
-// 整体包进子查询再数外层行数。
+// 四种情形之外走 COUNT(*) 快速路径；任一命中，就把原查询整体包进子查询再数外层行数
+// （详见函数体里的注释）。
 //
 // 后者修的是一个真实的错算：此前 Count 把 distinct / groupBy / havings 一律清掉，
 // 于是
@@ -969,18 +1042,39 @@ func (q *Query[T]) fromClause(d Dialect) string {
 //	· GroupBy(...) 的查询：列表返回的是分组数，总数却是**全表行数**（差若干个数量级）。
 //
 // 两者都直接落在 Page 的 Total 上 —— 分页器显示的页数与列表能对上的行数不符，
-// 且全程不报错。（havings 必须保留，否则 GROUP BY + HAVING 的过滤结果没被数进去。
-// orders / limit / offset / forUpdate 则相反：它们在 COUNT 里无意义，
-// 部分方言还会直接拒绝出现在子查询里。）
+// 且全程不报错。
+//
+// 近邻检索（Nearest 的 k）是同一个回路上的第五个错算：k 此前存在 limit 里，
+// 被这里一并清掉，于是「邻域内有多少条」被算成全表行数（真库用例只插 3 行、
+// k 恰好也是 3，全表计数与近邻计数相等，所以测不出来）。
+//
+// orders / limit / offset / forUpdate 相反：它们在 COUNT 里无意义，
+// 部分方言还会直接拒绝出现在子查询里。
 func (q *Query[T]) countBuild() (string, []any) {
 	c := *q
 	c.aggFn, c.aggCol = "", ""
 	c.noVecCol = true // COUNT 结果只有一列，别追加向量距离列
+	// 清掉的是**调用方的分页**：总数不该被第几页截断。
+	// vecK（Nearest 的 k）必须留下 —— 它是查询语义的一部分（只召回最近的 k 条），
+	// 清掉之后近邻查询的 Total 会变成全表行数，Page 的页数与列表能对上的行数不符。
 	c.limit, c.offset = 0, 0
 	c.orders, c.forUpdate, c.last = nil, false, ""
-	if !c.distinct && len(c.groupBy) == 0 {
+	// 走子查询的四种情形：
+	//   · Distinct：COUNT(*) 不去重，必须包一层让去重真实发生；
+	//   · GroupBy：列表返回的是分组数，总数也必须是分组数；
+	//   · havings：快速路径是单行 COUNT(*)，HAVING 挂在它上面既丢过滤
+	//     （返回 1 或 0 行，总数失真）又会在无 GROUP BY 时产出含义不明的 SQL；
+	//   · vecK：LIMIT 对单行 COUNT(*) 无效，必须放子查询里才能截断。
+	needSub := c.distinct || len(c.groupBy) > 0 || len(c.havings) > 0 || c.vecK > 0
+	if !needSub {
 		c.aggFn = "COUNT"
 		return c.Build()
+	}
+	// 带 GROUP BY / HAVING 时内层投影必须是常量：SELECT * 与 GROUP BY 在 PG /
+	// MySQL(ONLY_FULL_GROUP_BY) 下是非法组合。只 DISTINCT / 只有 vecK 时相反 ——
+	// 去重与近邻都依赖投影列本身，投影必须保持原样。
+	if len(c.groupBy) > 0 || len(c.havings) > 0 {
+		c.selOne = true
 	}
 	inner, args := c.Build()
 	// 派生表必须有别名：MySQL 强制要求，PG 同样不允许无名子查询。
@@ -989,6 +1083,8 @@ func (q *Query[T]) countBuild() (string, []any) {
 
 // agg 返回一个「投影被替换成聚合函数」的新查询（原查询不被修改）。
 // LIMIT / OFFSET 在聚合场景下会改变语义（只取部分行再聚合），故一并清空。
+// vecK（Nearest 的 k）同样是「先截行再聚合」，按同一口径清空；
+// 唯一例外是 Count —— 它走 countBuild，k 参与计数（邻域内有多少条）。
 func (q *Query[T]) agg(fn, col string) *Query[T] {
 	c := *q
 	c.aggFn = fn
@@ -996,6 +1092,7 @@ func (q *Query[T]) agg(fn, col string) *Query[T] {
 	c.noVecCol = true
 	c.limit = 0
 	c.offset = 0
+	c.vecK = 0
 	return &c
 }
 

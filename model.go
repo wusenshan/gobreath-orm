@@ -47,7 +47,11 @@ type modelMeta struct {
 	logicCol      *fieldInfo // 逻辑删除列（db tag 含 ",logic" 时非空）
 	logicIsTime   bool       // true 表示逻辑列是 time.Time/*time.Time，未删除判定为 IS NULL；否则 = 0
 	versionCol    *fieldInfo // 乐观锁版本列（db tag 含 ",version" 时非空）
-	tagChecked    bool       // 是否已在 StrictTagCheck 模式下校验过 tag 格式（避免重复校验）
+	// 是否已在 StrictTagCheck 模式下校验过 tag 格式（避免重复校验）。
+	// 用 atomic 而不是 bool：多个 goroutine 首次取同一个模型时会并发读写它
+	// （metaCache 只保证 map 本身安全，被取出的是同一个 *modelMeta），
+	// 普通 bool 的并发读写是数据竞态（-race 可复现）。
+	tagChecked atomic.Bool
 
 	// 行映射计划缓存（按结果集列签名索引）。惰性初始化，首次查询时填充。
 	scanMu        sync.RWMutex
@@ -83,13 +87,13 @@ func getMetaByType(typ reflect.Type) *modelMeta {
 	if v, ok := metaCache.Load(typ); ok {
 		m := v.(*modelMeta)
 		// 严格模式开启后，若此前以非严格模式缓存过（未校验），补校验一次。
-		if strictTagCheck.Load() && !m.tagChecked {
+		if strictTagCheck.Load() && !m.tagChecked.Load() {
 			for _, f := range m.fields {
 				if f.rawTag != "" {
 					validateDbTag(f.rawTag, typ.Name(), f.goName)
 				}
 			}
-			m.tagChecked = true
+			m.tagChecked.Store(true)
 		}
 		return m
 	}
@@ -165,7 +169,7 @@ func parseMeta(typ reflect.Type) *modelMeta {
 	if versionIdx >= 0 {
 		m.versionCol = &m.fields[versionIdx]
 	}
-	m.tagChecked = strictTagCheck.Load()
+	m.tagChecked.Store(strictTagCheck.Load())
 	return m
 }
 
@@ -819,15 +823,55 @@ func assignInt(target reflect.Value, val any) error {
 	case float64:
 		target.SetInt(int64(v))
 	case []byte:
-		n, _ := strconv.ParseInt(string(v), 10, 64)
+		n, err := parseIntLike(string(v), target.Type())
+		if err != nil {
+			return err
+		}
 		target.SetInt(n)
 	case string:
-		n, _ := strconv.ParseInt(v, 10, 64)
+		n, err := parseIntLike(v, target.Type())
+		if err != nil {
+			return err
+		}
 		target.SetInt(n)
 	default:
 		return fmt.Errorf("orm: 无法把 %T 赋给 int 字段", val)
 	}
 	return nil
+}
+
+// parseIntLike 把数据库交回的文本 / 字节形式解析成整数。
+//
+// 此前 strconv 的错误被一律丢弃（`n, _ := strconv.ParseInt(...)`），于是
+// PostgreSQL NUMERIC(10,2) / MySQL DECIMAL 返回 "9.50" 映射到整型字段时，
+// 字段被**静默置 0** —— 不报错、不告警，读出来的数全是 0，排查时只会怀疑数据。
+//
+// 先按整型解析；失败再按浮点解析，且只接受「数值恰好是整数」的情形（"9.00" → 9，
+// lib/pq 把 numeric 交回 []byte 时很常见）。真正带小数的值说明列类型与字段类型
+// 不匹配（小数列映射到 int 字段），报错而不是截断 —— 截断同样是静默做错事。
+func parseIntLike(s string, target reflect.Type) (int64, error) {
+	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return n, nil
+	}
+	if f, err := strconv.ParseFloat(s, 64); err == nil && !math.IsInf(f, 0) && f == math.Trunc(f) {
+		return int64(f), nil
+	}
+	return 0, fmt.Errorf("orm: 数据库返回的 %q 无法赋给整型字段（%s）：既不是整数文本，也不是整数值的数值。"+
+		"常见原因是 NUMERIC / DECIMAL 这类小数列映射到了整型字段 —— 请把字段类型改成 float64 / string，"+
+		"或在 SQL 里显式取整", s, target)
+}
+
+// parseUintLike 同 parseIntLike 的无符号版本（负值同样是类型不匹配，一并报错）。
+func parseUintLike(s string, target reflect.Type) (uint64, error) {
+	if n, err := strconv.ParseUint(s, 10, 64); err == nil {
+		return n, nil
+	}
+	if f, err := strconv.ParseFloat(s, 64); err == nil && !math.IsInf(f, 0) && f == math.Trunc(f) && f >= 0 {
+		return uint64(f), nil
+	}
+	return 0, fmt.Errorf("orm: 数据库返回的 %q 无法赋给无符号整型字段（%s）：既不是非负整数文本，"+
+		"也不是整数值的数值。常见原因是 NUMERIC / DECIMAL 这类小数列映射到了整型字段 —— "+
+		"请把字段类型改成 float64 / string，或在 SQL 里显式取整", s, target)
 }
 
 func assignUint(target reflect.Value, val any) error {
@@ -839,10 +883,16 @@ func assignUint(target reflect.Value, val any) error {
 	case float64:
 		target.SetUint(uint64(v))
 	case []byte:
-		n, _ := strconv.ParseUint(string(v), 10, 64)
+		n, err := parseUintLike(string(v), target.Type())
+		if err != nil {
+			return err
+		}
 		target.SetUint(n)
 	case string:
-		n, _ := strconv.ParseUint(v, 10, 64)
+		n, err := parseUintLike(v, target.Type())
+		if err != nil {
+			return err
+		}
 		target.SetUint(n)
 	default:
 		return fmt.Errorf("orm: 无法把 %T 赋给 uint 字段", val)
@@ -857,10 +907,18 @@ func assignFloat(target reflect.Value, val any) error {
 	case int64:
 		target.SetFloat(float64(v))
 	case []byte:
-		f, _ := strconv.ParseFloat(string(v), 64)
+		f, err := strconv.ParseFloat(string(v), 64)
+		if err != nil {
+			// 与整型同口径：解析失败不能静默置 0（"¥1,234" 这类带符号的文本、
+			// 或列类型与字段类型不匹配时，读出来全是 0 且不报错，最难排查）。
+			return fmt.Errorf("orm: 数据库返回的 %q 无法赋给浮点字段（%s）：%v", string(v), target.Type(), err)
+		}
 		target.SetFloat(f)
 	case string:
-		f, _ := strconv.ParseFloat(v, 64)
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return fmt.Errorf("orm: 数据库返回的 %q 无法赋给浮点字段（%s）：%v", v, target.Type(), err)
+		}
 		target.SetFloat(f)
 	default:
 		return fmt.Errorf("orm: 无法把 %T 赋给 float 字段", val)

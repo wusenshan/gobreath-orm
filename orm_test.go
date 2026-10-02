@@ -99,22 +99,58 @@ var mockRegistry = map[string]*mockRows{}
 // 工厂先于 registry 匹配，现有用例不受影响。
 var mockFactories = map[string]func() driver.Rows{}
 
+// mockRowsFor 按「子串命中」把查询路由到注册的假结果集。
+//
+// 命中规则刻意做成**确定性**的：候选键里最长的优先，等长再比字典序。
+// 原因是 mockRegistry / mockFactories 是包级 map，而 `range` 的遍历顺序随机，
+// 一旦两个键同时命中同一句 SQL，返回哪份结果就变成掷硬币 ——
+// 典型是 raw_test.go 遗留的 "COUNT(*)" 与分组用例的 "GROUP BY" 同时命中
+// `SELECT COUNT(*) FROM (SELECT ... GROUP BY ...) "_t"`，前者只有 1 列，
+// 会让列表扫描报 `expected 2 destination arguments in Scan, not 1`。
+// 最长键优先同时符合直觉：注册得越具体的键越应该赢。
 func mockRowsFor(query string) driver.Rows {
 	// PostgreSQL 自增主键回填走 INSERT ... RETURNING "id"，优先匹配并返回单行单列 id。
 	if strings.Contains(strings.ToUpper(query), "RETURNING") {
 		return &mockRows{cols: []string{"id"}, data: [][]driver.Value{{driver.Value(int64(1))}}}
 	}
-	for k, f := range mockFactories {
-		if strings.Contains(query, k) {
-			return f()
-		}
+	if f, ok := longestMatch(query, mockFactories); ok {
+		return f()
 	}
-	for k, v := range mockRegistry {
-		if strings.Contains(query, k) {
-			return v
-		}
+	if v, ok := longestMatch2(query, mockRegistry); ok {
+		return v
 	}
 	return &mockRows{}
+}
+
+// longestMatch 在 map 里挑出「是 query 子串且最长」的键，返回其取值；
+// 无命中返回 false。等长时按字典序取小的，保证结果与 map 遍历顺序无关。
+func longestMatch(query string, m map[string]func() driver.Rows) (func() driver.Rows, bool) {
+	var bestKey string
+	var best func() driver.Rows
+	for k, v := range m {
+		if !strings.Contains(query, k) {
+			continue
+		}
+		if best == nil || len(k) > len(bestKey) || (len(k) == len(bestKey) && k < bestKey) {
+			bestKey, best = k, v
+		}
+	}
+	return best, best != nil
+}
+
+// longestMatch2 是 longestMatch 的「值不是工厂函数」版本（mockRegistry 存的是结果集实例）。
+func longestMatch2(query string, m map[string]*mockRows) (*mockRows, bool) {
+	var bestKey string
+	var best *mockRows
+	for k, v := range m {
+		if !strings.Contains(query, k) {
+			continue
+		}
+		if best == nil || len(k) > len(bestKey) || (len(k) == len(bestKey) && k < bestKey) {
+			bestKey, best = k, v
+		}
+	}
+	return best, best != nil
 }
 
 func newMockDB(t *testing.T) *DB {

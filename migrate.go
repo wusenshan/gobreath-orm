@@ -116,15 +116,31 @@ func isDuplicateIndexErr(err error) bool {
 	return strings.Contains(s, "duplicate key name") || strings.Contains(s, "already exists")
 }
 
-// dialectKind 返回方言种类字符串（用于列类型映射的类型 switch）。
-// 不扩展 Dialect 接口，确保自定义方言无需实现迁移相关方法，保持向后兼容。
+// DialectKinder 是可选接口：方言可以实现它来声明自己属于哪一类
+// （"postgres" / "mysql" / "sqlite"），供迁移 DDL 与分页等按类分支的逻辑使用。
+//
+// 为什么需要它：内置三方言之外的类型以前一律按 "sqlite" 兜底，于是
+// 「包装内置方言」（`type my struct{ orm.Dialect }`）或自定义方言会拿到
+// `INTEGER PRIMARY KEY AUTOINCREMENT` / `DATETIME`（PG 不认）以及
+// `CREATE INDEX IF NOT EXISTS`（MySQL 1064）—— 真库上直接语法错误。
+// 实现本接口即可得到正确分类；不实现则维持原有的 SQLite 兜底行为（向后兼容）。
+type DialectKinder interface{ DialectKind() string }
+
+// dialectKind 返回方言种类字符串（用于列类型映射与分页等按类分支的逻辑）。
+// 优先取方言自报的 DialectKinder；内置方言直接判具体类型（含指针形态，
+// 避免 `&mysqlDialect{}` 这类直传漏判）；两者都不是则按 SQLite 兜底。
 func dialectKind(d Dialect) string {
+	if k, ok := d.(DialectKinder); ok {
+		if s := strings.ToLower(strings.TrimSpace(k.DialectKind())); s != "" {
+			return s
+		}
+	}
 	switch d.(type) {
-	case postgresDialect:
+	case postgresDialect, *postgresDialect:
 		return "postgres"
-	case mysqlDialect:
+	case mysqlDialect, *mysqlDialect:
 		return "mysql"
-	case sqliteDialect:
+	case sqliteDialect, *sqliteDialect:
 		return "sqlite"
 	default:
 		return "sqlite" // 未知方言按 SQLite 的宽松类型兜底，避免迁移直接失败

@@ -252,8 +252,10 @@ func (r *readWriteRouter) choose(query string) Executor {
 		return r.replicas[0]
 	}
 	r.mu.Lock()
-	r.index = (r.index + 1) % len(r.replicas)
+	// 先取后加：先自增的话第一次读请求会落到 replicas[1]，replicas[0] 被跳过
+	// （多副本时第一个副本要等到第二轮才被用到）。
 	next := r.replicas[r.index]
+	r.index = (r.index + 1) % len(r.replicas)
 	r.mu.Unlock()
 	return next
 }

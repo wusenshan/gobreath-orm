@@ -220,10 +220,15 @@ func TestVectorArgsMatchPlaceholders(t *testing.T) {
 				_, err := Count(ctx, db, q)
 				return err
 			}),
-			want: 0,
+			// k 现在参与计数（邻域内有多少条），所以子查询里必须有按距离排序与 LIMIT k，
+			// 向量参数随之存在 —— 与「占位符个数 == 参数个数」这条主断言一致。
+			want: 1,
 			checkSQL: func(t *testing.T, s string) {
-				if strings.Contains(s, "ORDER BY") || strings.Contains(s, "LIMIT") {
-					t.Fatalf("聚合查询不该带 ORDER BY / LIMIT: %s", s)
+				if !strings.Contains(s, "LIMIT 5") {
+					t.Fatalf("近邻查询的 Count 必须保留 k（LIMIT 5），否则总数会变成全表行数: %s", s)
+				}
+				if strings.Contains(s, "AS dist") {
+					t.Fatalf("计数查询不该追加距离列: %s", s)
 				}
 			},
 		},
@@ -235,7 +240,7 @@ func TestVectorArgsMatchPlaceholders(t *testing.T) {
 				_, err := Exists(ctx, db, q)
 				return err
 			}),
-			want: 0,
+			want: 1,
 		},
 		{
 			name:  "PG Nearest+Sum",
@@ -269,15 +274,15 @@ func TestVectorArgsMatchPlaceholders(t *testing.T) {
 				_, err := Count(ctx, db, q)
 				return err
 			}),
-			want: 1,
+			want: 2,
 			checkSQL: func(t *testing.T, s string) {
 				if !strings.Contains(s, `"title" = $1`) {
-					t.Fatalf("WHERE 的值应占据 $1（向量参数已不存在）: %s", s)
+					t.Fatalf("WHERE 的值应占据 $1（不能被向量参数顶到 $2）: %s", s)
 				}
 			},
 			checkArg: func(t *testing.T, args []any) {
-				if len(args) != 1 || args[0] != "go" {
-					t.Fatalf("参数应只剩 WHERE 的值 [go]，实际 %v", args)
+				if len(args) != 2 || args[0] != "go" || args[1] != vecStr {
+					t.Fatalf("参数应为 [go 向量]，实际 %v", args)
 				}
 			},
 		},
@@ -408,7 +413,7 @@ func TestVectorArgsMatchPlaceholders(t *testing.T) {
 				_, err := Count(ctx, db, q)
 				return err
 			}),
-			want: 0,
+			want: 1, // 子查询里的按距离排序要一个 ?（位置型，不复用）
 		},
 		{
 			name: "MySQL Nearest+WithinDistance+Count+Where",
@@ -421,7 +426,7 @@ func TestVectorArgsMatchPlaceholders(t *testing.T) {
 				_, err := Count(ctx, db, q)
 				return err
 			}),
-			want: 3,
+			want: 4, // WHERE 值 + 阈值过滤的向量 + 阈值 + 排序的向量
 		},
 		{
 			name:  "MySQL 普通 Nearest 查询",
@@ -476,7 +481,7 @@ func TestVectorArgsMatchPlaceholders(t *testing.T) {
 				_, err := Count(ctx, db, q)
 				return err
 			}),
-			want: 0,
+			want: 1,
 		},
 	}
 

@@ -250,6 +250,10 @@ func Insert[T any](ctx context.Context, db *DB, entity *T, opts ...WriteOption) 
 }
 
 // BatchInsert 批量插入切片实体。
+//
+// 行数 × 列数超过方言的参数上限时会自动分批执行（每批一条 INSERT）。
+// 分批只在单条语句层面保证原子性，**跨批不保证**：需要「要么全成功要么全不写入」
+// 时请自己开事务（db.Transaction）—— 在事务里调用，多批就都在同一事务内。
 func BatchInsert[T any](ctx context.Context, db *DB, entities []T, opts ...WriteOption) error {
 	n := len(entities)
 	if n == 0 {
@@ -271,32 +275,72 @@ func BatchInsert[T any](ctx context.Context, db *DB, entities []T, opts ...Write
 	if len(cols) == 0 {
 		return fmt.Errorf("orm: %s 无可写字段%s", meta.table, emptyColsHint(cfg))
 	}
-	phIdx := 0
-	nextPh := func() string { phIdx++; return db.dialect.Placeholder(phIdx) }
-
-	args := make([]any, 0, n*len(cols))
-	valueRows := make([]string, 0, n)
-	for i := 0; i < n; i++ {
-		ev := reflect.ValueOf(&entities[i]).Elem()
-		phs := make([]string, 0, len(cols))
-		for _, c := range cols {
-			v, err := argFor(meta, ev, c)
-			if err != nil {
-				return err
+	buildBatch := func(start, end int) (string, []any, error) {
+		phIdx := 0
+		nextPh := func() string { phIdx++; return db.dialect.Placeholder(phIdx) }
+		args := make([]any, 0, (end-start)*len(cols))
+		valueRows := make([]string, 0, end-start)
+		for i := start; i < end; i++ {
+			ev := reflect.ValueOf(&entities[i]).Elem()
+			phs := make([]string, 0, len(cols))
+			for _, c := range cols {
+				v, err := argFor(meta, ev, c)
+				if err != nil {
+					return "", nil, err
+				}
+				args = append(args, v)
+				ph := nextPh()
+				if fi := fieldInfoForCol(meta, c); fi != nil && fi.vector {
+					ph = db.dialect.VectorBind(ph)
+				}
+				phs = append(phs, ph)
 			}
-			args = append(args, v)
-			ph := nextPh()
-			if fi := fieldInfoForCol(meta, c); fi != nil && fi.vector {
-				ph = db.dialect.VectorBind(ph)
-			}
-			phs = append(phs, ph)
+			valueRows = append(valueRows, "("+strings.Join(phs, ", ")+")")
 		}
-		valueRows = append(valueRows, "("+strings.Join(phs, ", ")+")")
+		sqlStr := fmt.Sprintf("INSERT INTO %s (%s) VALUES %s",
+			quoteTable(meta.finalTable(db.prefix), db.dialect), quoteCols(cols, db.dialect), strings.Join(valueRows, ", "))
+		return sqlStr, args, nil
 	}
-	sqlStr := fmt.Sprintf("INSERT INTO %s (%s) VALUES %s",
-		quoteTable(meta.finalTable(db.prefix), db.dialect), quoteCols(cols, db.dialect), strings.Join(valueRows, ", "))
-	_, err := db.execContext(ctx, sqlStr, args...)
-	return err
+	// 一条语句塞下全部行会撞方言的参数上限（SQLite 32766 变量 / PG·MySQL 65535），
+	// 行数一多就是一条硬报错（too many SQL variables 等）。按列数自动分批。
+	per := batchRowsPerStmt(db.dialect, len(cols))
+	for start := 0; start < n; start += per {
+		end := start + per
+		if end > n {
+			end = n
+		}
+		sqlStr, args, err := buildBatch(start, end)
+		if err != nil {
+			return err
+		}
+		if _, err := db.execContext(ctx, sqlStr, args...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// batchRowsPerStmt 按「方言参数上限 ÷ 每行列数」算出单条语句最多能带多少行
+// （少于 1 行时按 1 行一批，保证至少能推进）。
+//
+// 上限是三方实测值（见 integration 的批量用例）：SQLite 32766 个变量、
+// PostgreSQL 65535 个参数、MySQL 65535 个占位符。留 8 个余量，避免与驱动
+// 自己追加的参数相撞。SQL 文本长度（MySQL 的 max_allowed_packet）不在考虑范围内 ——
+// 那取决于每行数据的大小，只能由调用方按 chunk 控制。
+func batchRowsPerStmt(d Dialect, cols int) int {
+	if cols <= 0 {
+		return 1
+	}
+	limit := 32766
+	switch dialectKind(d) {
+	case "postgres", "mysql":
+		limit = 65535
+	}
+	n := (limit - 8) / cols
+	if n < 1 {
+		n = 1
+	}
+	return n
 }
 
 // bindVal 返回部分更新 / map 更新时字段应绑定的参数值；向量列序列化为文本 [..]。
@@ -491,6 +535,7 @@ func upsertBatchConflictCols(meta *modelMeta, ents reflect.Value, cols, conflict
 }
 
 // BatchUpsert 批量 upsert 切片实体，复用 Upsert 的冲突键与方言策略（多行 VALUES）。
+// 与 BatchInsert 一样按方言参数上限自动分批，跨批不保证原子性（需要原子性请自己开事务）。
 func BatchUpsert[T any](ctx context.Context, db *DB, entities []T, conflictCols []string, opts ...WriteOption) error {
 	n := len(entities)
 	if n == 0 {
@@ -531,34 +576,52 @@ func BatchUpsert[T any](ctx context.Context, db *DB, entities []T, conflictCols 
 			updateCols = append(updateCols, c)
 		}
 	}
-	phIdx := 0
-	nextPh := func() string { phIdx++; return db.dialect.Placeholder(phIdx) }
-	args := make([]any, 0, n*len(cols))
-	valueRows := make([]string, 0, n)
-	for i := 0; i < n; i++ {
-		ev := reflect.ValueOf(&entities[i]).Elem()
-		phs := make([]string, 0, len(cols))
-		for _, c := range cols {
-			v, err := argFor(meta, ev, c)
-			if err != nil {
-				return err
+	buildBatch := func(start, end int) (string, []any, error) {
+		phIdx := 0
+		nextPh := func() string { phIdx++; return db.dialect.Placeholder(phIdx) }
+		args := make([]any, 0, (end-start)*len(cols))
+		valueRows := make([]string, 0, end-start)
+		for i := start; i < end; i++ {
+			ev := reflect.ValueOf(&entities[i]).Elem()
+			phs := make([]string, 0, len(cols))
+			for _, c := range cols {
+				v, err := argFor(meta, ev, c)
+				if err != nil {
+					return "", nil, err
+				}
+				args = append(args, v)
+				ph := nextPh()
+				if fi := fieldInfoForCol(meta, c); fi != nil && fi.vector {
+					ph = db.dialect.VectorBind(ph)
+				}
+				phs = append(phs, ph)
 			}
-			args = append(args, v)
-			ph := nextPh()
-			if fi := fieldInfoForCol(meta, c); fi != nil && fi.vector {
-				ph = db.dialect.VectorBind(ph)
-			}
-			phs = append(phs, ph)
+			valueRows = append(valueRows, "("+strings.Join(phs, ", ")+")")
 		}
-		valueRows = append(valueRows, "("+strings.Join(phs, ", ")+")")
+		sqlStr := fmt.Sprintf("INSERT INTO %s (%s) VALUES %s %s",
+			quoteTable(meta.finalTable(db.prefix), db.dialect), quoteCols(cols, db.dialect),
+			strings.Join(valueRows, ", "), db.dialect.UpsertSuffix(cc, updateCols))
+		return sqlStr, args, nil
 	}
-	sqlStr := fmt.Sprintf("INSERT INTO %s (%s) VALUES %s %s",
-		quoteTable(meta.finalTable(db.prefix), db.dialect), quoteCols(cols, db.dialect),
-		strings.Join(valueRows, ", "), db.dialect.UpsertSuffix(cc, updateCols))
 	// 批量不回填自增主键：多行 RETURNING 的返回顺序与行序、以及 MySQL 的
 	// LAST_INSERT_ID + auto_increment_increment 都依赖较多前提，与 BatchInsert 保持一致。
-	_, err = db.execContext(ctx, sqlStr, args...)
-	return err
+	//
+	// 与 BatchInsert 同口径按参数上限分批（见 batchRowsPerStmt）。
+	per := batchRowsPerStmt(db.dialect, len(cols))
+	for start := 0; start < n; start += per {
+		end := start + per
+		if end > n {
+			end = n
+		}
+		sqlStr, args, err := buildBatch(start, end)
+		if err != nil {
+			return err
+		}
+		if _, err := db.execContext(ctx, sqlStr, args...); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ---- 查询 ----
@@ -806,6 +869,42 @@ func UpdateById[T any](ctx context.Context, db *DB, entity *T, opts ...WriteOpti
 		if n, e := res.RowsAffected(); e == nil && n == 0 {
 			return ErrOptimisticLock
 		}
+		// 回写自增后的版本号：库里已经是 version+1，实体却还停在旧值 ——
+		// 同一个实体连续两次 UpdateById，第二次会拿旧版本去比对，于是收到
+		// 一个根本没有并发写者的 ErrOptimisticLock（假冲突）。
+		// 自增主键就是回填的（见 Insert），版本没有理由例外。
+		if err := bumpVersionField(ev, vi); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// bumpVersionField 把实体的乐观锁版本字段 +1，与 SQL 里的 "version = version + 1" 对齐。
+//
+// 版本列必须是整型：`version + 1` 在 PostgreSQL 上对 text 列直接报错，但 MySQL 会
+// 静默把字符串转成 0 再 +1（版本从 "abc" 变成 1，冲突检测形同虚设），
+// 所以这里不猜语义、直接报错（调用方换成整型字段即可）。
+func bumpVersionField(ev reflect.Value, vi *fieldInfo) error {
+	f := ev.FieldByIndex(vi.idx)
+	if !f.IsValid() {
+		return nil
+	}
+	if f.Kind() == reflect.Ptr {
+		if f.IsNil() {
+			return fmt.Errorf("orm: 乐观锁版本列 %q 的字段是指针且为 nil，无法自增（请先赋值，或改用整型值字段）", vi.colName)
+		}
+		f = f.Elem()
+	}
+	switch f.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		f.SetInt(f.Int() + 1)
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		f.SetUint(f.Uint() + 1)
+	default:
+		return fmt.Errorf("orm: 乐观锁版本列 %q 的字段类型是 %s，无法自增：必须是整型（int / int64 / uint 等）。"+
+			"非整型版本列在 MySQL 上会被静默转成 0 再 +1，冲突检测形同虚设（PG 则直接报错），"+
+			"故在这里显式失败而不是继续写入", vi.colName, f.Type())
 	}
 	return nil
 }
@@ -831,9 +930,17 @@ func Update[T any](ctx context.Context, db *DB, q *Query[T], entity *T, opts ...
 	}
 	phIdx := 0
 	nextPh := func() string { phIdx++; return db.dialect.Placeholder(phIdx) }
+	// 版本列不按实体值赋值：Update 是**按条件批量**更新，把实体的版本号原样写回
+	// 所有匹配行，等于把一批行的版本统一改成调用方手里的那个值（既丢自增、
+	// 又可能把别人的版本改小）。这里与 UpdateById 同口径 —— SET version = version + 1，
+	// 由数据库按各行当前值自增。（批量更新的是多行，实体上回填版本号没有意义。）
+	vi := resolveVersion(meta, db)
 	setParts := make([]string, 0, len(cols))
 	args := make([]any, 0, len(cols))
 	for _, c := range cols {
+		if vi != nil && c == vi.colName {
+			continue
+		}
 		v, err := argFor(meta, ev, c)
 		if err != nil {
 			return err
@@ -844,6 +951,10 @@ func Update[T any](ctx context.Context, db *DB, q *Query[T], entity *T, opts ...
 			ph = db.dialect.VectorBind(ph)
 		}
 		setParts = append(setParts, fmt.Sprintf("%s = %s", db.dialect.QuoteIdent(c), ph))
+	}
+	if vi != nil {
+		setParts = append(setParts, fmt.Sprintf("%s = %s + 1",
+			db.dialect.QuoteIdent(vi.colName), db.dialect.QuoteIdent(vi.colName)))
 	}
 	idx := phIdx
 	add := func(v any) int { idx++; args = append(args, v); return idx }
@@ -966,7 +1077,8 @@ func queryTable[T any](q *Query[T], meta *modelMeta, db *DB) string {
 // UpdateByIdSets 按主键更新 sets 中的字段（map 形式的部分更新）。
 // 自动跳过已逻辑删除的行（Unscoped 例外）。若 sets 含乐观锁版本列，则
 // 自动追加 "WHERE version = ?" 并 "SET version = version + 1"，受影响行数为 0
-// 时返回 ErrOptimisticLock。field 名必须是模型中的真实列名，否则报错。返回受影响行数。
+// 时返回 ErrOptimisticLock；**sets 不含版本列时不碰版本列**（不判冲突、也不自增）。
+// field 名必须是模型中的真实列名，否则报错。返回受影响行数。
 func UpdateByIdSets[T any](ctx context.Context, db *DB, id any, sets map[string]any) (int64, error) {
 	meta := getMeta[T]()
 	if meta.pk == nil {
@@ -1005,7 +1117,12 @@ func UpdateByIdSets[T any](ctx context.Context, db *DB, id any, sets map[string]
 		}
 		setParts = append(setParts, fmt.Sprintf("%s = %s", d.QuoteIdent(col), ph))
 	}
-	if vi != nil {
+	if hasVersion {
+		// 只在 sets 真的带了版本值（即走上乐观锁语义）时才自增。
+		// 此前判的是 vi != nil：sets 未带版本列时 hasVersion 已被置 false，
+		// 这里却仍然 `SET version = version + 1` 且**不加** `WHERE version = ?`，
+		// 于是每次 map 更新都静默抬版本 —— 其它会话拿着刚读到的版本再写
+		// 会收到假的 ErrOptimisticLock（并没有并发写者）。
 		setParts = append(setParts, fmt.Sprintf("%s = %s + 1", d.QuoteIdent(vi.colName), d.QuoteIdent(vi.colName)))
 	}
 	args = append(args, id)

@@ -337,6 +337,11 @@ if err := orm.BatchInsert(ctx, db, users); err != nil {
 }
 ```
 
+> **大批次会自动分片**：`BatchInsert` / `BatchUpsert` 按「方言参数上限 ÷ 每行列数」把实体切成多批，
+> 每批一条 `INSERT`（SQLite 32766 个变量、PG / MySQL 65535 个参数 —— 不分片的话几万行就是一条
+> `too many SQL variables` / `Error 1390` 硬报错）。分片只保证**单条语句**的原子性，**跨批不保证**：
+> 需要「要么全成功要么全不写入」请自己开事务（在 `db.Transaction` 里调用，多批就都在同一事务内）。
+
 ### 按主键查询（SelectById）
 
 ```go
@@ -358,6 +363,10 @@ list, err := orm.SelectList(ctx, db,
         Offset(0),
 )
 ```
+
+> `Limit` / `Offset` **不接受负数**：负 `LIMIT` 在各家数据库里语义恰好相反（PG / MySQL 直接报错，
+> SQLite 解释为「无上限」），而框架此前会静默地不生成子句 —— `Limit(-1)` 看起来设了限制，实际返回全表。
+> 需要「不限制行数」请不要调用 `Limit`。
 
 ### 查首条（SelectOne）
 
@@ -942,6 +951,11 @@ list, err := orm.SelectList(ctx, db,
 )
 ```
 
+> `Json` 的 op 只接受白名单：`= != <> > >= < <= LIKE NOT LIKE IN NOT IN`。op 是**原样拼进 SQL** 的
+> （列名/路径能参数化，运算符不能），所以框架不接受任意片段 —— 运算符来自配置或用户输入时，
+> 请在调用方先映射到白名单里的值。`Having`（含 `HavingCount` / `HavingSum` …）同理，
+> 只是它不支持 `IN` / `NOT IN`（左侧是聚合表达式，只做二元比较）。
+
 ### 包含查询（最常用）
 
 ```go
@@ -1141,6 +1155,15 @@ q := orm.NewQuery[Doc]().Nearest(embCol, vec, 10).WithinDistance(embCol, vec, 0.
 > **注意**：`Nearest` / `WithinDistance` 不指定度量时沿用旧版默认 `L2`；做语义检索请显式 `NearestBy(..., orm.Cosine)`。
 > SQLite 无原生向量类型，仅能生成语法（用于离线拼 SQL），真正检索请换 PG / MySQL。
 
+**k 与分页的关系**：k 是**召回上限**，与 `Limit` / `Page` 的页大小是两回事 —— 两者并存时取更严格的那个
+（`Nearest(col, vec, 3)` + `Page(..., size = 10)` 只返回 3 行）。`Count` / `Page` 的 `Total` 同样是
+「邻域内有多少条」（`min(k, 匹配行数)`），而不是全表行数：
+
+```go
+q := orm.NewQuery[Doc]().NearestBy(embCol, vec, 5, orm.Cosine)
+total, _ := orm.Count(ctx, db, q) // 最多 5，不会是表里的总行数
+```
+
 **完整可运行示例**：见 [`examples/vector-search`](examples/vector-search)，无需装数据库即可看到 PG / MySQL 两种方言生成的 SQL。
 
 **性能提示**：百万级向量请用向量索引——PG `CREATE INDEX ON docs USING hnsw (embedding vector_cosine_ops);`，MySQL `CREATE VECTOR INDEX idx ON docs(embedding);`（向量索引同样仅 HeatWave / MySQL AI，社区版无）。框架生成的 `ORDER BY 距离 ASC LIMIT k` 能直接命中这些索引。
@@ -1214,6 +1237,21 @@ if err == orm.ErrOptimisticLock {
     // 版本冲突，记录已被他人修改，需重试
 }
 ```
+
+**更新成功后版本会回写到实体**（`order.Version` 变成 6），所以同一个实体可以连续更新，不会撞上「自己跟自己冲突」的假 `ErrOptimisticLock`：
+
+```go
+order.Status = "paid"
+_ = orm.UpdateById(ctx, db, &order) // Version: 5 → 6（实体同步 +1）
+order.Status = "shipped"
+_ = orm.UpdateById(ctx, db, &order) // 带 version = 6 去比对，正常成功
+```
+
+三点注意事项：
+
+- **版本列必须是整型**（`int` / `int64` / `uint` …）。字符串版本列上的 `version + 1` 在 MySQL 会把文本静默转成 0 再 +1（PG 直接报错），冲突检测形同虚设，故框架在这种情况下直接返回错误；
+- **按条件的批量 `Update` 不加 `WHERE version`**（它更新的是多行），但 `SET version = version + 1` 照旧 —— 即各行按自己的当前值自增，而不是被统一改成实体里那个值；
+- `UpdateByIdSets`（map 形式）**只有 sets 里带了版本列**才走乐观锁语义，否则不碰版本列。
 
 ---
 
