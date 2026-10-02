@@ -83,6 +83,20 @@ func preloadReflect(ctx context.Context, db *DB, slice reflect.Value, relations 
 		if childMeta.pk == nil {
 			return fmt.Errorf("orm: Preload 子类型 %s 无主键，无法关联", childMeta.table)
 		}
+		// 校验关联字段的类型与关系种类匹配：has_many 字段必须是切片，
+		// has_one/belongs_to 字段必须是结构体或指针。此前类型不匹配时
+		// 反射操作（MakeSlice / 对 nil ptr FieldByName）直接 panic，
+		// 错误信息看不出是哪个模型哪个关系的问题 —— 翻译成带模型/关系名的 error。
+		if kind == "has_many" && sf.Type.Kind() != reflect.Slice {
+			return fmt.Errorf("orm: Preload 关系 %q 在 %s 上标记为 has_many，但字段类型 %s 不是切片"+
+				"（has_many 要求切片字段，如 []%s）",
+				rel, parentMeta.table, sf.Type, childElemType.Name())
+		}
+		if kind != "has_many" && sf.Type.Kind() == reflect.Slice {
+			return fmt.Errorf("orm: Preload 关系 %q 在 %s 上标记为 %s，但字段类型 %s 是切片"+
+				"（%s 关系要求结构体或指针字段，如 *%s 或 %s）",
+				rel, parentMeta.table, kind, sf.Type, kind, childElemType.Name(), childElemType.Name())
+		}
 
 		var childFKCol, parentFKCol string
 		var parentKeyValues []any // has_many/has_one：父主键集合；belongs_to：父外键值集合
@@ -99,6 +113,24 @@ func preloadReflect(ctx context.Context, db *DB, slice reflect.Value, relations 
 				childFKCol = toSnake(parentTypeName) + "_id"
 			}
 			parentKeyValues = collectPK(slice, parentMeta)
+		}
+		// 校验外键列确实属于对应模型：此前列名拼错时，belongs_to 会静默全空
+		// （fieldByColName 找不到列返回 nil → validKeys 全滤掉 → 一条 SQL 都不发 →
+		// Preload 返回 nil、不报错），而 has_many/has_one 会真发 SQL、由数据库报
+		// unknown column（显式失败）—— 两条路口径不一致。统一在这里提前拦住，
+		// 把「静默做错事」换成「带模型/关系名的 error」。
+		if kind == "belongs_to" {
+			if fieldInfoForCol(parentMeta, parentFKCol) == nil {
+				return fmt.Errorf("orm: Preload 关系 %q（belongs_to）的外键列 %q 不属于父类型 %s"+
+					"（请检查 orm tag 的 fk 设置，或确认父结构体上声明了该 db 列）",
+					rel, parentFKCol, parentMeta.table)
+			}
+		} else {
+			if fieldInfoForCol(childMeta, childFKCol) == nil {
+				return fmt.Errorf("orm: Preload 关系 %q（%s）的外键列 %q 不属于子类型 %s"+
+					"（请检查 orm tag 的 fk 设置，或确认子表上声明了该 db 列）",
+					rel, kind, childFKCol, childMeta.table)
+			}
 		}
 
 		// 加载子对象（复用 scanStruct，按列 IN 查询）。两侧的连接列随关系方向不同：
@@ -126,6 +158,13 @@ func preloadReflect(ctx context.Context, db *DB, slice reflect.Value, relations 
 
 		for i := 0; i < slice.Len(); i++ {
 			ev := derefValue(slice.Index(i))
+			// nil 指针父元素跳过：derefValue 对 nil ptr 返回 nil ptr 本身，
+			// 之后 FieldByName 会对 nil ptr Value panic
+			// （"reflect: call of reflect.Value.FieldByName on ptr Value"）。
+			// 这类元素尚无有效数据，跳过不影响已落库的兄弟元素。
+			if ev.Kind() == reflect.Ptr && ev.IsNil() {
+				continue
+			}
 			field := ev.FieldByName(rel)
 			if !field.IsValid() || !field.CanSet() {
 				continue
@@ -260,6 +299,12 @@ func collectColumn(slice reflect.Value, meta *modelMeta, col string) []any {
 
 // fieldByColName 返回结构体（或指针）上某 db 列名对应的字段值。
 func fieldByColName(ev reflect.Value, meta *modelMeta, col string) any {
+	// nil 指针没有字段可取：derefValue 对 nil ptr 返回 ptr 本身，
+	// 直接 FieldByName 会 panic（"reflect.Value.FieldByName on ptr Value"）。
+	// 返回 nil 后由调用方的 validKeys 判为「不关联」，与「该父对象尚无数据」语义一致。
+	if ev.Kind() == reflect.Ptr && ev.IsNil() {
+		return nil
+	}
 	fi := fieldInfoForCol(meta, col)
 	if fi == nil {
 		return nil
