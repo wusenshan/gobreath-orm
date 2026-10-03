@@ -725,6 +725,35 @@ func (db *DB) queryContext(ctx context.Context, query string, args ...any) (*sql
 	return rows, err
 }
 
+// queryPrimaryContext 执行**只走主库**的查询（绕过读写路由），用于读元数据
+// （AutoMigrate 读表结构）。
+//
+// 为什么不能复用 queryContext：那是 SELECT，isWriteQuery 会把它判成读并路由到副本。
+// 而副本的结构可能滞后于主库（主从延迟 / 只同步数据不同步 DDL），
+// 在副本上看列会得出与真实结构相反的结论 —— 漏补列，或者补一个其实已经存在的列。
+func (db *DB) queryPrimaryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	exec := db.exec
+	if db.readWrite != nil {
+		exec = db.readWrite.primary
+	}
+	return db.queryOn(ctx, exec, query, args...)
+}
+
+// queryOn 在指定执行器上执行查询，并统一记录日志与钩子事件。
+func (db *DB) queryOn(ctx context.Context, exec Executor, query string, args ...any) (*sql.Rows, error) {
+	if len(db.hooks) > 0 {
+		db.notifyHooks(HookEvent{Kind: HookKindQuery, Phase: HookPhaseBefore, Query: query, Args: append([]any(nil), args...)})
+	}
+	start := time.Now()
+	rows, err := exec.QueryContext(ctx, query, args...)
+	duration := time.Since(start)
+	db.logSlowOrErr(query, args, duration, err)
+	if len(db.hooks) > 0 {
+		db.notifyHooks(HookEvent{Kind: HookKindQuery, Phase: HookPhaseAfter, Query: query, Args: append([]any(nil), args...), Duration: duration, Err: err})
+	}
+	return rows, err
+}
+
 // queryRowContext 执行仅返回单行的查询（如 INSERT ... RETURNING）并记录日志。
 // 语义上仍按写操作（HookKindExec）上报，因为调用方用它做主键回填而非读取数据。
 // QueryRowContext 不在调用点返回 error，错误延迟到 Scan；此处按 nil 记录，由调用方捕获 Scan 错误。

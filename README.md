@@ -36,7 +36,7 @@
 - 🔐 **乐观锁**：`db:"version,version"`（或 `Config.OptimisticField` 约定）标记版本列；`UpdateById / UpdateByIdSets` 自动 `WHERE version = ?` 并 `SET version = version + 1`，冲突时返回 `ErrOptimisticLock`。
 - 🪝 **SQL 生命周期钩子（Hook）**：`Config.Hooks` 或 `db.WithHooks(...)` 注册实现 `Hook` 接口的对象；每次 `exec` / `query` 的 before / after 阶段都会触发 `On(HookEvent)`，可零侵入地做审计、限流、链路追踪。未配置则不触发、零开销。
 - 🌐 **读写分离 / 多数据源**：`Config.ReadWrite`（或等价的 `Config.MultiSource`）声明主库 + 只读副本；框架按 SQL 前缀自动把写操作路由主库、读操作 round-robin 到副本，事务内自动回落主库；**`SELECT ... FOR UPDATE` / `FOR SHARE` 等悲观锁读也会识别并路由主库**，避免锁落在只读副本上失效。*`*readWriteRouter` 内部加锁，并发安全。
-- 🗃 **AutoMigrate（数据库迁移）**：`db.AutoMigrate(ctx, &User{}, &Order{})` 幂等建表（`CREATE TABLE IF NOT EXISTS`）+ 二级索引（PG/SQLite 用 `CREATE INDEX IF NOT EXISTS`；MySQL 不支持该子句，改由忽略「索引已存在」错误保证幂等），三方言自动生成 DDL；自动识别 `,vector(N)`（PG `vector(N)` / MySQL `VECTOR(N)` / SQLite `TEXT`）与 `,json`（PG `JSONB` / MySQL `JSON` / SQLite `TEXT`）、`,unique` / `,index`；无需引入迁移工具即可让表结构与结构体对齐。
+- 🗃 **AutoMigrate（数据库迁移）**：`db.AutoMigrate(ctx, &User{}, &Order{})` 幂等建表（`CREATE TABLE IF NOT EXISTS`）+ **补齐已有表缺失的列**（`ALTER TABLE ADD COLUMN`，只增不减）+ 二级索引（PG/SQLite 用 `CREATE INDEX IF NOT EXISTS`；MySQL 不支持该子句，改由忽略「索引已存在」错误保证幂等），三方言自动生成 DDL；自动识别 `,vector(N)`（PG `vector(N)` / MySQL `VECTOR(N)` / SQLite `TEXT`）与 `,json`（PG `JSONB` / MySQL `JSON` / SQLite `TEXT`）、`,unique` / `,index`；无需引入迁移工具即可让表结构与结构体对齐。
 - 🔗 **关联预加载（Preload）**：`orm.Preload(ctx, db, &users, "Articles")` 一次性批量加载 **has_many / has_one / belongs_to** 关联，避免 N+1 查询；默认外键约定 `<类型名>_id`（如 `User` → `user_id`），可用 `orm:"has_many;fk:user_id"` / `orm:"belongs_to;fk:xxx"` 覆盖；软删除过滤对子查询同样生效。
 - ⋇ **Distinct 去重查询**：`orm.NewQuery[T]().Distinct()` 生成 `SELECT DISTINCT`，可搭配 `Select` / 条件 / 排序 / 分页照常使用。
 
@@ -1315,7 +1315,13 @@ db, _ := orm.Open(orm.Config{
 
 ## AutoMigrate（数据库迁移）
 
-`AutoMigrate` 让表结构与 Go 结构体保持一致，**幂等、可重复执行**：先 `CREATE TABLE IF NOT EXISTS` 建表，再按需补二级索引。建索引语句按方言分派 —— PG / SQLite 用 `CREATE INDEX IF NOT EXISTS`，MySQL（含 8.x）不支持该子句（那是 MariaDB 扩展，带上会 `Error 1064`），故生成朴素 `CREATE INDEX`，幂等性由执行时忽略「索引已存在」错误兜住。它直接读结构体的 `db` tag，**不扩展 `Dialect` 接口**（用方言类型 switch 生成 DDL），三方言（PG / MySQL / SQLite）都能正确产出对应语法。
+`AutoMigrate` 让表结构与 Go 结构体保持一致，**幂等、可重复执行**，策略是「**只增不减**」：
+
+1. 表不存在 → `CREATE TABLE IF NOT EXISTS` 建出全部列；
+2. 表已存在 → 先读一遍已有列（PG / MySQL 查 `information_schema.columns`，SQLite 查 `pragma_table_info`），**只补缺失的列**（`ALTER TABLE ADD COLUMN`）；
+3. 最后补二级索引（必定排在补列之后 —— 缺的列若带 `,index`，先建索引会撞「列不存在」）。
+
+建索引语句按方言分派 —— PG / SQLite 用 `CREATE INDEX IF NOT EXISTS`，MySQL（含 8.x）不支持该子句（那是 MariaDB 扩展，带上会 `Error 1064`），故生成朴素 `CREATE INDEX`，幂等性由执行时忽略「索引已存在」错误兜住。它直接读结构体的 `db` tag，**不扩展 `Dialect` 接口**（用方言类型 switch 生成 DDL），三方言（PG / MySQL / SQLite）都能正确产出对应语法。
 
 ```go
 type Product struct {
@@ -1338,7 +1344,14 @@ if err := db.AutoMigrate(ctx, &Product{}, &User{}, &Order{}); err != nil {
 - **主键 + 自增**：PG `BIGSERIAL PRIMARY KEY`；MySQL `BIGINT AUTO_INCREMENT PRIMARY KEY`；SQLite `INTEGER PRIMARY KEY AUTOINCREMENT`。
 - **索引**：`,unique` 生成唯一索引，`,index` 生成普通二级索引；列类型未显式声明维度时向量默认 1536。
 
-> 当前 AutoMigrate 负责「建表 + 建索引」，**不会删除结构体里已移除的列**（保守策略，避免误删数据）；需要改列类型 / 删列请走原生 SQL（`RawExec`）或专业迁移工具。
+**补列时的两条硬边界（都会返回错误，不会静默放过）**：
+
+- **主键 / 自增列缺失 → 报错**：在已有表上补主键要给存量行凭空造唯一值，SQLite 的 `ADD COLUMN` 更是明确不接受 `PRIMARY KEY` / `AUTOINCREMENT`。请手工迁移或重建表。
+- **`,unique` 列补齐时建的是 `CREATE UNIQUE INDEX` 而不是内联 `UNIQUE` 约束**：SQLite 的 `ADD COLUMN` 同样不接受 `UNIQUE` 修饰。唯一性保证等价，但报错文案与 `ON CONFLICT` 的目标名与内联约束不同。
+
+> 当前 AutoMigrate **不会删除结构体里已移除的列**、**也不会修改已有列的类型 / 长度**（保守策略，避免误删数据）；需要改列类型 / 删列请走原生 SQL（`RawExec`）或专业迁移工具。
+>
+> 另注：读取表结构的元数据查询**走主库**（读写分离下不会发到副本）——副本的 DDL 可能滞后于主库，在副本上看列会得出与真实结构相反的结论。自实现方言若不声明 `DialectKinder`、也不是内置三方言，框架无从知道它的系统表长什么样，会退化为「仅建表」。
 
 ---
 
