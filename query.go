@@ -601,7 +601,8 @@ func (q *Query[T]) Offset(n int) *Query[T] {
 }
 
 // Distinct 让本次查询使用 SELECT DISTINCT 去重（对标 SQL 的 SELECT DISTINCT）。
-// 常与 GroupBy / 聚合场景配合；向量检索（hasVector）时仅作用于普通列，距离列 dist 不受影响。
+// 常与 GroupBy / 聚合场景配合；与向量检索（Nearest / WithinDistance）同时使用时
+// 在 Build 期直接 panic —— 距离列 dist 会让去重静默失效，见 Build 里的说明。
 func (q *Query[T]) Distinct() *Query[T] { q.distinct = true; return q }
 
 // ForUpdate 在 SELECT 末尾追加悲观行锁（FOR UPDATE），用于「先查后改」防并发覆盖。
@@ -741,9 +742,14 @@ func (li *logicInfo) deletedValue() any {
 // resolveLogic 解析模型实际生效的软删除列，优先级：
 //  1. db:"...,logic" tag 显式声明（单表级别，不依赖全局配置，总是生效）；
 //  2. DB 的约定字段名（Config.SoftDeleteField）：列名或 Go 字段名与其相等、
-//     且类型为 time/int/bool 的字段自动启用；类型不支持则不启用（保守处理，
-//     可用 ,nologic tag 显式退出匹配）；
+//     且类型为 time/int/bool 的字段自动启用；命中同名但类型不支持的字段时
+//     **硬失败**（此前是静默不启用，详见下方注释），可用 ,nologic 显式退出匹配；
 //  3. 都不满足 → 返回 nil，即物理删除。
+//
+// 第 2 条此前在类型不支持时返回 nil（软删除静默失效）。理由是：全局配了
+// SoftDeleteField 就说明意图是启用，模型里同名却类型不对的字段几乎必然是笔误
+// 或语义撞名（如 `State string` 撞上约定名），沉默跳过会让这张表的软删除永久失效
+// 且没有任何线索 —— 与 `,logic` 打在 string 上「全表查不出且不报错」是同一类事故。
 func resolveLogic(meta *modelMeta, db *DB) *logicInfo {
 	if meta.logicCol != nil {
 		return &logicInfo{col: meta.logicCol.colName, isTime: meta.logicIsTime, isBool: isBoolType(meta.logicCol.typ)}
@@ -767,9 +773,11 @@ func resolveLogic(meta *modelMeta, db *DB) *logicInfo {
 			return &logicInfo{col: f.colName, isBool: true}
 		case isIntType(f.typ):
 			return &logicInfo{col: f.colName}
-		default:
-			return nil
 		}
+		panic(fmt.Errorf("orm: 结构体 %s 的字段 %s（类型 %s）与约定的软删除字段名 %q 同名，但类型不支持软删除："+
+			"必须是 time.Time / bool / 整型。此前这种情况会静默不启用软删除（表里的软删除条件永远不生效，"+
+			"删掉的行也照常出现在查询结果里）。请改字段类型、给该字段加 `,nologic` 退出匹配，或修改 Config.SoftDeleteField",
+			meta.table, f.goName, f.typ, name))
 	}
 	return nil
 }
@@ -786,9 +794,13 @@ func logicSuffix(li *logicInfo, d Dialect, unscoped bool) string {
 
 // resolveVersion 解析模型实际生效的乐观锁版本列，优先级：
 //  1. db:"...,version" tag 显式声明（单表级别，不依赖全局配置，总是生效）；
-//  2. DB 的约定字段名（Config.OptimisticField）：列名或 Go 字段名与其相等的字段，
-//     类型不限（通常为 int），自动启用乐观锁。
+//  2. DB 的约定字段名（Config.OptimisticField）：列名或 Go 字段名与其相等、
+//     且是整型的字段自动启用（可用 ,noversion 显式退出匹配）；
 //  3. 都不满足 → 返回 nil，即不启用乐观锁。
+//
+// 第 2 条此前**不校验类型**，于是 `Version string`（存语义化版本号的常见字段）
+// 会被当成乐观锁列：框架生成 `SET "version" = "version" + 1`，MySQL 静默把字符串
+// 转成 0 再 +1，冲突检测形同虚设；PG 则到执行时才报类型错。现在改成硬失败。
 func resolveVersion(meta *modelMeta, db *DB) *fieldInfo {
 	if meta.versionCol != nil {
 		return meta.versionCol
@@ -799,12 +811,19 @@ func resolveVersion(meta *modelMeta, db *DB) *fieldInfo {
 	}
 	for i := range meta.fields {
 		f := &meta.fields[i]
-		if f.ignore {
+		if f.ignore || f.noversion {
 			continue
 		}
-		if f.colName == name || f.goName == name {
-			return f
+		if f.colName != name && f.goName != name {
+			continue
 		}
+		if !isIntType(f.typ) {
+			panic(fmt.Errorf("orm: 结构体 %s 的字段 %s（类型 %s）与约定的乐观锁字段名 %q 同名，但不是整型："+
+				"框架用 version + 1 自增，string 版本列在 MySQL 上会被静默转成 0 再 +1（冲突检测失效），"+
+				"PG 则直接报类型错。请改字段类型、给该字段加 `,noversion` 退出匹配，或修改 Config.OptimisticField",
+				meta.table, f.goName, f.typ, name))
+		}
+		return f
 	}
 	return nil
 }
@@ -830,6 +849,19 @@ func (q *Query[T]) Build() (string, []any) {
 	// 结果集会从 1 列变成 2 列，Scan 单值直接报 "expected 1 destination arguments in Scan"。
 	// 另外聚合时的向量排序也要跳过（见下方 ORDER BY），否则是非法 SQL。
 	noVecCol := q.noVecCol
+	// DISTINCT 与向量距离列不能共存，且这个组合此前是**静默做错事**：
+	// dist 是每行都不同的表达式列，DISTINCT 作用于整行 → 追加 dist 之后每行必然唯一，
+	// 去重彻底失效；而 Count 的内层查询关掉了 dist（noVecCol），那里是真去重 ——
+	// 于是「列表行数」与分页总数按两套口径算，分页器与列表对不上且不报错。
+	// 也不能靠「DISTINCT 时不追加 dist」绕过：PG 要求 SELECT DISTINCT 的 ORDER BY
+	// 表达式必须出现在选择列表里（MySQL 8 同样拒绝），去掉 dist 会让排序非法。
+	// 两种语义无法同时满足，故显式失败。
+	if q.distinct && q.hasVector && !noVecCol {
+		panic("orm: Distinct() 不能与向量检索（Nearest / NearestBy / WithinDistance）同时使用：" +
+			"距离列 dist 每行都不同，会让 DISTINCT 静默失效；而 Count 的内层不带 dist，" +
+			"两边去重口径不一致，分页总数与列表行数对不上。" +
+			"需要去重请先按业务键查出去重（或改用 GroupBy 分组），再单独做向量检索")
+	}
 	args := []any{}
 	idx := 0
 	add := func(v any) int {

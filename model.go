@@ -27,6 +27,7 @@ type fieldInfo struct {
 	logic     bool // true 表示该字段是逻辑删除列（db tag 含 ",logic"）
 	nologic   bool // true 表示显式退出约定软删除匹配（db tag 含 ",nologic"）
 	version   bool // true 表示该字段是乐观锁版本列（db tag 含 ",version"）
+	noversion bool // true 表示显式退出约定版本列的匹配（db tag 含 ",noversion"）
 	unique    bool // true 表示该列需唯一约束（db tag 含 ",unique"），仅 AutoMigrate 使用
 	index     bool // true 表示该列需二级索引（db tag 含 ",index"），仅 AutoMigrate 使用
 	typ       reflect.Type
@@ -143,6 +144,10 @@ func parseMeta(typ reflect.Type) *modelMeta {
 	for _, fi := range collectFields(typ, nil, 0) {
 		register(fi)
 	}
+	// tag 修饰符决定生成什么样的 SQL，此前却没有任何一处校验字段类型 ——
+	// 「修饰符打在类型不支持的字段上」一律表现为静默做错事（详见函数注释）。
+	// 与 compositePKPanic / validateDbTag 同一口径：这是模型定义错误，解析期硬失败。
+	validateFieldModifiers(typ, m.fields)
 	// 未显式声明主键时，沿用「字段名 ID / Id」的约定推断。
 	if len(pkIdxs) == 0 {
 		for i := range m.fields {
@@ -266,6 +271,11 @@ func parseFieldInfo(f reflect.StructField, idx []int) fieldInfo {
 				fi.nologic = true
 			case "version":
 				fi.version = true
+			case "noversion":
+				// 显式退出「约定字段名」的乐观锁匹配（对标 ,nologic）。
+				// 全局 Config.OptimisticField 会按名字命中同名但语义无关的字段
+				// （如 `Version string` 存的是语义化版本号），用它局部关掉。
+				fi.noversion = true
 			case "unique":
 				fi.unique = true
 			case "index":
@@ -309,6 +319,93 @@ func compositePKPanic(typ reflect.Type, cols []string) error {
 	return fmt.Errorf("orm: 结构体 %s 声明了 %d 个主键列（%s），但复合主键尚未支持；"+
 		"请只保留一个 ,pk 列，或改用显式条件（Eq / In）代替按主键操作",
 		name, len(cols), strings.Join(cols, ", "))
+}
+
+// validateFieldModifiers 校验 tag 修饰符与字段的 Go 类型是否配套。
+//
+// 四类修饰符都会决定生成什么样的 SQL，而在此之前没有任何一处检查字段类型，
+// 于是「修饰符打在类型不支持的字段上」一律表现为**静默做错事**：
+//   - `,logic` 打在 string 上 → `WHERE "state" = 0`：PG 报错，MySQL / SQLite
+//     静默返回 0 行（SQLite 更隐蔽：把解析不出的双引号标识符兜底成字符串字面量，
+//     条件恒 false，连报错都没有）；DeleteById 同样静默失效；
+//   - `,version` 打在 string 上 → `SET "ver" = "ver" + 1`：MySQL 静默把字符串转 0
+//     再 +1（版本从 "abc" 变成 1），冲突检测形同虚设，PG 则到运行时才报错；
+//   - `,vector` 打在 int 上 → AutoMigrate 照样建出 vector(N) 列，Insert 把 int
+//     原样写进去（SQLite 静默，PG 到写入时才报类型错）；
+//   - `,autoincrement` 打在 string 主键上 → 自增回填静默跳过，主键永远是零值。
+//
+// 这些都是模型定义错误，且在运行期没有任何线索可循，故在解析期硬失败。
+func validateFieldModifiers(typ reflect.Type, fields []fieldInfo) {
+	for i := range fields {
+		f := fields[i]
+		if f.ignore {
+			continue
+		}
+		switch {
+		case f.logic && !isLogicCapable(f.typ):
+			panic(modifierTypePanic(typ, f, ",logic",
+				"软删除列必须是 time.Time（未删除 = IS NULL）、bool（= false）或整型（= 0），含指针形式",
+				"把该字段改成上述类型之一，或去掉 ,logic"))
+		case f.version && !isIntType(f.typ):
+			panic(modifierTypePanic(typ, f, ",version",
+				"乐观锁版本列必须是整型（int / int64 / uint 等，含指针形式），因为框架用 version + 1 自增",
+				"把该字段改成整型，或去掉 ,version"))
+		case f.vector && !isVectorCapable(f.typ):
+			panic(modifierTypePanic(typ, f, ",vector",
+				"向量列必须是 string（文本形式 [1,2,3]）或数值元素的切片 / 数组（[]float32 / []float64 / [3]float64 …）",
+				"把该字段改成上述类型之一，或去掉 ,vector"))
+		case f.autoInc && !isIntType(f.typ):
+			panic(modifierTypePanic(typ, f, ",autoincrement",
+				"自增列必须是整型（int / int64 / uint 等，含指针形式）：LastInsertId 返回 int64，非整型无法回填",
+				"把该字段改成整型，或去掉 ,autoincrement"))
+		}
+	}
+}
+
+// modifierTypePanic 构造「修饰符与字段类型不配套」的 panic 值。
+func modifierTypePanic(typ reflect.Type, f fieldInfo, modifier, want, fix string) error {
+	name := typ.Name()
+	if name == "" {
+		name = typ.String()
+	}
+	return fmt.Errorf("orm: 结构体 %s 的字段 %s（列 %q）声明了 %s，但字段类型是 %s：%s。"+
+		"请%s —— 类型不配套在运行期是静默做错事（查不到数据 / 版本不自增 / 主键不回填），不会报错",
+		name, f.goName, f.colName, modifier, f.typ, want, fix)
+}
+
+// isLogicCapable 判断字段类型能否承载软删除语义（time / bool / 整型，均含指针形式）。
+func isLogicCapable(t reflect.Type) bool {
+	return isTimeType(t) || isBoolType(t) || isIntType(t)
+}
+
+// isVectorCapable 判断字段类型能否承载向量列。
+//
+// 与 serializeVector 的支持面保持同一口径：string（原样文本）、数值元素的
+// 切片 / 定长数组（逐元素格式化成 [1,2,3]），以及实现了 fmt.Stringer 的自定义
+// 向量类型（如 pgvector.Vector —— 它底层就是 []float32，走切片分支）。
+func isVectorCapable(t reflect.Type) bool {
+	for t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+	switch t.Kind() {
+	case reflect.String:
+		return true
+	case reflect.Slice, reflect.Array:
+		e := t.Elem()
+		for e.Kind() == reflect.Ptr {
+			e = e.Elem()
+		}
+		switch e.Kind() {
+		case reflect.Float32, reflect.Float64,
+			reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+			reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+			return true
+		}
+		return false
+	}
+	// 自定义向量类型（如实现了 String() 的结构体）
+	stringer := reflect.TypeOf((*fmt.Stringer)(nil)).Elem()
+	return t.Implements(stringer) || reflect.PointerTo(t).Implements(stringer)
 }
 
 // resolveTable 返回逻辑表名，以及该表名是否来自 TableName() 显式指定。
@@ -1135,9 +1232,15 @@ func quoteCols(cols []string, d Dialect) string {
 }
 
 // setFieldValue 把自增主键（LastInsertId 返回 int64）回填到字段。
-func setFieldValue(fv reflect.Value, id int64) {
+//
+// 类型不配套时返回 error 而不是静默跳过：此前非整型主键拿到 id 后什么也不做，
+// Insert 返回 nil、实体的主键字段却永远是零值 —— 后续 UpdateById / DeleteById
+// 拿着零值主键去操作，要么改不动任何行，要么（条件被折叠时）打到别的行上。
+// 解析期的 validateFieldModifiers 已经拦过 `,autoincrement` 打在非整型字段上，
+// 这里兜的是「非自增字段但代码路径仍走到回填」的情形（如主键类型后来被改名）。
+func setFieldValue(fv reflect.Value, id int64) error {
 	if !fv.IsValid() {
-		return
+		return nil
 	}
 	if fv.Kind() == reflect.Ptr {
 		if fv.IsNil() {
@@ -1150,5 +1253,9 @@ func setFieldValue(fv reflect.Value, id int64) {
 		fv.SetInt(id)
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 		fv.SetUint(uint64(id))
+	default:
+		return fmt.Errorf("orm: 自增主键回填失败：主键字段类型是 %s，无法承接 LastInsertId 返回的 int64。"+
+			"请把主键改为整型（int / int64 / uint 等）", fv.Type())
 	}
+	return nil
 }

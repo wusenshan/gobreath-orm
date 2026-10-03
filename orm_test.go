@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -24,9 +25,22 @@ func (User) TableName() string { return "users" }
 // ---- 纯 Go mock driver：零依赖，用于验证真实结构体扫描 + 记录生成的 SQL ----
 
 var (
+	// recMu 保护下面两个记录变量。mock 的 stmt 是**每次调用现造**的，而
+	// TestScanPlanConcurrent 这类用例会 8 个 goroutine × N 轮并发查询 ——
+	// 无锁写 string 在 Go 里是数据竞态（两字 string 甚至可能撕裂成非法指针），
+	// 任何一句 `recQuery` 的读取都可能读到半个值。测试本身没报是因为它们
+	// 只在主 goroutine 里读，但一次 `-race` 就会把它炸出来。
+	recMu    sync.Mutex
 	recQuery string
 	recArgs  []any
 )
+
+// recordSQL 记录一次执行的 SQL 与参数（并发安全）。
+func recordSQL(query string, args []driver.Value) {
+	recMu.Lock()
+	defer recMu.Unlock()
+	recQuery, recArgs = query, valuesToAny(args)
+}
 
 func init() { sql.Register("ormmock", mockDriver{}) }
 
@@ -50,11 +64,11 @@ type mockStmt struct{ query string }
 func (s *mockStmt) Close() error  { return nil }
 func (s *mockStmt) NumInput() int { return -1 }
 func (s *mockStmt) Exec(args []driver.Value) (driver.Result, error) {
-	recQuery, recArgs = s.query, valuesToAny(args)
+	recordSQL(s.query, args)
 	return mockResult{}, nil
 }
 func (s *mockStmt) Query(args []driver.Value) (driver.Rows, error) {
-	recQuery, recArgs = s.query, valuesToAny(args)
+	recordSQL(s.query, args)
 	return mockRowsFor(s.query), nil
 }
 

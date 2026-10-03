@@ -38,7 +38,7 @@
 - 🌐 **读写分离 / 多数据源**：`Config.ReadWrite`（或等价的 `Config.MultiSource`）声明主库 + 只读副本；框架按 SQL 前缀自动把写操作路由主库、读操作 round-robin 到副本，事务内自动回落主库；**`SELECT ... FOR UPDATE` / `FOR SHARE` 等悲观锁读也会识别并路由主库**，避免锁落在只读副本上失效。*`*readWriteRouter` 内部加锁，并发安全。
 - 🗃 **AutoMigrate（数据库迁移）**：`db.AutoMigrate(ctx, &User{}, &Order{})` 幂等建表（`CREATE TABLE IF NOT EXISTS`）+ **补齐已有表缺失的列**（`ALTER TABLE ADD COLUMN`，只增不减）+ 二级索引（PG/SQLite 用 `CREATE INDEX IF NOT EXISTS`；MySQL 不支持该子句，改由忽略「索引已存在」错误保证幂等），三方言自动生成 DDL；自动识别 `,vector(N)`（PG `vector(N)` / MySQL `VECTOR(N)` / SQLite `TEXT`）与 `,json`（PG `JSONB` / MySQL `JSON` / SQLite `TEXT`）、`,unique` / `,index`；无需引入迁移工具即可让表结构与结构体对齐。
 - 🔗 **关联预加载（Preload）**：`orm.Preload(ctx, db, &users, "Articles")` 一次性批量加载 **has_many / has_one / belongs_to** 关联，避免 N+1 查询；默认外键约定 `<类型名>_id`（如 `User` → `user_id`），可用 `orm:"has_many;fk:user_id"` / `orm:"belongs_to;fk:xxx"` 覆盖；软删除过滤对子查询同样生效。
-- ⋇ **Distinct 去重查询**：`orm.NewQuery[T]().Distinct()` 生成 `SELECT DISTINCT`，可搭配 `Select` / 条件 / 排序 / 分页照常使用。
+- ⋇ **Distinct 去重查询**：`orm.NewQuery[T]().Distinct()` 生成 `SELECT DISTINCT`，可搭配 `Select` / 条件 / 排序 / 分页照常使用。⚠️ **不能与向量检索（`Nearest` / `WithinDistance`）同时使用** —— 距离列 `dist` 每行都不同，加上它之后 `DISTINCT` 会静默失效（去重彻底不起作用），而 `Count` 的内层查询不带 `dist`、那里是真去重，两边口径不一致会让分页总数与列表行数对不上。碰到这个组合时框架直接 panic；需要去重请先按业务键查出去重（或改用 `GroupBy` 分组），再单独做向量检索。
 
 ---
 
@@ -133,12 +133,31 @@ func (User) TableName() string { return "users" }
 | 写法 | 含义 |
 |---|---|
 | `db:"id,pk"` | 该列为主键（**仅支持单列主键**，见下方说明） |
-| `db:"id,pk,autoincrement"` | 主键且自增，插入后自动回填 |
+| `db:"id,pk,autoincrement"` | 主键且自增，插入后自动回填（**字段须为整型**） |
 | `db:"profile,json"` | 以 JSON 文本读写该列 |
+| `db:"embedding,vector(1536)"` | 向量列，序列化为 `[1,2,3]` 文本（**字段须为 string 或数值切片/数组**） |
+| `db:"deleted_at,logic"` | 逻辑删除列（**字段须为 time / bool / 整型**） |
+| `db:"version,version"` | 乐观锁版本列（**字段须为整型**） |
+| `db:"state,nologic"` / `db:"v,noversion"` | 显式退出 `SoftDeleteField` / `OptimisticField` 的约定名匹配 |
 | `db:"-"` | 忽略该字段（不参与任何 SQL） |
 | `db:"user_name"` | 自定义列名（不写则按蛇形自动推导，如 `UserName` → `user_name`） |
 
 > 若字段名为 `ID` 或 `Id` 且未声明 `pk`，框架会自动把它当作主键。
+
+> ⚠️ **带类型语义的修饰符（`autoincrement` / `vector` / `logic` / `version`）与字段类型不配套时，模型解析阶段即 panic。**
+> 这四类修饰符决定生成什么样的 SQL，但此前没有任何一处检查字段类型，于是「修饰符打在类型不支持的字段上」
+> 一律表现为**静默做错事**，且运行期没有任何线索：
+>
+> | 写法 | 字段类型 | 修之前的实际后果 |
+> |---|---|---|
+> | `,logic` | `string` | 生成 `WHERE "state" = 0`：MySQL / SQLite **不报错地返回 0 行**（表建好了、数据插进去了，就是永远查不出来），PG 报 `operator does not exist: text = integer` 但指不回模型定义；`DeleteById` 同样静默失效 |
+> | `,version` | `string` | `SET "ver" = "ver" + 1`：MySQL 静默把字符串转成 0 再 +1，**冲突检测形同虚设** |
+> | `,vector` | `int` | AutoMigrate 照样建出 `vector(3)` 列，Insert 把 int 原样写进去（SQLite 静默、PG 到写入时才报类型错） |
+> | `,autoincrement` | `string` | `LastInsertId` 返回 int64 无法回填，**静默留零值**：Insert 返回 nil，而后续 `UpdateById` / `DeleteById` 拿着零值主键去操作 |
+>
+> 现在统一提前到启动期失败（与复合主键的硬失败同一口径），错误信息点名结构体、字段、列名与该怎么改。
+> `SoftDeleteField` / `OptimisticField` 的**约定名匹配**同样校验类型：命中了同名但类型不支持的字段时
+> 此前是「静默不启用」（软删除 / 乐观锁对该表永久失效），现在也改为 panic，逃生口分别是 `,nologic` 与 `,noversion`。
 
 > ⚠️ **复合主键尚未支持，声明多个 `pk` 会直接 panic。**
 > 给两个及以上 `,pk` 列时，模型解析阶段即抛错：
@@ -1040,7 +1059,8 @@ type Order struct {
 ```
 
 - **优先级**：`db:"...,logic"` 显式声明 > `SoftDeleteField` 约定匹配 > 都没有则**物理删除**。
-- **匹配规则**：列名（`db` tag 第一项）或 Go 字段名等于 `SoftDeleteField` 即命中；类型必须是 `time` / `int` / `bool`，不支持的类型（如 string）不启用（保守处理，避免误软删）。
+- **匹配规则**：列名（`db` tag 第一项）或 Go 字段名等于 `SoftDeleteField` 即命中；类型必须是 `time` / `int` / `bool`（含指针形式）。
+- **类型不配套一律在解析模型时 panic**（两条路径都是）：`SoftDeleteField` 命中了同名但类型不支持的字段时，此前是**静默不启用软删除** —— 删掉的行照常出现在查询结果里，且没有任何线索；改用 `,logic` 打在 string 字段上则生成 `WHERE "state" = 0`，MySQL / SQLite 同样**不报错地返回 0 行**。两种都是「静默做错事」，故统一提前到启动期失败。逃生口是下面的 `,nologic`。
 - **显式退出**：实体不想要软删除时，加 `,nologic` 即可退出约定匹配，退化为物理删除：
 
 ```go
@@ -1048,6 +1068,7 @@ type Log struct {
     Id        int64      `db:"id,pk,autoincrement"`
     Body      string     `db:"body"`
     DeletedAt *time.Time `db:"deleted_at,nologic"` // 命中约定名但显式退出 → 物理删除
+    State     string     `db:"state,nologic"`     // 命中约定名但类型不支持 → 显式退出，不 panic
 }
 ```
 
@@ -1247,11 +1268,12 @@ order.Status = "shipped"
 _ = orm.UpdateById(ctx, db, &order) // 带 version = 6 去比对，正常成功
 ```
 
-三点注意事项：
+四点注意事项：
 
-- **版本列必须是整型**（`int` / `int64` / `uint` …）。字符串版本列上的 `version + 1` 在 MySQL 会把文本静默转成 0 再 +1（PG 直接报错），冲突检测形同虚设，故框架在这种情况下直接返回错误；
+- **版本列必须是整型**（`int` / `int64` / `uint` …，含指针形式）。字符串版本列上的 `version + 1` 在 MySQL 会把文本静默转成 0 再 +1（PG 直接报错），冲突检测形同虚设。现在这条校验**提前到模型解析期**：`db:"version,version"` 打在非整型字段上、或 `OptimisticField` 约定名命中了非整型字段，都直接 panic（不再等到执行时才报错 —— 那样 MySQL 上已经脏写完了）；约定名撞上语义无关的同名字段（如存语义化版本号的 `Version string`）时，用 `,noversion` 显式退出匹配；
 - **按条件的批量 `Update` 不加 `WHERE version`**（它更新的是多行），但 `SET version = version + 1` 照旧 —— 即各行按自己的当前值自增，而不是被统一改成实体里那个值；
-- `UpdateByIdSets`（map 形式）**只有 sets 里带了版本列**才走乐观锁语义，否则不碰版本列。
+- `UpdateByIdSets`（map 形式）**只有 sets 里带了版本列**才走乐观锁语义，否则不碰版本列；
+- `UpdateSets` / `UpdatePartial` / `UpdateByIdSets` 的 `SET` 列按**列名排序**生成 —— 传入的是 `map`，遍历顺序随机会让同一份代码每次产出不同列顺序的 SQL，依赖 prepared statement 的驱动因此每次都要重新 Prepare，慢查询日志也无法逐字比对。
 
 ---
 

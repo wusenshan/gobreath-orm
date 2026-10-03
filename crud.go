@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 )
 
@@ -233,8 +234,7 @@ func Insert[T any](ctx context.Context, db *DB, entity *T, opts ...WriteOption) 
 		if err := db.queryRowContext(ctx, sqlStr, args...).Scan(&id); err != nil {
 			return err
 		}
-		setFieldValue(fieldByCol(ev, meta, meta.pk.colName), id)
-		return nil
+		return setFieldValue(fieldByCol(ev, meta, meta.pk.colName), id)
 	}
 
 	res, err := db.execContext(ctx, sqlStr, args...)
@@ -243,7 +243,9 @@ func Insert[T any](ctx context.Context, db *DB, entity *T, opts ...WriteOption) 
 	}
 	if meta.pk != nil && meta.pk.autoInc {
 		if id, err := res.LastInsertId(); err == nil {
-			setFieldValue(fieldByCol(ev, meta, meta.pk.colName), id)
+			if err := setFieldValue(fieldByCol(ev, meta, meta.pk.colName), id); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -433,7 +435,9 @@ func Upsert[T any](ctx context.Context, db *DB, entity *T, conflictCols []string
 			if err := db.queryRowContext(ctx, sqlStr+d.UpsertReturning(meta.pk.colName), args...).Scan(&id); err != nil {
 				return err
 			}
-			setFieldValue(fieldByCol(ev, meta, meta.pk.colName), id)
+			if err := setFieldValue(fieldByCol(ev, meta, meta.pk.colName), id); err != nil {
+				return err
+			}
 			return nil
 		}
 	}
@@ -444,7 +448,9 @@ func Upsert[T any](ctx context.Context, db *DB, entity *T, conflictCols []string
 	// 自增主键回填，与 Insert 对齐：只回填「数据库真正发号」的情形（id > 0 才算数）。
 	if needPK {
 		if id, err := res.LastInsertId(); err == nil && id > 0 {
-			setFieldValue(fieldByCol(ev, meta, meta.pk.colName), id)
+			if err := setFieldValue(fieldByCol(ev, meta, meta.pk.colName), id); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -1024,10 +1030,20 @@ func updateSetsImpl[T any](ctx context.Context, db *DB, q *Query[T], sets map[st
 	d := db.dialect
 	phIdx := 0
 	nextPh := func() string { phIdx++; return d.Placeholder(phIdx) }
-	setParts := make([]string, 0, len(sets))
-	args := make([]any, 0, len(sets))
-	for col, val := range sets {
-		bv, err := bindVal(meta, col, val)
+	// sets 是 map，直接遍历会得到**随机顺序**的 SET 列。后果不只是「SQL 不好看」：
+	//   - 依赖 prepared statement 的驱动（MySQL / PG）每次都要重新 Prepare，
+	//     同一份代码的语句缓存命中率归零；
+	//   - 慢查询日志、SLA 采样、逐字比对 SQL 的断言全部变得不稳定。
+	// 按列名排序后遍历，SQL 文本对同一份输入恒定。
+	cols := make([]string, 0, len(sets))
+	for col := range sets {
+		cols = append(cols, col)
+	}
+	sort.Strings(cols)
+	setParts := make([]string, 0, len(cols))
+	args := make([]any, 0, len(cols))
+	for _, col := range cols {
+		bv, err := bindVal(meta, col, sets[col])
 		if err != nil {
 			return 0, fmt.Errorf("orm: 列 %q 绑定失败：%w", col, err)
 		}

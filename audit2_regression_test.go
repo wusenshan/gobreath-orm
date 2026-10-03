@@ -3,6 +3,7 @@ package orm
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"reflect"
 	"strings"
 	"sync"
@@ -155,15 +156,30 @@ type strVer struct {
 }
 
 func TestUpdateByIdRejectsNonIntegerVersion(t *testing.T) {
-	ctx := context.Background()
-	db := newMockDB(t)
+	// 校验已提前到模型解析期：拿到元数据的那一刻就 panic，而不是等 UpdateById
+	// 把 `SET "version" = "version" + 1` 发出去之后（MySQL 上那时已经脏写了）。
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("非整型版本列应在解析模型时 panic，实际静默通过")
+		}
+		msg := fmt.Sprint(r)
+		if !strings.Contains(msg, "整型") {
+			t.Fatalf("panic 信息应指出版本列必须是整型，实际: %s", msg)
+		}
+	}()
+	getMetaByType(reflect.TypeOf(strVer{}))
+}
+
+// TestBumpVersionFieldStillGuards 解析期校验之外的最后一道防线：
+// bumpVersionField 自身也必须拒绝非整型字段（它可能在别的路径上被调用）。
+func TestBumpVersionFieldStillGuards(t *testing.T) {
+	vi := &fieldInfo{colName: "version", idx: []int{2}}
 	e := &strVer{Id: 1, Name: "n", Version: "abc"}
-	err := UpdateById(ctx, db, e)
-	if err == nil {
-		t.Fatal("非整型版本列应报错（自增语义不成立），实际静默通过")
-	}
-	if !strings.Contains(err.Error(), "整型") {
-		t.Fatalf("错误信息应指出版本列必须是整型，实际: %v", err)
+	if err := bumpVersionField(reflect.ValueOf(e).Elem(), vi); err == nil {
+		t.Fatal("bumpVersionField 应拒绝非整型版本字段")
+	} else if !strings.Contains(err.Error(), "整型") {
+		t.Fatalf("错误信息应指出需要整型，实际: %v", err)
 	}
 }
 
