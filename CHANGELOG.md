@@ -2,7 +2,7 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/)。
 
-## v0.1.14（未发布）
+## v0.1.14 (2026-10-22)
 
 - **feat: 批量按主键第一类便利 API（`SelectByIds` / `DeleteByIds` / `ForceDeleteByIds` / `UpdateByIdsSets`）**：service 层最常见的「按 ID 列表批量查 / 删 / 改」此前只能拿 `In()` 自己拼，现提供一等入口（`crud.go` + `repo.go` 包装）。语义要点：① **空 ID 列表返回 `ErrInvalidArgument`**（新增统一错误）—— `IN ()` 不是合法 SQL，若折叠成恒真条件等价于全表查询/删除，这类调用几乎总是漏传参数的笔误，必须显式失败而不是静默查全表；② 删除类与单数版同语义（有生效逻辑删除列走逻辑删除、否则物理删除），返回受影响行数；③ 软删分支严格遵守「SET 实参先于 WHERE 分配」—— 批量形态同样会踩位置型方言的参数错位（MySQL / SQLite 上把删除值绑给条件列 → 静默 0 行），mock 的字符串断言对 `?` 无序号可辨（变异实测：变异 `idsIN` 起始序号后**只有 PG 子用例转红**，`$n` 有序号；MySQL / SQLite 照过），**真库是唯一 gate**（`integration/batch_apis_it_test.go` 插 4 行删 3 行剩 1，4 后端全绿）；④ `UpdateByIdsSets` 与单行版同源差异：**批量形态不支持乐观锁** —— 多个目标行的版本各不相同，无法用单个 `WHERE version = 旧值` 表达，sets 含版本列直接报错而不是静默写出只对个别行成立的条件；SET 列按名称排序（与 `updateSetsImpl` 同理由）。新增 `batch_apis_test.go`（三方言 SQL/实参逐位断言 + 守卫）与真库 3 用例（`TestBatchByIDApisOnRealDB` / `TestBatchByIDSoftDeleteArgOrderOnRealDB` / `TestDescribeTableOnRealDB`，4 后端）。
 - **feat: `Save` —— 按主键判断插入或更新的「直觉版」保存入口**：主键为零值（含 nil 指针）→ `Insert`（自增主键照常回填）；非零 → 按 `UpdateById` 口径全列更新，**命中 0 行（记录不存在或已被逻辑删除）返回 `ErrNotFound`** —— 不静默、也不退回 Insert：拿着非零主键却插入新行，通常意味着主键被意外清零或并发删除，应当显式失败（需要真 upsert 语义请用 `Upsert`）。为此把 `UpdateById` 的内核抽成 `updateByIdImpl`（返回受影响行数），`UpdateById` 行为不变；唯一的口径收紧是 `RowsAffected` 报错时不再静默跳过行数判断继续成功（三个主方言的 `RowsAffected` 均可靠，实际影响面为零）。
