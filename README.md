@@ -6,6 +6,8 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 ![Go](https://img.shields.io/badge/go-1.23%2B-00ADD8)
 
+**简体中文** | [English](README_EN.md)
+
 > 用了这个 ORM，查询数据就像呼吸一样简单。
 
 `gobreath-orm` 是一个 **AI 原生（AI-ready）、类型安全、零魔法字符串** 的 Go ORM——**内置向量检索，让 RAG / 语义搜索开箱即用**，同时保留 MyBatis-Plus 式 `LambdaQueryWrapper` 的零字段名查询体验：调用点绝不出现手写列名 / 关键字 / 占位符，从根本上避免拼 SQL 写错字段、写错 `AND` 位置、出现 SQL 注入等常见问题。

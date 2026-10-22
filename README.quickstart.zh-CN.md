@@ -1,5 +1,7 @@
 # gobreath-orm 快速上手（新手版）
 
+**简体中文** | [English](README.quickstart.en.md)
+
 这份文档的目标很简单：
 
 - 让第一次接触这个 ORM 的人，能在 10 分钟内跑通

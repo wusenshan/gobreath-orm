@@ -6,6 +6,8 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 ![Go](https://img.shields.io/badge/go-1.23%2B-00ADD8)
 
+**English** | [简体中文](README.md)
+
 A Go ORM designed for AI-native applications, semantic search, and type-safe SQL workflows.
 
 `gobreath-orm` is a modern ORM built around three ideas:

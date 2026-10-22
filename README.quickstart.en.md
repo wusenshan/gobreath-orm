@@ -1,5 +1,7 @@
 # gobreath-orm Quick Start for Beginners
 
+**English** | [简体中文](README.quickstart.zh-CN.md)
+
 This guide is designed to make the ORM easy to use from day one.
 
 The goal is simple:
