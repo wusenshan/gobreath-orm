@@ -23,7 +23,7 @@
 - 🧩 **泛型 + 链式条件**：`Eq / Ne / Gt / Ge / Lt / Le / Like / In / NotIn / Between / IsNull / IsNotNull`，自动处理 `AND/OR` 拼接与占位符。
 - 🪄 **MyBatis-Plus 式条件块**：`Or()` 与 `If(cond, func(q))` 对标 MP 的 `.or()` 与三参数条件（Go 不支持重载，用条件块统一实现）。
 - 🗂 **自动表名推导**：`User` → `users`（蛇形 + 复数），也可实现 `TableName()` 显式指定；支持 DB 级表前缀（`t_users`）。
-- 🧱 **完整 CRUD**：`Insert / BatchInsert / SelectById / SelectByIds / SelectList / SelectOne / Count / Exists / Page / UpdateById / Save / Update / DeleteById / DeleteByIds / Delete`，自增主键自动回填；另有聚合 `Sum / Avg / Max / Min`（+ 强类型 `*Of` 版本）与单列取值 `Pluck / PluckCol`。
+- 🧱 **完整 CRUD**：`Insert / BatchInsert / SelectById / SelectByIds / SelectList / SelectOne / QueryIter / Count / Exists / Page / UpdateById / Save / Update / DeleteById / DeleteByIds / Delete`，自增主键自动回填；另有聚合 `Sum / Avg / Max / Min`（+ 强类型 `*Of` 版本）与单列取值 `Pluck / PluckCol`。
 - 🔎 **预览 SQL**：`Query.ToSQL()` 与 `orm.DryRun(db, q)` 在不访问数据库的前提下拿到最终 SQL 与参数（对标 GORM 的 DryRun），单测断言与 DBA 复核都用得上。
 - 🔒 **原生事务**：`db.Transaction(ctx, func(tx *orm.DB) error)`。
 - 📦 **JSON 字段**：`db:"meta,json"` 即可把结构体字段（map / struct）自动与 JSON 列互转；支持按路径查询与 `JSON_CONTAINS / @>` 包含查询，三方言全适配。
@@ -410,6 +410,34 @@ list, err := orm.SelectList(ctx, db,
 > SQLite 解释为「无上限」），而框架此前会静默地不生成子句 —— `Limit(-1)` 看起来设了限制，实际返回全表。
 > 需要「不限制行数」请不要调用 `Limit`。
 
+### 流式遍历大表（QueryIter）
+
+导出、清洗、ETL 这类「百万行全表处理」场景，`SelectList` 会把整个结果集拉进内存。
+`QueryIter` 用**单游标逐行产出**，内存占用恒定：
+
+```go
+for u, err := range orm.QueryIter[User](ctx, db, orm.NewQuery[User]().OrderBy(idCol, false)) {
+    if err != nil {
+        return err // 行映射或网络错误，终止遍历
+    }
+    if process(u) {
+        break // 立即关闭游标并归还连接，后面的行不再读取
+    }
+}
+
+// Repo 同名包装
+for u, err := range repo.QueryIter(ctx, q) { ... }
+```
+
+实现语义与代价：
+
+- **单游标，不是分批 OFFSET 翻页**：OFFSET 翻页在没有稳定排序或遍历期间有写入时会跳行 / 重复行，
+  框架无法替调用方保证排序键稳定；单游标的语义就是「这一条 SQL 的结果集」。
+- **游标占用一个连接**直到遍历结束 / break / return —— 连接池小时大量并发遍历会互相等连接。
+- 逻辑删除过滤与 `SelectList` 完全一致（`Unscoped` 例外）；`Limit` / `OrderBy` / `GroupBy` /
+  `Distinct` 由传入的 `q` 决定（遍历到 `Limit` 就停）。
+- 遍历期间对同表写入后继续读的行为取决于方言隔离级别，需要跨方言一致语义请自己包事务。
+
 ### 查首条（SelectOne）
 
 ```go
@@ -466,7 +494,7 @@ err := users.Transaction(ctx, func(tx *orm.Repo[User]) error {
 })
 ```
 
-`Repo[T]` 完整转发：`Insert / BatchInsert / SelectById / SelectByIds / SelectList / SelectOne / Page / Count / Exists / UpdateById / Save / Update / DeleteById / DeleteByIds / ForceDeleteByIds / UpdateByIdsSets / Delete / ForceDelete / Transaction`，底层与包级泛型函数完全一致，只是把 `T` 提前固定了。
+`Repo[T]` 完整转发：`Insert / BatchInsert / SelectById / SelectByIds / SelectList / SelectOne / QueryIter / Page / Count / Exists / UpdateById / Save / Update / DeleteById / DeleteByIds / ForceDeleteByIds / UpdateByIdsSets / Delete / ForceDelete / Transaction`，底层与包级泛型函数完全一致，只是把 `T` 提前固定了。
 
 ### 按主键更新（UpdateById）
 
@@ -1564,7 +1592,8 @@ cities, err := orm.SelectList(ctx, db,
 
 ## 路线图（Phase 2+）
 
-- `RawQuery` 体验增强：`IN` 占位符批量展开（slice → `(?, ?, ...)`）、`map[string]any` 结果集、流式游标（大结果集分批读取）
+- `RawQuery` 体验增强：`IN` 占位符批量展开（slice → `(?, ?, ...)`）、`map[string]any` 结果集
+- ✅ 流式遍历大表 —— 已在 v0.1.14 通过 `QueryIter`（单游标 `iter.Seq2`）落地；`RawQuery` 侧的流式游标可基于同一套 `rowScanner` 后续补齐
 - 钩子（`BeforeCreate / AfterUpdate` 等，实体级回调——当前 `Hook` 是 SQL 生命周期级，二者定位不同，后续可扩展）
 - ✅ 聚合结果的分组映射 —— 已在 v0.1.13 通过 `SelectSum` / `SelectCount` 聚合投影 + `Aggregate[DTO]` 落地（`SelectCol` 补上了类型安全的列选择；`Select(cols ...string)` 的字符串形式保留兼容）
 - ✅ 关联预加载 / 关联映射（relation preload / association mapping）—— 已在 v0.1.7 通过 `Preload` / `PreloadOne` 落地

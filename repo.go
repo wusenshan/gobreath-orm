@@ -3,6 +3,7 @@ package orm
 import (
 	"context"
 	"database/sql"
+	"iter"
 )
 
 // Repo 把 *DB 与实体类型 T 绑定，提供免类型参数的 CRUD 方法（类似 DAO / Repository 模式）。
@@ -145,6 +146,12 @@ func (r *Repo[T]) ForceDeleteByIds(ctx context.Context, ids ...any) (int64, erro
 // 批量形态不支持乐观锁：sets 含版本列时报错。空 ID 列表 / 空 sets 均报错。
 func (r *Repo[T]) UpdateByIdsSets(ctx context.Context, ids []any, sets map[string]any) (int64, error) {
 	return UpdateByIdsSets[T](ctx, r.db, ids, sets)
+}
+
+// QueryIter 流式遍历本 Repo 的查询结果（单游标逐行产出，大表扫描用），
+// 语义与代价说明见包级 QueryIter。
+func (r *Repo[T]) QueryIter(ctx context.Context, q *Query[T]) iter.Seq2[*T, error] {
+	return QueryIter[T](ctx, r.db, q)
 }
 
 // Transaction 在本 Repo 的事务中执行 fn；回调收到的是同一 T 绑定的事务仓储句柄，
