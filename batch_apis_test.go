@@ -147,6 +147,11 @@ func TestDeleteByIdsSoftDeleteArgOrder(t *testing.T) {
 	} {
 		exec := &auditExecutor{}
 		db := NewDB(exec, c.dialect)
+		// before 必须取在调用**之前**：删除时间在 DeleteByIds 内部生成，
+		// 晚于此刻。曾经把它写在调用之后，断言「删除时间早于调用后时刻」——
+		// 逻辑上恒真，只因 Windows 时钟粒度粗（两次读数落在同一 tick）
+		// 才一直假绿，Linux 的纳秒精度立刻转红。
+		before := time.Now()
 		n, err := DeleteByIds[batchSoftUser](ctx, db, ids...)
 		if err != nil {
 			t.Fatalf("[%s] DeleteByIds 出错：%v", c.name, err)
@@ -170,7 +175,6 @@ func TestDeleteByIdsSoftDeleteArgOrder(t *testing.T) {
 			t.Fatalf("[%s] IN 占位符应从第 2 个起。\n want: %s\n  got: %s",
 				c.name, inExpect(c.dialect, 2, 2), exec.query)
 		}
-		before := time.Now()
 		delVal, ok := exec.args[0].(time.Time)
 		if !ok || delVal.Before(before) {
 			t.Fatalf("[%s] args[0] 应为删除时间值，实际 %#v —— SET 与 IN 的实参顺序错位（SQL=%s）",
