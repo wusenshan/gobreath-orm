@@ -856,10 +856,28 @@ func (q *Query[T]) Build() (string, []any) {
 	// 也不能靠「DISTINCT 时不追加 dist」绕过：PG 要求 SELECT DISTINCT 的 ORDER BY
 	// 表达式必须出现在选择列表里（MySQL 8 同样拒绝），去掉 dist 会让排序非法。
 	// 两种语义无法同时满足，故显式失败。
-	if q.distinct && q.hasVector && !noVecCol {
+	//
+	// 闸门**不能**再带 !noVecCol（即不能给 Count / Page / 聚合开后门）。早先那版认为
+	// 「Count 内层 noVecCol=true 就没有矛盾、照常可用」，这个判断是错的：关掉 dist 列
+	// 只影响投影，ORDER BY 依旧由 hasVector 兜底生成，内层实际拼出
+	//
+	//	SELECT DISTINCT * FROM "articles" ORDER BY "emb" <-> $1 LIMIT 3
+	//
+	// 真库实测（2026-10-22，pgvector:pg17 / mysql 8.0.30）的差异：
+	//   · PG   —— 一律报 "for SELECT DISTINCT, ORDER BY expressions must appear in
+	//            select list"（即使排序列本身在 * 投影里）；
+	//   · MySQL—— 只有排序列不在投影里才报 3065；默认 `DISTINCT *` 投影时反而接受；
+	//   · SQLite —— 完全接受，静默执行。
+	// 也就是说同一条查询「在 PG 上炸、在 MySQL/SQLite 上过」，这正是框架最该避免的
+	// 跨方言不一致；再叠上 SelectList 已 panic、Count 却放行的契约缺口，调用方在
+	// Page 上只会拿到一个不带调用栈的数据库语法错误。清掉 ORDER BY 也不是出路：
+	// 近邻排序一旦消失，LIMIT k 截来的是任意 k 行，Count 会静默给出无意义的数字。
+	if q.distinct && q.hasVector {
 		panic("orm: Distinct() 不能与向量检索（Nearest / NearestBy / WithinDistance）同时使用：" +
-			"距离列 dist 每行都不同，会让 DISTINCT 静默失效；而 Count 的内层不带 dist，" +
-			"两边去重口径不一致，分页总数与列表行数对不上。" +
+			"距离列 dist 每行都不同，会让 DISTINCT 静默失效；去掉 dist 又会让 DISTINCT 的排序非法" +
+			"（PG 一律拒绝；MySQL 仅在排序列不在投影时才拒绝 —— 同一条 SQL 在不同方言上" +
+			"一个报错一个通过，口径无法统一）。Count / Page / 聚合走同一条闸门，不与列表查询" +
+			"分叉：否则取列表给清晰 panic、取总数给数据库语法错误。" +
 			"需要去重请先按业务键查出去重（或改用 GroupBy 分组），再单独做向量检索")
 	}
 	args := []any{}

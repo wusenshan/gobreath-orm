@@ -29,6 +29,9 @@ type ColumnMeta struct {
 // 方言不支持自省（自定义方言未实现 DialectKinder）时返回错误而不是 false ——
 // 「不知道」伪装成「不存在」会让调用方误判（例如据此重复建表）。
 func TableExists(ctx context.Context, db *DB, table string) (bool, error) {
+	if err := validateTableName("TableExists", table); err != nil {
+		return false, err
+	}
 	cols, err := existingColumns(ctx, db, table)
 	if err != nil {
 		return false, err
@@ -39,6 +42,9 @@ func TableExists(ctx context.Context, db *DB, table string) (bool, error) {
 // ColumnExists 判断列是否存在（大小写不敏感，与 AutoMigrate 的列名归一口径一致）。
 // 表不存在时同样返回 false —— 不区分「表缺失」与「列缺失」，需要区分请先 TableExists。
 func ColumnExists(ctx context.Context, db *DB, table, column string) (bool, error) {
+	if err := validateTableName("ColumnExists", table); err != nil {
+		return false, err
+	}
 	cols, err := existingColumns(ctx, db, table)
 	if err != nil {
 		return false, err
@@ -51,8 +57,8 @@ func ColumnExists(ctx context.Context, db *DB, table, column string) (bool, erro
 // （PG / MySQL 按 ordinal_position，SQLite 按 cid）。
 // 空 table 返回 ErrInvalidArgument；方言不支持自省时报错（理由同 TableExists）。
 func DescribeTable(ctx context.Context, db *DB, table string) ([]ColumnMeta, error) {
-	if table == "" {
-		return nil, fmt.Errorf("orm: DescribeTable: %w：table 为空", ErrInvalidArgument)
+	if err := validateTableName("DescribeTable", table); err != nil {
+		return nil, err
 	}
 	if _, known := dialectKindKnown(db.dialect); !known {
 		return nil, fmt.Errorf("orm: DescribeTable: %w（需要方言实现 DialectKind）", ErrNotSupported)
@@ -78,12 +84,38 @@ func existingColumns(ctx context.Context, db *DB, table string) (map[string]stru
 	return db.tableColumns(ctx, table)
 }
 
+// validateTableName 校验自省 API 的表名实参。
+//
+// 自省 SQL 里的表名/库名走**字面量**而非占位符（SQLite 的 pragma 表值函数对绑定参数
+// 的支持各版本不一），而 sqlLiteral 只做「单引号双写」：MySQL 默认不开
+// NO_BACKSLASH_ESCAPES，反斜杠是转义字符，表名以反斜杠结尾时字面量不会闭合，
+// 后面的 SQL 结构会被改写。
+//
+// AutoMigrate 路径上的表名来自 meta.finalTable()，早已被模型解析约束过；但
+// TableExists / ColumnExists / DescribeTable 是**公开 API**，表名由调用方直接给，
+// 全程不经过 quoteTable。所以在这里用同一份 identRe 白名单兜住，返回
+// ErrInvalidArgument 而不是 panic —— 这是运行时输入，不是编程期错误。
+func validateTableName(api, table string) error {
+	if table == "" {
+		return fmt.Errorf("orm: %s: %w：table 为空", api, ErrInvalidArgument)
+	}
+	// 支持 schema.table 两段，每段都必须满足标识符白名单（与 quoteTable 同口径）。
+	for _, p := range strings.SplitN(table, ".", 2) {
+		if !identRe.MatchString(p) {
+			return fmt.Errorf("orm: %s: %w：非法表名 %q（只能由字母/数字/下划线组成，支持 schema.table）",
+				api, ErrInvalidArgument, table)
+		}
+	}
+	return nil
+}
+
 // tableColumnsDetailSQL 生成「查某表全部列详情」的 SQL，三方言输出**同构的 6 列**：
 // 列名 / 类型名 / 是否可空('YES'/'NO') / 默认值表达式(可 NULL) / 是否主键(0|1) / 是否自增(0|1)，
 // 一个扫描函数即可通吃三个方言。与 tableColumnsSQL 同样的取舍：系统表是方言
 // 差异最集中的地方，各写一份不做抽象；表名与库名走字面量而非占位符 ——
-// 它们是模型里的标识符（已过 quoteTable 校验），且 SQLite 的 pragma 表值函数
-// 对绑定参数的支持各版本不一。
+// 它们是标识符，且 SQLite 的 pragma 表值函数对绑定参数的支持各版本不一。
+// 安全性由调用方保证：公开 API 入口已过 validateTableName（identRe 白名单），
+// AutoMigrate 内部路径的表名来自模型元数据。
 //
 // 自增判定：PG 看 is_identity（PG 10+）或 nextval 序列默认值；MySQL 看 extra 的
 // auto_increment 标记；SQLite 没有自增标志，按「INTEGER 主键 = rowid 别名」推断

@@ -42,19 +42,53 @@ func TestQueryDistinctRejectsVector(t *testing.T) {
 	_, _ = q.Build()
 }
 
-// TestCountStillAllowsDistinctWithVector Count 的内层不带 dist 列（noVecCol），
-// 那里不存在「去重失效」的问题，因此必须照常可用 —— 否则上面的闸门会误伤分页总数。
-func TestCountStillAllowsDistinctWithVector(t *testing.T) {
+// TestCountRejectsDistinctWithVector Count / Page 必须与 SelectList 走同一条闸门。
+//
+// 这个用例此前断言的正是缺陷本身：标题写「Count 的内层不带 dist，那里不存在去重
+// 失效问题，必须照常可用」，但只检查了 SQL 里没有 dist 列，**没检查 ORDER BY**。
+// 实际内层是
+//
+//	SELECT DISTINCT * FROM "articles" ORDER BY "emb" <-> $1 LIMIT 5
+//
+// 关掉 dist 只影响投影，按距离排序仍由 hasVector 兜底生成 —— 真库实测三种形态：
+// PG 一律报 "for SELECT DISTINCT, ORDER BY expressions must appear in select list"；
+// MySQL 只在排序列不在投影里时报 3065（默认 `DISTINCT *` 反而接受）；SQLite 完全接受。
+// 同一条查询跨方言「一个炸两个过」正是要拦住的东西，而清掉排序也不是出路：
+// LIMIT k 会截到任意 k 行，Count 静默给出无意义的数字。
+func TestCountRejectsDistinctWithVector(t *testing.T) {
 	db := mockDB(t, PG)
-	q := NewQuery[Article]().WithDialect(PG).Distinct().
-		Nearest(Col[Article](func(d *Article) *[]float32 { return &d.Embedding }), []float32{0.1, 0.2}, 5)
-	if _, err := Count(context.Background(), db, q); err != nil {
-		t.Fatalf("Count 不应受 Distinct+向量的闸门影响: %v", err)
+	vec := Col[Article](func(d *Article) *[]float32 { return &d.Embedding })
+
+	cases := []struct {
+		name string
+		run  func()
+	}{
+		{"Count", func() {
+			_, _ = Count(context.Background(), db, NewQuery[Article]().WithDialect(PG).Distinct().
+				Nearest(vec, []float32{0.1, 0.2}, 5))
+		}},
+		{"Page", func() {
+			_, _ = Page[Article](context.Background(), db, NewQuery[Article]().WithDialect(PG).Distinct().
+				Nearest(vec, []float32{0.1, 0.2}, 5), 1, 10)
+		}},
+		{"Sum", func() {
+			_, _ = Sum[Article](context.Background(), db, NewQuery[Article]().WithDialect(PG).Distinct().
+				Nearest(vec, []float32{0.1, 0.2}, 5),
+				Col[Article](func(a *Article) *int64 { return &a.Id }))
+		}},
 	}
-	if !strings.Contains(recQuery, "SELECT COUNT(*) FROM (") {
-		t.Fatalf("Distinct 的 COUNT 应走子查询，实际: %s", recQuery)
-	}
-	if strings.Contains(recQuery, "dist") {
-		t.Fatalf("Count 内层不该带 dist 列: %s", recQuery)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			defer func() {
+				r := recover()
+				if r == nil {
+					t.Fatalf("[%s] Distinct + 向量必须显式 panic，实际放行到了数据库（会拿到语法错误或静默错误结果）", c.name)
+				}
+				if msg := fmt.Sprint(r); !strings.Contains(msg, "Distinct") {
+					t.Fatalf("[%s] panic 信息应点名 Distinct 冲突，实际: %s", c.name, msg)
+				}
+			}()
+			c.run()
+		})
 	}
 }

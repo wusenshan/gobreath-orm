@@ -1138,9 +1138,19 @@ func UpdateByIdSets[T any](ctx context.Context, db *DB, id any, sets map[string]
 	}
 	phIdx := 0
 	nextPh := func() string { phIdx++; return d.Placeholder(phIdx) }
+	// 列名排序后再拼 SET：map 的遍历顺序在 Go 里是随机的，同一份 sets 每次生成的
+	// SQL 文本都不同 —— prepared statement 缓存命中率归零、慢查询日志与逐字断言不稳定。
+	// updateSetsImpl / UpdateByIdsSets 早已排序，此处（单行版）此前漏了，三个入口
+	// 口径必须一致。
+	cols := make([]string, 0, len(sets))
+	for col := range sets {
+		cols = append(cols, col)
+	}
+	sort.Strings(cols)
 	setParts := make([]string, 0, len(sets)+1)
 	args := make([]any, 0, len(sets)+2)
-	for col, val := range sets {
+	for _, col := range cols {
+		val := sets[col]
 		if hasVersion && col == vi.colName {
 			continue // 版本列由「自增 + WHERE 旧值」处理
 		}

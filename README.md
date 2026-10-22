@@ -40,7 +40,7 @@
 - 🌐 **读写分离 / 多数据源**：`Config.ReadWrite`（或等价的 `Config.MultiSource`）声明主库 + 只读副本；框架按 SQL 前缀自动把写操作路由主库、读操作 round-robin 到副本，事务内自动回落主库；**`SELECT ... FOR UPDATE` / `FOR SHARE` 等悲观锁读也会识别并路由主库**，避免锁落在只读副本上失效。*`*readWriteRouter` 内部加锁，并发安全。
 - 🗃 **AutoMigrate（数据库迁移）**：`db.AutoMigrate(ctx, &User{}, &Order{})` 幂等建表（`CREATE TABLE IF NOT EXISTS`）+ **补齐已有表缺失的列**（`ALTER TABLE ADD COLUMN`，只增不减）+ 二级索引（PG/SQLite 用 `CREATE INDEX IF NOT EXISTS`；MySQL 不支持该子句，改由忽略「索引已存在」错误保证幂等），三方言自动生成 DDL；自动识别 `,vector(N)`（PG `vector(N)` / MySQL `VECTOR(N)` / SQLite `TEXT`）与 `,json`（PG `JSONB` / MySQL `JSON` / SQLite `TEXT`）、`,unique` / `,index`；无需引入迁移工具即可让表结构与结构体对齐。
 - 🔗 **关联预加载（Preload）**：`orm.Preload(ctx, db, &users, "Articles")` 一次性批量加载 **has_many / has_one / belongs_to** 关联，避免 N+1 查询；默认外键约定 `<类型名>_id`（如 `User` → `user_id`），可用 `orm:"has_many;fk:user_id"` / `orm:"belongs_to;fk:xxx"` 覆盖；软删除过滤对子查询同样生效。
-- ⋇ **Distinct 去重查询**：`orm.NewQuery[T]().Distinct()` 生成 `SELECT DISTINCT`，可搭配 `Select` / 条件 / 排序 / 分页照常使用。⚠️ **不能与向量检索（`Nearest` / `WithinDistance`）同时使用** —— 距离列 `dist` 每行都不同，加上它之后 `DISTINCT` 会静默失效（去重彻底不起作用），而 `Count` 的内层查询不带 `dist`、那里是真去重，两边口径不一致会让分页总数与列表行数对不上。碰到这个组合时框架直接 panic；需要去重请先按业务键查出去重（或改用 `GroupBy` 分组），再单独做向量检索。
+- ⋇ **Distinct 去重查询**：`orm.NewQuery[T]().Distinct()` 生成 `SELECT DISTINCT`，可搭配 `Select` / 条件 / 排序 / 分页照常使用。⚠️ **不能与向量检索（`Nearest` / `WithinDistance`）同时使用** —— 距离列 `dist` 每行都不同，加上它之后 `DISTINCT` 会静默失效（去重彻底不起作用）；不追加 `dist` 又会让 `SELECT DISTINCT` 的 `ORDER BY` 非法（PG 一律拒绝，MySQL 在排序列不在投影里时拒绝，SQLite 接受 —— 跨方言口径无法统一）。这个组合在 `SelectList` / `Count` / `Page` / 聚合上**一律 panic**，不给数据库留报语法错误的机会；需要去重请先按业务键查出去重（或改用 `GroupBy` 分组），再单独做向量检索。
 
 ---
 
@@ -1555,6 +1555,12 @@ cities, err := orm.SelectList(ctx, db,
 
 `Distinct()` 与 `Select` / `Eq` / `OrderBy` / `Limit` / `Page` 等链式条件完全兼容，顺序随意。
 
+> **不能与向量检索同时使用。** `Distinct()` + `Nearest` / `WithinDistance` 在 `SelectList` /
+> `Count` / `Page` / 聚合上**一律 panic**：距离列每行都不同，加上它 `DISTINCT` 会静默失效；
+> 不追加距离列，`SELECT DISTINCT` 的 `ORDER BY` 又非法（PG 一律拒绝、MySQL 在排序列不在投影里
+> 拒绝、SQLite 接受 —— 跨方言口径无法统一）。需要「去重 + 向量」请分两步：先用 `GroupBy`
+> 或业务键去重，再对结果单独做向量检索。
+
 > `Select(cols ...string)` 只接受**列名**（会按方言加引号）。要投影 `SUM(col)`、`COUNT(*)` 这类**聚合表达式**，
 > 请用专用的 `SelectSum` / `SelectCount` 等构造器（见「分组聚合（GroupBy / Having）」），或走 `RawQuery`。
 > 把表达式塞进 `Select` 会被当成标识符加引号：PostgreSQL 下报「列不存在」，SQLite 下更隐蔽 ——
@@ -1568,7 +1574,7 @@ cities, err := orm.SelectList(ctx, db,
 
 1. **值永远参数化**：所有条件值走占位符（`$N` / `?`），绝不字符串拼接。
 2. **列名白名单**：列名只从结构体 `db` tag 解析得到，无法构造出 tag 里不存在的列，旁路注入无效。
-3. **表名白名单 + 引号转义**：表名无法用占位符绑定，框架用正则校验「字母/数字/下划线、不以数字开头」，再做方言引号（如 `"` / `` ` ``）转义，非法表名直接 panic（属编程期错误，不会生成恶意 SQL）。
+3. **表名白名单 + 引号转义**：表名无法用占位符绑定，框架用正则校验「字母/数字/下划线、不以数字开头」，再做方言引号（如 `"` / `` ` ``）转义。查询构造路径上的非法表名直接 panic（属编程期错误，不会生成恶意 SQL）；自省 API（`TableExists` / `ColumnExists` / `DescribeTable`）的表名来自调用方入参，属运行时输入，非法时返回 `ErrInvalidArgument` 而不是 panic。
 
 ---
 
