@@ -230,19 +230,19 @@ func (db *DB) tableColumns(ctx context.Context, table string) (map[string]struct
 	}
 	rows, err := db.queryPrimaryContext(ctx, query)
 	if err != nil {
-		return nil, fmt.Errorf("orm: AutoMigrate 读取表 %q 已有列失败: %w", table, err)
+		return nil, fmt.Errorf("orm: 读取表 %q 已有列失败: %w", table, err)
 	}
 	defer rows.Close()
 	cols := make(map[string]struct{})
 	for rows.Next() {
 		var c string
 		if err := rows.Scan(&c); err != nil {
-			return nil, fmt.Errorf("orm: AutoMigrate 读取表 %q 列名失败: %w", table, err)
+			return nil, fmt.Errorf("orm: 读取表 %q 列名失败: %w", table, err)
 		}
 		cols[strings.ToLower(c)] = struct{}{}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("orm: AutoMigrate 读取表 %q 已有列失败: %w", table, err)
+		return nil, fmt.Errorf("orm: 读取表 %q 已有列失败: %w", table, err)
 	}
 	return cols, nil
 }

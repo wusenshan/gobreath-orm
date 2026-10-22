@@ -114,6 +114,39 @@ func (r *Repo[T]) ForceDelete(ctx context.Context, q *Query[T]) error {
 	return ForceDelete[T](ctx, r.db, q)
 }
 
+// Save 按主键判断插入或更新：主键为零值 → Insert（自增主键照常回填），
+// 非零 → 全列更新，命中 0 行（记录不存在或已被逻辑删除）返回 ErrNotFound。
+// 需要真正的 upsert 语义请用 Upsert。
+func (r *Repo[T]) Save(ctx context.Context, entity *T, opts ...WriteOption) error {
+	return Save[T](ctx, r.db, entity, opts...)
+}
+
+// ---- 批量按主键（IN 列表）----
+
+// SelectByIds 按主键列表批量查询，自动过滤已逻辑删除的行。
+// 返回顺序与 ids 传入顺序无关；空 ID 列表返回 ErrInvalidArgument（防止折叠成全表查询）。
+func (r *Repo[T]) SelectByIds(ctx context.Context, ids ...any) ([]T, error) {
+	return SelectByIds[T](ctx, r.db, ids...)
+}
+
+// DeleteByIds 按主键列表批量删除（逻辑删除列生效时走逻辑删除），返回受影响行数。
+// 空 ID 列表返回 ErrInvalidArgument。
+func (r *Repo[T]) DeleteByIds(ctx context.Context, ids ...any) (int64, error) {
+	return DeleteByIds[T](ctx, r.db, ids...)
+}
+
+// ForceDeleteByIds 无视逻辑删除列，按主键列表物理删除，返回受影响行数。
+// 空 ID 列表返回 ErrInvalidArgument。
+func (r *Repo[T]) ForceDeleteByIds(ctx context.Context, ids ...any) (int64, error) {
+	return ForceDeleteByIds[T](ctx, r.db, ids...)
+}
+
+// UpdateByIdsSets 按主键列表更新 map 指定的字段，返回受影响行数。
+// 批量形态不支持乐观锁：sets 含版本列时报错。空 ID 列表 / 空 sets 均报错。
+func (r *Repo[T]) UpdateByIdsSets(ctx context.Context, ids []any, sets map[string]any) (int64, error) {
+	return UpdateByIdsSets[T](ctx, r.db, ids, sets)
+}
+
 // Transaction 在本 Repo 的事务中执行 fn；回调收到的是同一 T 绑定的事务仓储句柄，
 // 因此回调内同样免类型参数。fn 返回 error 时自动回滚，否则提交。
 func (r *Repo[T]) Transaction(ctx context.Context, fn func(tx *Repo[T]) error) error {
