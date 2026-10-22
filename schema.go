@@ -55,12 +55,12 @@ func DescribeTable(ctx context.Context, db *DB, table string) ([]ColumnMeta, err
 		return nil, fmt.Errorf("orm: DescribeTable: %w：table 为空", ErrInvalidArgument)
 	}
 	if _, known := dialectKindKnown(db.dialect); !known {
-		return nil, fmt.Errorf("orm: 当前方言不支持表结构自省（DescribeTable 需要 DialectKind）")
+		return nil, fmt.Errorf("orm: DescribeTable: %w（需要方言实现 DialectKind）", ErrNotSupported)
 	}
 	schema, name := splitTableName(table)
 	query, ok := tableColumnsDetailSQL(db.dialect, schema, name)
 	if !ok {
-		return nil, fmt.Errorf("orm: 当前方言不支持表结构自省（DescribeTable 需要 DialectKind）")
+		return nil, fmt.Errorf("orm: DescribeTable: %w（需要方言实现 DialectKind）", ErrNotSupported)
 	}
 	rows, err := db.queryPrimaryContext(ctx, query)
 	if err != nil {
@@ -73,7 +73,7 @@ func DescribeTable(ctx context.Context, db *DB, table string) ([]ColumnMeta, err
 // 的列名自省（同一套方言判定、主库路由与大小写归一），不自建第二套查询。
 func existingColumns(ctx context.Context, db *DB, table string) (map[string]struct{}, error) {
 	if _, known := dialectKindKnown(db.dialect); !known {
-		return nil, fmt.Errorf("orm: 当前方言不支持表结构自省（TableExists / ColumnExists 需要 DialectKind）")
+		return nil, fmt.Errorf("orm: TableExists / ColumnExists: %w（需要方言实现 DialectKind）", ErrNotSupported)
 	}
 	return db.tableColumns(ctx, table)
 }
