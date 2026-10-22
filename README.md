@@ -23,7 +23,7 @@
 - 🧩 **泛型 + 链式条件**：`Eq / Ne / Gt / Ge / Lt / Le / Like / In / NotIn / Between / IsNull / IsNotNull`，自动处理 `AND/OR` 拼接与占位符。
 - 🪄 **MyBatis-Plus 式条件块**：`Or()` 与 `If(cond, func(q))` 对标 MP 的 `.or()` 与三参数条件（Go 不支持重载，用条件块统一实现）。
 - 🗂 **自动表名推导**：`User` → `users`（蛇形 + 复数），也可实现 `TableName()` 显式指定；支持 DB 级表前缀（`t_users`）。
-- 🧱 **完整 CRUD**：`Insert / BatchInsert / SelectById / SelectList / SelectOne / Count / Exists / Page / UpdateById / Update / DeleteById / Delete`，自增主键自动回填；另有聚合 `Sum / Avg / Max / Min`（+ 强类型 `*Of` 版本）与单列取值 `Pluck / PluckCol`。
+- 🧱 **完整 CRUD**：`Insert / BatchInsert / SelectById / SelectByIds / SelectList / SelectOne / Count / Exists / Page / UpdateById / Save / Update / DeleteById / DeleteByIds / Delete`，自增主键自动回填；另有聚合 `Sum / Avg / Max / Min`（+ 强类型 `*Of` 版本）与单列取值 `Pluck / PluckCol`。
 - 🔎 **预览 SQL**：`Query.ToSQL()` 与 `orm.DryRun(db, q)` 在不访问数据库的前提下拿到最终 SQL 与参数（对标 GORM 的 DryRun），单测断言与 DBA 复核都用得上。
 - 🔒 **原生事务**：`db.Transaction(ctx, func(tx *orm.DB) error)`。
 - 📦 **JSON 字段**：`db:"meta,json"` 即可把结构体字段（map / struct）自动与 JSON 列互转；支持按路径查询与 `JSON_CONTAINS / @>` 包含查询，三方言全适配。
@@ -370,6 +370,29 @@ if errors.Is(err, orm.ErrNotFound) {
 }
 ```
 
+### 批量按主键（SelectByIds / DeleteByIds / UpdateByIdsSets）
+
+service 层最常见的「按 ID 列表批量查 / 删 / 改」有现成入口，逻辑删除语义与单数版完全一致（存在生效的逻辑删除列时走逻辑删除）：
+
+```go
+// 批量查询（自动过滤已逻辑删除的行）；返回顺序与 ids 传入顺序无关
+users, err := orm.SelectByIds[User](ctx, db, 1, 2, 3)
+
+// 批量删除：返回受影响行数（软删模型走逻辑删除，ForceDeleteByIds 物理删除）
+n, err := orm.DeleteByIds[User](ctx, db, 4, 5)
+
+// 批量部分更新（map 形态，与 UpdateByIdSets 同语义）
+n, err := orm.UpdateByIdsSets[User](ctx, db,
+    []any{int64(4), int64(5)},
+    map[string]any{"status": 2, "reviewed_by": "admin"})
+```
+
+> ⚠️ **空 ID 列表返回 `ErrInvalidArgument`**：`IN ()` 不是合法 SQL，把空列表折叠成恒真条件
+> 等价于全表查询 / 删除 —— 这类调用几乎总是漏传参数的笔误，框架显式失败而不是静默查全表。
+> ID 数量受各方言占位符上限约束（PG / MySQL 65535、SQLite 32766），框架不做自动分片。
+> 批量更新不支持乐观锁版本列（多行版本各不相同，无法用单个 `WHERE version = ?` 表达），
+> sets 含版本列时直接报错。
+
 ### 条件查询列表（SelectList）
 
 ```go
@@ -443,7 +466,7 @@ err := users.Transaction(ctx, func(tx *orm.Repo[User]) error {
 })
 ```
 
-`Repo[T]` 完整转发：`Insert / BatchInsert / SelectById / SelectList / SelectOne / Page / Count / Exists / UpdateById / Update / DeleteById / Delete / Transaction`，底层与包级泛型函数完全一致，只是把 `T` 提前固定了。
+`Repo[T]` 完整转发：`Insert / BatchInsert / SelectById / SelectByIds / SelectList / SelectOne / Page / Count / Exists / UpdateById / Save / Update / DeleteById / DeleteByIds / ForceDeleteByIds / UpdateByIdsSets / Delete / ForceDelete / Transaction`，底层与包级泛型函数完全一致，只是把 `T` 提前固定了。
 
 ### 按主键更新（UpdateById）
 
@@ -454,6 +477,27 @@ if err := orm.UpdateById(ctx, db, u); err != nil {
     panic(err)
 }
 ```
+
+### 按主键判断插入或更新（Save）
+
+```go
+// 主键为零值 → Insert（自增主键照常回填）
+u := &User{Name: "erin", Age: 28}
+if err := orm.Save[User](ctx, db, u); err != nil { ... }
+
+// 主键非零 → 全列更新（与 UpdateById 口径一致）
+u.Age = 99
+if err := orm.Save[User](ctx, db, u); err != nil { ... }
+
+// 主键非零但记录不存在（或已被逻辑删除）→ ErrNotFound
+if errors.Is(err, orm.ErrNotFound) {
+    // 不静默、也不退回 Insert：拿着非零主键却插入新行，
+    // 通常意味着主键被意外清零或并发删除，需要真 upsert 请用 Upsert
+}
+```
+
+> `Save` 的更新是**全列写回**：未赋值字段被写回零值（含 `created_at` 等审计列）。
+> 只想改部分字段请用 `UpdateByIdSets` / `UpdatePartial`，或 `OnlyColumns(...)` 限定列。
 
 ### 条件更新（Update）
 
@@ -1374,6 +1418,32 @@ if err := db.AutoMigrate(ctx, &Product{}, &User{}, &Order{}); err != nil {
 > 当前 AutoMigrate **不会删除结构体里已移除的列**、**也不会修改已有列的类型 / 长度**（保守策略，避免误删数据）；需要改列类型 / 删列请走原生 SQL（`RawExec`）或专业迁移工具。
 >
 > 另注：读取表结构的元数据查询**走主库**（读写分离下不会发到副本）——副本的 DDL 可能滞后于主库，在副本上看列会得出与真实结构相反的结论。自实现方言若不声明 `DialectKinder`、也不是内置三方言，框架无从知道它的系统表长什么样，会退化为「仅建表」。
+
+## 表结构自省（TableExists / ColumnExists / DescribeTable）
+
+AutoMigrate 之外的「治理」侧能力：插件式脚本、动态建表、迁移检查、导出 / 审计前的结构核对。
+
+```go
+// 表是否存在（可带 schema. 前缀，口径与 AutoMigrate 一致）
+ok, err := orm.TableExists(ctx, db, "users")
+
+// 列是否存在（大小写不敏感，与 AutoMigrate 的列名归一同一口径）
+ok, err = orm.ColumnExists(ctx, db, "users", "Created_At")
+
+// 全部列元信息，顺序即建列顺序
+cols, err := orm.DescribeTable(ctx, db, "users")
+for _, c := range cols {
+    fmt.Printf("%s %s nullable=%v pk=%v autoinc=%v default=%v\n",
+        c.Name, c.DataType, c.Nullable, c.PrimaryKey, c.AutoIncrement, c.Default)
+}
+// → id bigint nullable=false pk=true autoinc=true
+```
+
+`ColumnMeta` 的字段取自数据库系统表的原样文本：`DataType` 是方言自己的类型名（PG 的 `bigint` / MySQL 的 `varchar` / SQLite 的声明类型）；`Default` 是默认值表达式（无默认值为 `nil`）。三方言（PG 走 `information_schema`，MySQL 走 `information_schema`，SQLite 走 `pragma_table_info`）统一由框架翻译，调用方无需写任何方言分支。
+
+> 元数据查询一律**走主库**（同 AutoMigrate 的理由：副本 DDL 可能滞后）。
+> 方言不支持自省（未声明 `DialectKinder` 且非内置三方言）时返回**错误**而不是 `false` ——
+> 「不知道」伪装成「不存在」会让调用方据此重复建表。
 
 ---
 

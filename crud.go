@@ -801,11 +801,17 @@ func Page[T any](ctx context.Context, db *DB, q *Query[T], page, size int) (*Pag
 
 // ---- 更新 ----
 
-// UpdateById 按实体主键更新其非主键字段。
-func UpdateById[T any](ctx context.Context, db *DB, entity *T, opts ...WriteOption) error {
+// updateByIdImpl 是 UpdateById / Save 的共用实现，额外返回受影响行数：
+// Save 需要「命中 0 行 = 记录不存在」的信号（返回 ErrNotFound），
+// 而 UpdateById 在无乐观锁列时维持旧行为（不判行数）。
+//
+// 注意此处 RowsAffected 报错时直接返回错误（旧行为是静默跳过行数判断继续成功）：
+// 对 Save 来说「拿不到行数」与「记录不存在」一样不能装作成功。
+// 三个主方言（PG / MySQL / SQLite）的 RowsAffected 均可靠，不影响既有调用方。
+func updateByIdImpl[T any](ctx context.Context, db *DB, entity *T, opts ...WriteOption) (int64, error) {
 	meta := getMeta[T]()
 	if meta.pk == nil {
-		return fmt.Errorf("orm: %s 无主键，无法 UpdateById", meta.table)
+		return 0, fmt.Errorf("orm: %s 无主键，无法 UpdateById", meta.table)
 	}
 	cfg := applyWriteOptions(opts...)
 	ev := reflect.ValueOf(entity).Elem()
@@ -813,7 +819,7 @@ func UpdateById[T any](ctx context.Context, db *DB, entity *T, opts ...WriteOpti
 	if cfg.onlySet {
 		filtered, err := filterOnlyCols(meta, cols, cfg.only)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		cols = filtered
 	}
@@ -821,7 +827,7 @@ func UpdateById[T any](ctx context.Context, db *DB, entity *T, opts ...WriteOpti
 		cols = filterOmitZeroCols(meta, ev, cols)
 	}
 	if len(cols) == 0 {
-		return fmt.Errorf("orm: %s 无可更新字段%s", meta.table, emptyColsHint(cfg))
+		return 0, fmt.Errorf("orm: %s 无可更新字段%s", meta.table, emptyColsHint(cfg))
 	}
 	vi := resolveVersion(meta, db)
 	phIdx := 0
@@ -834,7 +840,7 @@ func UpdateById[T any](ctx context.Context, db *DB, entity *T, opts ...WriteOpti
 		}
 		v, err := argFor(meta, ev, c)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		args = append(args, v)
 		ph := nextPh()
@@ -849,7 +855,7 @@ func UpdateById[T any](ctx context.Context, db *DB, entity *T, opts ...WriteOpti
 	}
 	pkVal, err := argFor(meta, ev, meta.pk.colName)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	args = append(args, pkVal)
 	sqlStr := fmt.Sprintf("UPDATE %s SET %s WHERE %s = %s",
@@ -859,7 +865,7 @@ func UpdateById[T any](ctx context.Context, db *DB, entity *T, opts ...WriteOpti
 		// 乐观锁：WHERE version = 期望的旧值
 		oldVer, err := argFor(meta, ev, vi.colName)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		sqlStr += fmt.Sprintf(" AND %s = %s", db.dialect.QuoteIdent(vi.colName), nextPh())
 		args = append(args, oldVer)
@@ -869,21 +875,37 @@ func UpdateById[T any](ctx context.Context, db *DB, entity *T, opts ...WriteOpti
 	}
 	res, err := db.execContext(ctx, sqlStr, args...)
 	if err != nil {
-		return err
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
 	}
 	if vi != nil {
-		if n, e := res.RowsAffected(); e == nil && n == 0 {
-			return ErrOptimisticLock
+		if n == 0 {
+			return 0, ErrOptimisticLock
 		}
 		// 回写自增后的版本号：库里已经是 version+1，实体却还停在旧值 ——
 		// 同一个实体连续两次 UpdateById，第二次会拿旧版本去比对，于是收到
 		// 一个根本没有并发写者的 ErrOptimisticLock（假冲突）。
 		// 自增主键就是回填的（见 Insert），版本没有理由例外。
 		if err := bumpVersionField(ev, vi); err != nil {
-			return err
+			return 0, err
 		}
 	}
-	return nil
+	return n, nil
+}
+
+// UpdateById 按实体主键更新其非主键字段。
+//
+// 会写入「全部可写列」：未赋值的字段被写回零值（含 created_at 等审计列），
+// 需要部分更新请用 UpdateByIdSets / UpdatePartial，或 OnlyColumns(...) 限定列。
+// 带乐观锁版本列时自动比对并自增版本，命中 0 行返回 ErrOptimisticLock；
+// 无版本列时命中 0 行不报错（历史行为，调用方如需「记录必须存在」的更新
+// 请用 Save，它把 0 行显式报告为 ErrNotFound）。
+func UpdateById[T any](ctx context.Context, db *DB, entity *T, opts ...WriteOption) error {
+	_, err := updateByIdImpl[T](ctx, db, entity, opts...)
+	return err
 }
 
 // bumpVersionField 把实体的乐观锁版本字段 +1，与 SQL 里的 "version = version + 1" 对齐。
@@ -1262,4 +1284,206 @@ func ForceDelete[T any](ctx context.Context, db *DB, q *Query[T]) error {
 	sqlStr := fmt.Sprintf("DELETE FROM %s WHERE %s", quoteTable(queryTable(q, meta, db), db.dialect), w)
 	_, err := db.execContext(ctx, sqlStr, args...)
 	return err
+}
+
+// ---- 批量按主键（IN 列表）----
+
+// idsIN 生成 IN (...) 的占位符列表与对应参数：占位符从 startIdx 起连续编号，
+// 参数按传入顺序返回。位置型方言（MySQL / SQLite 的 ?）按出现次序逐个消耗实参，
+// 调用方必须把返回的 args 原样排在「SQL 文本中先于 IN 出现」的参数之后
+// （见 DeleteByIds 的软删分支 —— SET 值占 Placeholder(1)，IN 从 2 起）。
+func idsIN(d Dialect, startIdx int, ids []any) (string, []any) {
+	phs := make([]string, len(ids))
+	for i := range ids {
+		phs[i] = d.Placeholder(startIdx + i)
+	}
+	return strings.Join(phs, ", "), ids
+}
+
+// SelectByIds 按主键列表批量查询。自动过滤已逻辑删除的行。
+// 返回顺序与 ids 的传入顺序无关（SQL 不保证 IN 的输出次序），需要按序请自行排序。
+//
+// 空 ID 列表返回 ErrInvalidArgument（包装 errors.Is 可判别）：`IN ()` 不是合法 SQL，
+// 若把空列表折叠成恒真条件则等价于全表查询 —— 这类调用几乎总是漏传参数的笔误，
+// 必须显式失败而不是静默查全表。ID 数量受各方言占位符上限约束
+// （PG / MySQL 65535、SQLite 32766），超限由数据库报错，框架不做分片。
+func SelectByIds[T any](ctx context.Context, db *DB, ids ...any) ([]T, error) {
+	meta := getMeta[T]()
+	if meta.pk == nil {
+		return nil, fmt.Errorf("orm: %s 无主键，无法 SelectByIds", meta.table)
+	}
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("orm: SelectByIds: %w：空 ID 列表", ErrInvalidArgument)
+	}
+	d := db.dialect
+	inPh, args := idsIN(d, 1, ids)
+	sqlStr := fmt.Sprintf("SELECT * FROM %s WHERE %s IN (%s)",
+		quoteTable(meta.finalTable(db.prefix), d), d.QuoteIdent(meta.pk.colName), inPh)
+	if s := logicSuffix(resolveLogic(meta, db), d, false); s != "" {
+		sqlStr += " AND " + s
+	}
+	rows, err := db.queryContext(ctx, sqlStr, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanRows[T](rows)
+}
+
+// DeleteByIds 按主键列表批量删除：模型存在生效的逻辑删除列时走逻辑删除
+// （只更新逻辑列，已删除行不受影响），否则物理删除。返回受影响行数。
+// 空 ID 列表返回 ErrInvalidArgument（理由同 SelectByIds）。
+func DeleteByIds[T any](ctx context.Context, db *DB, ids ...any) (int64, error) {
+	meta := getMeta[T]()
+	if meta.pk == nil {
+		return 0, fmt.Errorf("orm: %s 无主键，无法 DeleteByIds", meta.table)
+	}
+	if len(ids) == 0 {
+		return 0, fmt.Errorf("orm: DeleteByIds: %w：空 ID 列表", ErrInvalidArgument)
+	}
+	d := db.dialect
+	if li := resolveLogic(meta, db); li != nil {
+		// 实参顺序必须与占位符在 SQL 文本中的出现顺序一致：SET 在 WHERE 之前，
+		// 所以「删除值」占 Placeholder(1)，IN 列表从 2 起。顺序颠倒时 PG 因为 $n
+		// 自带序号而侥幸正确，MySQL / SQLite 的 ? 会把删除值绑给条件列 ——
+		// 匹配 0 行、不报错、不删除（历史上 Delete 真出过这事故，真库才测得出）。
+		inPh, idArgs := idsIN(d, 2, ids)
+		sqlStr := fmt.Sprintf("UPDATE %s SET %s = %s WHERE %s IN (%s)",
+			quoteTable(meta.finalTable(db.prefix), d),
+			d.QuoteIdent(li.col), d.Placeholder(1),
+			d.QuoteIdent(meta.pk.colName), inPh)
+		args := make([]any, 0, len(ids)+1)
+		args = append(args, li.deletedValue())
+		args = append(args, idArgs...)
+		if s := logicSuffix(li, d, false); s != "" {
+			sqlStr += " AND " + s
+		}
+		res, err := db.execContext(ctx, sqlStr, args...)
+		if err != nil {
+			return 0, err
+		}
+		return res.RowsAffected()
+	}
+	inPh, args := idsIN(d, 1, ids)
+	sqlStr := fmt.Sprintf("DELETE FROM %s WHERE %s IN (%s)",
+		quoteTable(meta.finalTable(db.prefix), d), d.QuoteIdent(meta.pk.colName), inPh)
+	res, err := db.execContext(ctx, sqlStr, args...)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// ForceDeleteByIds 无视逻辑删除列，按主键列表物理删除。
+// 空 ID 列表返回 ErrInvalidArgument（理由同 SelectByIds）。
+func ForceDeleteByIds[T any](ctx context.Context, db *DB, ids ...any) (int64, error) {
+	meta := getMeta[T]()
+	if meta.pk == nil {
+		return 0, fmt.Errorf("orm: %s 无主键，无法 ForceDeleteByIds", meta.table)
+	}
+	if len(ids) == 0 {
+		return 0, fmt.Errorf("orm: ForceDeleteByIds: %w：空 ID 列表", ErrInvalidArgument)
+	}
+	d := db.dialect
+	inPh, args := idsIN(d, 1, ids)
+	sqlStr := fmt.Sprintf("DELETE FROM %s WHERE %s IN (%s)",
+		quoteTable(meta.finalTable(db.prefix), d), d.QuoteIdent(meta.pk.colName), inPh)
+	res, err := db.execContext(ctx, sqlStr, args...)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// UpdateByIdsSets 按主键列表更新 sets 指定的字段（UpdateByIdSets 的批量形态）。
+// 自动跳过已逻辑删除的行，返回受影响行数。
+//
+// 与单行版本不同，批量形态不支持乐观锁：多个目标行的版本各不相同，无法用单个
+// 「WHERE version = 旧值」表达；sets 含版本列时直接报错，避免静默写出只对个别行
+// 成立的条件（那是「不报错但做错事」）。空 ID 列表 / 空 sets 均报错。
+func UpdateByIdsSets[T any](ctx context.Context, db *DB, ids []any, sets map[string]any) (int64, error) {
+	meta := getMeta[T]()
+	if meta.pk == nil {
+		return 0, fmt.Errorf("orm: %s 无主键，无法 UpdateByIdsSets", meta.table)
+	}
+	if len(ids) == 0 {
+		return 0, fmt.Errorf("orm: UpdateByIdsSets: %w：空 ID 列表", ErrInvalidArgument)
+	}
+	if len(sets) == 0 {
+		return 0, fmt.Errorf("orm: UpdateByIdsSets 至少需要一个字段")
+	}
+	d := db.dialect
+	if vi := resolveVersion(meta, db); vi != nil {
+		if _, ok := sets[vi.colName]; ok {
+			return 0, fmt.Errorf("orm: UpdateByIdsSets 的 sets 不应包含乐观锁版本列 %q：批量行版本各异，无法做单版本冲突检测", vi.colName)
+		}
+	}
+	phIdx := 0
+	nextPh := func() string { phIdx++; return d.Placeholder(phIdx) }
+	// sets 是 map，直接遍历会得到随机顺序的 SET 列 —— 与 updateSetsImpl 同理，
+	// 按列名排序保证同一份输入生成的 SQL 文本恒定（语句缓存与日志比对依赖它）。
+	cols := make([]string, 0, len(sets))
+	for col := range sets {
+		cols = append(cols, col)
+	}
+	sort.Strings(cols)
+	setParts := make([]string, 0, len(cols))
+	args := make([]any, 0, len(cols)+len(ids))
+	for _, col := range cols {
+		bv, err := bindVal(meta, col, sets[col])
+		if err != nil {
+			return 0, fmt.Errorf("orm: 列 %q 绑定失败：%w", col, err)
+		}
+		args = append(args, bv)
+		ph := nextPh()
+		if fi := fieldInfoForCol(meta, col); fi != nil && fi.vector {
+			ph = d.VectorBind(ph)
+		}
+		setParts = append(setParts, fmt.Sprintf("%s = %s", d.QuoteIdent(col), ph))
+	}
+	inPh, idArgs := idsIN(d, phIdx+1, ids)
+	args = append(args, idArgs...)
+	sqlStr := fmt.Sprintf("UPDATE %s SET %s WHERE %s IN (%s)",
+		quoteTable(meta.finalTable(db.prefix), d), strings.Join(setParts, ", "),
+		d.QuoteIdent(meta.pk.colName), inPh)
+	if s := logicSuffix(resolveLogic(meta, db), d, false); s != "" {
+		sqlStr += " AND " + s
+	}
+	res, err := db.execContext(ctx, sqlStr, args...)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// Save 按主键判断插入或更新的「直觉版」保存入口：
+//   - 主键为零值（含 nil 指针）→ Insert，自增主键照常回填；
+//   - 主键非零 → 按 UpdateById 的口径全列更新，命中 0 行（记录不存在或已被逻辑删除）
+//     返回 ErrNotFound（errors.Is 可判别）—— 不静默、也不退回 Insert：拿着非零主键
+//     却插入新行，通常意味着主键被意外清零或并发删除，应当显式失败；
+//     需要真正的 upsert 语义请用 Upsert。
+//
+// 写入选项（OmitZero / OnlyColumns）原样透传给 Insert / UpdateById。
+// 注意非零主键的更新会写入全部可写列（未赋值字段写回零值），与 UpdateById 一致。
+func Save[T any](ctx context.Context, db *DB, entity *T, opts ...WriteOption) error {
+	meta := getMeta[T]()
+	if meta.pk == nil {
+		return fmt.Errorf("orm: %s 无主键，无法 Save（无法判断插入还是更新）", meta.table)
+	}
+	if entity == nil {
+		return fmt.Errorf("orm: Save: %w：entity 为 nil", ErrInvalidArgument)
+	}
+	ev := reflect.ValueOf(entity).Elem()
+	if ev.FieldByIndex(meta.pk.idx).IsZero() {
+		return Insert[T](ctx, db, entity, opts...)
+	}
+	n, err := updateByIdImpl[T](ctx, db, entity, opts...)
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("orm: Save 更新命中 0 行（主键 %s = %v 的记录不存在或已被删除）: %w",
+			meta.pk.colName, ev.FieldByIndex(meta.pk.idx).Interface(), ErrNotFound)
+	}
+	return nil
 }
