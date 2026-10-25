@@ -1494,6 +1494,13 @@ func ForceDeleteByIds[T any](ctx context.Context, db *DB, ids ...any) (int64, er
 //     出错（漏扫描、拷贝丢了主键），静默跳过比报错危险得多。要 upsert 请用
 //     Upsert / BatchUpsert，要插入请用 Insert / BatchInsert。
 //
+// **主键非零但记录已不存在时，这一行静默跳过（不报错）** —— 这是 UpdateById 的语义
+// 原样传递：没有版本列时命中 0 行返回 nil（有版本列才会报 ErrOptimisticLock）。
+// 它与上面「零主键报错」看起来不对称，但两者性质不同：零主键是**实体组装错误**，
+// 而「行不在了」可能是并发删除的正常结果，批量更新里把整批打断往往不合适。
+// 需要「不存在就算失败」的语义请逐条用 Save（它就是为此设计的），或在更新前
+// 用 SelectByIds 校验存在性。
+//
 // 带乐观锁版本列时逐行比对并自增版本（与 UpdateById 完全一致）：任一行版本冲突
 // 都会中断并返回 ErrOptimisticLock，该错误同样可用 errors.Is 判别。
 //

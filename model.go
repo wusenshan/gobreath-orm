@@ -592,9 +592,10 @@ func (m *modelMeta) buildScanPlan(cols []string) *scanPlan {
 
 // setterFor 按字段类型选定赋值函数。
 //
-// 只为标量（字符串 / 整数 / 无符号 / 浮点 / 布尔，含其指针形式）做特化；
-// 其余类型（结构体、切片、map，以及 JSON 列）一律回落到通用的 setField，
-// 行为与未特化时完全一致。
+// 先按列语义分流：`,vector` 列交给 setVectorField（驱动交回来的是 "[1,0,0]" 文本，
+// 通用兜底会直接报「无法把 string 赋给 []float32」），JSON 列交给 jsonUnmarshalVal。
+// 剩下的标量（字符串 / 整数 / 无符号 / 浮点 / 布尔，含其指针形式）做类型特化；
+// 其余类型（结构体、切片、map 等）一律回落到通用的 setField，行为与未特化时一致。
 func setterFor(f *fieldInfo) scanSetter {
 	if f.vector {
 		// 向量列必须走专用 setter：驱动交回来的是 "[1,0,0]" 这样的**文本**，

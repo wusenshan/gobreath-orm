@@ -3,6 +3,7 @@ package orm
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -85,6 +86,8 @@ type Hook interface {
 // Config 用于配置数据库连接。推荐方式是按结构体传入，避免参数顺序写错。
 // 连接池参数为零值时不设置，保持 database/sql 默认行为
 // （MaxIdleConns 想显式设为 0 时请通过 db.SQL().SetMaxIdleConns(0) 设置）。
+// 配置读写分离时，这四个参数会应用到**主库与每个副本池**；退出前请调用 DB.Close()
+// 一次性关掉所有池（db.SQL().Close() 只关得掉主库）。
 type Config struct {
 	Driver        string
 	DSN           string
@@ -144,35 +147,66 @@ func Open(args ...any) (*DB, error) {
 		cfg.MultiSource.Primary = DataSource{Driver: cfg.Driver, DSN: cfg.DSN}
 	}
 
-	primary, err := openDataSource(cfg.Driver, cfg.DSN)
-	if err != nil {
-		return nil, err
-	}
-	if sqlDB, ok := primary.(*sql.DB); ok {
-		if cfg.MaxOpenConns != 0 {
-			sqlDB.SetMaxOpenConns(cfg.MaxOpenConns)
-		}
-		if cfg.MaxIdleConns != 0 {
-			sqlDB.SetMaxIdleConns(cfg.MaxIdleConns)
-		}
-		if cfg.ConnMaxLifetime != 0 {
-			sqlDB.SetConnMaxLifetime(cfg.ConnMaxLifetime)
-		}
-		if cfg.ConnMaxIdleTime != 0 {
-			sqlDB.SetConnMaxIdleTime(cfg.ConnMaxIdleTime)
-		}
+	// 主库连接的归属：没有读写路由时由 db.exec 独占；一旦配置了路由，主库池统一交给
+	// router 持有，并且 db.exec 必须与 router.primary 指向**同一个池**。
+	//
+	// 此前这两件事是分裂的：Open 先按 cfg.DSN 开一份池 A 挂到 db.exec，随后
+	// newReadWriteRouter 又按同一份 DSN 开了池 B 交给 router.primary。而常规查询
+	// （execContext / queryContext / queryRowContext）与 queryPrimaryContext 全部走
+	// router，池 A 只剩 Transaction 和 db.SQL() 两条路径在用，于是：
+	//  ① 连接池参数（MaxOpenConns / MaxIdleConns / ConnMaxLifetime / ConnMaxIdleTime）
+	//     只设给了几乎不用的池 A —— 想给主库限流实际限错了对象，主库连接数是 A+B 两份；
+	//  ② db.SQL() 返回池 A：Stats() 里的 QPS / 连接数长期接近 0（监控面板看着像没流量）、
+	//     运行期 SetMaxOpenConns 对查询路径无效、Ping 验的是另一个池的连通性；
+	//  ③ db.SQL().Close() 关不掉 router 的 primary 与各副本池，优雅退出时连接不回收。
+	routerCfg := cfg.ReadWrite
+	if routerCfg == nil && cfg.MultiSource != nil {
+		routerCfg = &ReadWriteConfig{Primary: cfg.MultiSource.Primary, Replicas: cfg.MultiSource.Replicas}
 	}
 
-	db := NewDB(primary, dialectForDriver(cfg.Driver))
-	if cfg.ReadWrite != nil || cfg.MultiSource != nil {
-		routerCfg := cfg.ReadWrite
-		if routerCfg == nil {
-			routerCfg = &ReadWriteConfig{Primary: cfg.MultiSource.Primary, Replicas: cfg.MultiSource.Replicas}
-		}
-		router, err := newReadWriteRouter(routerCfg)
+	var (
+		primary       Executor
+		router        *readWriteRouter
+		primaryDriver = cfg.Driver
+	)
+	switch {
+	case routerCfg == nil:
+		primary, err = openDataSource(cfg.Driver, cfg.DSN)
 		if err != nil {
 			return nil, err
 		}
+		applyPoolSettings(primary, &cfg)
+	case routerCfg.Primary.Driver == cfg.Driver && routerCfg.Primary.DSN == cfg.DSN:
+		// 与 cfg 同源（最常见写法：只配 Replicas、Primary 留空走默认）→ 复用同一个池，
+		// 不再开第二份。这样 db.SQL() / Transaction / 常规查询看到的是同一个池，
+		// 连接池参数也真正作用于查询路径。
+		primary, err = openDataSource(cfg.Driver, cfg.DSN)
+		if err != nil {
+			return nil, err
+		}
+		applyPoolSettings(primary, &cfg)
+		router, err = newReadWriteRouterReusingPrimary(routerCfg, primary, &cfg)
+		if err != nil {
+			// 路由建失败（副本 DSN 打不开等）时，已开的主库池必须回收，
+			// 否则每次失败的 Open 都漏一个池（进程内反复重试会累积到句柄耗尽）。
+			closeExecutors(primary)
+			return nil, err
+		}
+	default:
+		// Primary 指向另一个数据源：主库以它为准（Transaction 必须在真正的写库上开，
+		// 否则事务与常规查询会落在两个不同的库上），cfg.Driver/DSN 只作方言兜底。
+		router, err = newReadWriteRouter(routerCfg, &cfg)
+		if err != nil {
+			return nil, err
+		}
+		primary = router.primary
+		if routerCfg.Primary.Driver != "" {
+			primaryDriver = routerCfg.Primary.Driver
+		}
+	}
+
+	db := NewDB(primary, dialectForDriver(primaryDriver))
+	if router != nil {
 		db.readWrite = router
 	}
 	if cfg.Prefix != "" {
@@ -211,7 +245,43 @@ func openDataSource(driver, dsn string) (Executor, error) {
 	return sql.Open(driver, dsn)
 }
 
-func newReadWriteRouter(cfg *ReadWriteConfig) (*readWriteRouter, error) {
+// applyPoolSettings 把 Config 里的连接池参数应用到 e（不是 *sql.DB 时静默跳过）。
+//
+// 必须对**每一个**连接池（主库与每个副本）各调一次。这些参数是写在 Config 上、
+// 语义上属于「这个 ORM 实例的所有连接」，只设主库会让副本池退回 database/sql 的
+// 默认值（MaxIdleConns=2、MaxOpenConns 无上限），副本一多就与配置意图完全不符。
+func applyPoolSettings(e Executor, cfg *Config) {
+	sqlDB, ok := e.(*sql.DB)
+	if !ok || cfg == nil {
+		return
+	}
+	if cfg.MaxOpenConns != 0 {
+		sqlDB.SetMaxOpenConns(cfg.MaxOpenConns)
+	}
+	if cfg.MaxIdleConns != 0 {
+		sqlDB.SetMaxIdleConns(cfg.MaxIdleConns)
+	}
+	if cfg.ConnMaxLifetime != 0 {
+		sqlDB.SetConnMaxLifetime(cfg.ConnMaxLifetime)
+	}
+	if cfg.ConnMaxIdleTime != 0 {
+		sqlDB.SetConnMaxIdleTime(cfg.ConnMaxIdleTime)
+	}
+}
+
+// closeExecutors 关闭一批执行器里的 *sql.DB（非 *sql.DB 跳过），用于错误路径上回收
+// 已经打开的连接池 —— 不能依赖 GC，*sql.DB 不 Close 时底层连接会挂到进程退出。
+func closeExecutors(execs ...Executor) {
+	for _, e := range execs {
+		if sqlDB, ok := e.(*sql.DB); ok {
+			_ = sqlDB.Close()
+		}
+	}
+}
+
+// newReadWriteRouter 按 cfg.Primary 自带的 DSN 开主库池（Primary 与 Open 的
+// cfg.Driver/DSN 不同源时走这条路径）。
+func newReadWriteRouter(cfg *ReadWriteConfig, pool *Config) (*readWriteRouter, error) {
 	if cfg == nil {
 		return nil, nil
 	}
@@ -223,15 +293,39 @@ func newReadWriteRouter(cfg *ReadWriteConfig) (*readWriteRouter, error) {
 	if err != nil {
 		return nil, err
 	}
-	var reads []Executor
+	applyPoolSettings(primaryExec, pool)
+	replicas, err := openRouterReplicas(cfg, pool)
+	if err != nil {
+		closeExecutors(primaryExec) // 副本开失败时回收刚开的主库池
+		return nil, err
+	}
+	return &readWriteRouter{primary: primaryExec, replicas: replicas}, nil
+}
+
+// newReadWriteRouterReusingPrimary 复用调用方已经打开的主库池，不再开第二份。
+// 同一份 DSN 开两个池的后果见 Open 内的注释（连接池参数落空、db.SQL() 指向
+// 几乎不用的那个池、Close 关不全）。
+func newReadWriteRouterReusingPrimary(cfg *ReadWriteConfig, primary Executor, pool *Config) (*readWriteRouter, error) {
+	replicas, err := openRouterReplicas(cfg, pool)
+	if err != nil {
+		return nil, err
+	}
+	return &readWriteRouter{primary: primary, replicas: replicas}, nil
+}
+
+// openRouterReplicas 打开所有副本池并套用连接池参数；中途失败时回收已开的副本。
+func openRouterReplicas(cfg *ReadWriteConfig, pool *Config) ([]Executor, error) {
+	replicas := make([]Executor, 0, len(cfg.Replicas))
 	for _, r := range cfg.Replicas {
 		exec, err := openDataSource(r.Driver, r.DSN)
 		if err != nil {
+			closeExecutors(replicas...)
 			return nil, err
 		}
-		reads = append(reads, exec)
+		applyPoolSettings(exec, pool)
+		replicas = append(replicas, exec)
 	}
-	return &readWriteRouter{primary: primaryExec, replicas: reads}, nil
+	return replicas, nil
 }
 
 type readWriteRouter struct {
@@ -618,11 +712,48 @@ func (db *DB) WithSlowThreshold(d time.Duration) *DB {
 // SQL 返回底层的 *sql.DB，用于设置连接池参数（SetMaxOpenConns 等）、
 // 获取统计信息（Stats()）或 Ping 验活等逃逸操作。
 // 底层不是 *sql.DB（如事务副本绑定 *sql.Tx）时返回 nil。
+//
+// 配置了读写分离时，返回的是**主库池、且与路由实际使用的池是同一个对象** ——
+// 此前的实现返回另一个同 DSN 但几乎不参与查询的池，Stats() 因此看不到真实流量。
 func (db *DB) SQL() *sql.DB {
 	if sqlDB, ok := db.exec.(*sql.DB); ok {
 		return sqlDB
 	}
 	return nil
+}
+
+// Close 关闭底层的**所有**连接池：主库、读写路由里的主库（同源时与前者是同一个池）
+// 以及每个副本，同一个池只关一次。
+//
+// 这是进程退出时的正确清理方式：以前只能 `db.SQL().Close()`，而配了读写分离后
+// 它只关得掉主库，副本池仍然挂着连接。`*sql.DB.Close` 本身幂等，重复调用不报错；
+// WithPrefix / WithLogger 等派生出来的 DB 共享同一批池，对其调用 Close 会一并关闭
+// 底层连接 —— 只在确认不再使用这个实例时调用。
+// 底层不是 *sql.DB（WithExecutor 绑定的 *sql.Tx）时跳过，返回 nil。
+func (db *DB) Close() error {
+	var errs []error
+	closed := make(map[*sql.DB]struct{}, 4)
+	closeOne := func(e Executor) {
+		sqlDB, ok := e.(*sql.DB)
+		if !ok {
+			return
+		}
+		if _, dup := closed[sqlDB]; dup {
+			return
+		}
+		closed[sqlDB] = struct{}{}
+		if err := sqlDB.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	closeOne(db.exec)
+	if db.readWrite != nil {
+		closeOne(db.readWrite.primary)
+		for _, r := range db.readWrite.replicas {
+			closeOne(r)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // Transaction 在事务中执行 fn；fn 内使用传入的 tx *DB（已绑定 *sql.Tx，且继承日志配置与前缀）。

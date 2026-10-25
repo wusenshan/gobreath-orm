@@ -256,9 +256,13 @@ db, err := orm.Open("postgres", "postgres://user:pass@localhost:5432/demo?sslmod
 sqlDB := db.SQL()               // 返回底层 *sql.DB（事务副本/非 *sql.DB 底层时为 nil）
 sqlDB.SetMaxIdleConns(0)        // 例如显式关闭空闲连接
 _ = sqlDB.Stats()               // 连接池统计
+_ = db.Close()                  // 退出时关掉所有池（含读写分离的副本池）
 ```
 
 > 连接池参数属于 `database/sql` 原生能力，框架在 `Open` 后自动透传设置；`orm.Open` 之外的构建方式（如 `NewDB`）可自行通过 `db.SQL()` 配置。
+>
+> 配置了读写分离时，`db.SQL()` 返回的是**主库池、且与路由实际使用的池是同一个对象**（不是另开的第二份），
+> 四个连接池参数也同时作用于每个副本池。`db.SQL().Close()` 只关得掉主库，**退出请用 `db.Close()`**。
 
 ### 3. 一个最小可运行示例
 
@@ -1435,6 +1439,12 @@ db, _ := orm.Open(orm.Config{
 - 副本为空时所有请求回落主库；`MultiSourceConfig` 与本配置**完全等价**（仅别名），当前统一走同一套路由。
 - 事务内（`db.Transaction`）自动回落主库，避免读副本造成的不一致。
 - 路由选择内部加锁（`sync.Mutex`），并发安全。
+- **主库只开一个连接池**：`ReadWrite.Primary` 与 `Config.Driver` / `DSN` 同源时（最常见写法 —— 只配副本），
+  框架复用同一个池，`db.SQL()` 拿到的就是路由实际在用的主库池，`Stats()` / 运行期 `SetMaxOpenConns` /
+  `Ping` 看到的都是真实流量。`Primary` 指向另一个数据源时以它为准（事务也开在它上面，不会出现
+  「事务在主库 A、查询在主库 B」）。
+- **连接池参数对每个池都生效**：`MaxOpenConns` / `MaxIdleConns` / `ConnMaxLifetime` / `ConnMaxIdleTime`
+  会应用到主库与每个副本；退出前用 `db.Close()` 一次性关掉所有池。
 - **判定细节**：判定前会剥掉 SQL 开头的注释（`/* */`、`--`、MySQL 的 `#`），所以
   `/* trace-id */ UPDATE ...` 这类带前导注释的写语句不会被误判成读。悲观锁读
   （`FOR UPDATE` 等）走主库。
