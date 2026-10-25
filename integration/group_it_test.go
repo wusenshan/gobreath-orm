@@ -159,3 +159,71 @@ func TestDistinctCountIsDeduplicated(t *testing.T) {
 		}
 	})
 }
+
+// ---- COUNT(DISTINCT col) ----
+
+// GrpCustomerSale 支撑「每个部门有多少个不同客户」这个最典型的分组去重统计。
+type GrpCustomerSale struct {
+	ID       int64  `db:"id,pk,autoincrement"`
+	Dept     string `db:"dept"`
+	Customer string `db:"customer"`
+}
+
+func (GrpCustomerSale) TableName() string { return "grp_customer_sales" }
+
+type GrpCustomerStat struct {
+	Dept      string `db:"dept"`
+	Customers int64  `db:"customers"`
+}
+
+var grpCustomerCols = struct {
+	Dept     orm.ColExpr
+	Customer orm.ColExpr
+}{
+	Dept:     orm.ColOf[GrpCustomerSale]("Dept"),
+	Customer: orm.ColOf[GrpCustomerSale]("Customer"),
+}
+
+// TestSelectCountDistinctOnRealDB —— COUNT(DISTINCT col) 必须真的按列去重，
+// 而不是退化成「整行去重后计数」（数据里 a 部门有重复客户，两者结果不同：2 vs 3）。
+func TestSelectCountDistinctOnRealDB(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, db *orm.DB, b backend) {
+		ctx := context.Background()
+		if _, err := orm.RawExec(ctx, db, "DROP TABLE IF EXISTS grp_customer_sales"); err != nil {
+			t.Fatalf("[%s] DROP 失败：%v", b.name, err)
+		}
+		if err := db.AutoMigrate(ctx, &GrpCustomerSale{}); err != nil {
+			t.Fatalf("[%s] AutoMigrate 失败：%v", b.name, err)
+		}
+		for _, s := range []GrpCustomerSale{
+			{Dept: "a", Customer: "alice"},
+			{Dept: "a", Customer: "alice"}, // 同部门重复客户
+			{Dept: "a", Customer: "bob"},
+			{Dept: "b", Customer: "carol"},
+		} {
+			row := s
+			if err := orm.Insert(ctx, db, &row); err != nil {
+				t.Fatalf("[%s] Insert 失败：%v", b.name, err)
+			}
+		}
+
+		stats, err := orm.Aggregate[GrpCustomerStat](ctx, db, orm.NewQuery[GrpCustomerSale]().
+			SelectCol(grpCustomerCols.Dept).
+			SelectCountDistinct(grpCustomerCols.Customer, "customers").
+			GroupBy(grpCustomerCols.Dept).
+			OrderBy(grpCustomerCols.Dept, true))
+		if err != nil {
+			t.Fatalf("[%s] COUNT(DISTINCT) 执行失败：%v", b.name, err)
+		}
+		if len(stats) != 2 {
+			t.Fatalf("[%s] 应返回 2 个分组，实际 %d: %+v", b.name, len(stats), stats)
+		}
+		want := map[string]int64{"a": 2, "b": 1}
+		for _, s := range stats {
+			if s.Customers != want[s.Dept] {
+				t.Fatalf("[%s] 部门 %q 的去重客户数 = %d；期望 %d（整行去重会给出 3）",
+					b.name, s.Dept, s.Customers, want[s.Dept])
+			}
+		}
+	})
+}

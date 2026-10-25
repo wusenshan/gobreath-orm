@@ -3,6 +3,7 @@ package orm
 import (
 	"context"
 	"database/sql/driver"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -242,3 +243,73 @@ func TestPageTotalMatchesGroupedListLength(t *testing.T) {
 }
 
 func ctx() context.Context { return context.Background() }
+
+// ---- COUNT(DISTINCT col) ----
+
+// aggDistinctSale 用于 SelectCountDistinct：需要「部门 + 客户」两列才能表达
+// 「每个部门有多少个不同客户」。
+type aggDistinctSale struct {
+	Id       int64  `db:"id,pk,autoincrement"`
+	Dept     string `db:"dept"`
+	Customer string `db:"customer"`
+}
+
+// TestSelectCountDistinctBuildsSQL 三方言渲染 COUNT(DISTINCT col)，且列名/别名都走方言引号。
+func TestSelectCountDistinctBuildsSQL(t *testing.T) {
+	dept := ColOf[aggDistinctSale]("Dept")
+	customer := ColOf[aggDistinctSale]("Customer")
+	cases := []struct {
+		name string
+		d    Dialect
+		want string
+	}{
+		{"pg", PG,
+			`SELECT "dept", COUNT(DISTINCT "customer") AS "customers" FROM "agg_distinct_sales" GROUP BY "dept"`},
+		{"mysql", MySQL,
+			"SELECT `dept`, COUNT(DISTINCT `customer`) AS `customers` FROM `agg_distinct_sales` GROUP BY `dept`"},
+		{"sqlite", SQLite,
+			`SELECT "dept", COUNT(DISTINCT "customer") AS "customers" FROM "agg_distinct_sales" GROUP BY "dept"`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			sqlStr, _ := NewQuery[aggDistinctSale]().WithDialect(c.d).
+				SelectCol(dept).
+				SelectCountDistinct(customer, "customers").
+				GroupBy(dept).
+				ToSQL()
+			if sqlStr != c.want {
+				t.Fatalf("SQL 不符\nwant: %s\n got: %s", c.want, sqlStr)
+			}
+		})
+	}
+}
+
+// TestSelectCountDistinctRequiresAlias：别名仍是必填的，与其它聚合投影同一口径。
+func TestSelectCountDistinctRequiresAlias(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("缺别名应 panic")
+		}
+		if !strings.Contains(fmt.Sprint(r), "别名") {
+			t.Fatalf("panic 文案应说明别名必填，实际: %v", r)
+		}
+	}()
+	NewQuery[aggDistinctSale]().
+		SelectCountDistinct(ColOf[aggDistinctSale]("Customer"), "")
+}
+
+// TestSelectCountDistinctIsNotSelectDistinct：COUNT(DISTINCT col) 不能退化成
+// 「整行去重后计数」——两者语义不同，SQL 里必须能看到 DISTINCT 在括号内。
+func TestSelectCountDistinctIsNotSelectDistinct(t *testing.T) {
+	sqlStr, _ := NewQuery[aggDistinctSale]().WithDialect(PG).
+		SelectCountDistinct(ColOf[aggDistinctSale]("Customer"), "customers").
+		GroupBy(ColOf[aggDistinctSale]("Dept")).
+		ToSQL()
+	if strings.HasPrefix(sqlStr, "SELECT DISTINCT") {
+		t.Fatalf("不应把 Distinct() 的整行去重混进来: %s", sqlStr)
+	}
+	if !strings.Contains(sqlStr, "COUNT(DISTINCT \"customer\")") {
+		t.Fatalf("应渲染括号内的 DISTINCT: %s", sqlStr)
+	}
+}

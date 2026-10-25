@@ -117,6 +117,17 @@ orm.NewQuery[Article]().WithDialect(orm.PG).
 //   ORDER BY "embedding" <=> $1 LIMIT 20
 ```
 
+只做过滤（不排序、不投影 `dist` 列）—— 单独调用 `WithinDistance` 就是纯 `WHERE` 条件：
+
+```go
+orm.NewQuery[Article]().WithDialect(orm.PG).
+    WithinDistance(embCol, queryVec, 0.3).Build()
+// → SELECT * FROM "articles" WHERE "embedding" <=> $1 < 0.3
+```
+
+> 纯过滤不排序是 v0.1.15 起的语义（旧版会顺手补一段 `ORDER BY 距离` 并附带 `dist` 列）。
+> 需要按相似度排序请显式连上 `Nearest` / `NearestBy`。这样 `Distinct()` 也能与阈值过滤共存。
+
 ### 4.2 真实检索流程（Postgres 为例）
 
 ```go
@@ -151,6 +162,17 @@ CREATE VECTOR INDEX idx_articles_embedding ON articles(embedding);
 ```
 
 框架生成的 `ORDER BY 距离 ASC LIMIT k` 能直接命中这些索引。
+
+> **`AutoMigrate` 只建向量列，不代建向量索引 —— 这是刻意的，不是遗漏。**
+> 原因有三条，任一条都足以让它没法自动做：
+> 1. PG 的 HNSW 索引必须绑定**度量对应的 ops**（`vector_cosine_ops` / `vector_l2_ops` /
+>    `vector_ip_ops`），而度量是**查询期参数**（`NearestBy(..., orm.Cosine)`），模型层根本
+>    不知道你打算用哪种。建错 ops 的索引查询命中不了，反而制造「我建了索引怎么还慢」的假象；
+> 2. MySQL 社区版没有 `VECTOR INDEX`（仅 HeatWave on OCI / MySQL AI），建了直接报错；
+> 3. SQLite 没有向量能力，无从建起。
+>
+> 另外 IVFFlat 这类索引需要表里**先有数据**再建（lists 参数依赖数据量），建表阶段本来就不该建。
+> 所以请按上面的脚本手工建，或在迁移流程里单独执行。
 
 ---
 

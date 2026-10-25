@@ -2,6 +2,7 @@ package integration
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	orm "github.com/wusenshan/gobreath-orm"
@@ -303,5 +304,30 @@ func vectorDistanceChecks(t *testing.T, db *orm.DB, b backend) {
 		t.Errorf("[%s] NearestBy(Cosine) + Pluck 返回 %d 项；期望 2", b.name, len(names))
 	} else if names[0] != "x 轴" {
 		t.Errorf("[%s] 余弦最近邻首项 = %q；期望「x 轴」", b.name, names[0])
+	}
+
+	// ---- 纯阈值过滤不再隐含排序 / dist 列（v0.1.15）----
+	// 单独用 WithinDistance 时 SQL 里既没有 `AS dist` 也没有 ORDER BY，
+	// 于是 DISTINCT 与它可以共存。这里的判据不只是「能跑」：PG 只要 SQL 里还留着
+	// `ORDER BY 距离表达式`，`SELECT DISTINCT` 就会直接报 "ORDER BY expressions must
+	// appear in select list" —— 跑通即证明距离排序确实没了。
+	filterOnly := orm.NewQuery[VecDoc]().Distinct().WithinDistance(vEmb, []float32{1, 0, 0}, 0.2)
+	if sqlStr, _ := orm.DryRun(db, filterOnly); strings.Contains(sqlStr, "AS dist") || strings.Contains(sqlStr, "ORDER BY") {
+		t.Errorf("[%s] 纯阈值过滤不应投影 dist 或按距离排序，实际: %s", b.name, sqlStr)
+	}
+	distinctRows, err := orm.SelectList(ctx, db, filterOnly)
+	if err != nil {
+		t.Fatalf("[%s] Distinct + WithinDistance 执行失败：%v", b.name, err)
+	}
+	if len(distinctRows) != 2 {
+		t.Errorf("[%s] 阈值 0.2 去重后应有 2 行，实际 %d", b.name, len(distinctRows))
+	}
+	total, err := orm.Count(ctx, db,
+		orm.NewQuery[VecDoc]().Distinct().WithinDistance(vEmb, []float32{1, 0, 0}, 0.2))
+	if err != nil {
+		t.Fatalf("[%s] Distinct + WithinDistance + Count 执行失败：%v", b.name, err)
+	}
+	if total != int64(len(distinctRows)) {
+		t.Errorf("[%s] Count=%d 与列表行数 %d 口径不一致", b.name, total, len(distinctRows))
 	}
 }

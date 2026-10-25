@@ -3,6 +3,7 @@ package integration
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -186,4 +187,102 @@ func colNames(cols []orm.ColumnMeta) []string {
 		out[i] = c.Name
 	}
 	return out
+}
+
+// TestUpdateByIdsOnRealDB —— 逐条更新真的落到每一行，且未列入的行不受影响。
+//
+// 为什么必须真库：mock 只能数出「执行了两条 UPDATE」，证明不了 WHERE 的实参绑到了
+// 对应的主键 —— 位置型方言上实参错位仍是一条语法正确的 SQL，只会静默改错行。
+func TestUpdateByIdsOnRealDB(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, db *orm.DB, b backend) {
+		ctx := context.Background()
+		users := seedUsers(t, db)
+
+		users[0].Name, users[0].Age = "alice-v2", 31
+		users[1].Name, users[1].Age = "bob-v2", 26
+		if err := orm.UpdateByIds[User](ctx, db, users[:2]); err != nil {
+			t.Fatalf("[%s] UpdateByIds 出错：%v", b.name, err)
+		}
+
+		got, err := orm.SelectByIds[User](ctx, db, users[0].ID, users[1].ID)
+		if err != nil {
+			t.Fatalf("[%s] 回读失败：%v", b.name, err)
+		}
+		byID := make(map[int64]User, len(got))
+		for _, u := range got {
+			byID[u.ID] = u
+		}
+		if u := byID[users[0].ID]; u.Name != "alice-v2" || u.Age != 31 {
+			t.Fatalf("[%s] 第 0 行未按预期更新：%+v", b.name, u)
+		}
+		if u := byID[users[1].ID]; u.Name != "bob-v2" || u.Age != 26 {
+			t.Fatalf("[%s] 第 1 行未按预期更新：%+v", b.name, u)
+		}
+
+		// 未列入批量列表的行必须原样保留（这是「逐条按主键」而不是「全表更新」的证据）。
+		third, err := orm.SelectById[User](ctx, db, users[2].ID)
+		if err != nil {
+			t.Fatalf("[%s] 回读第 2 行失败：%v", b.name, err)
+		}
+		if third.Name != "carol" || third.Age != 35 {
+			t.Fatalf("[%s] 未列入的行被误改：%+v", b.name, third)
+		}
+
+		// 零主键：批量更新不做插入，必须报错且指到具体行号。
+		if err := orm.UpdateByIds[User](ctx, db, []User{{ID: 0, Name: "ghost"}}); err == nil {
+			t.Fatalf("[%s] 零主键应报错，实际通过", b.name)
+		} else if !strings.Contains(err.Error(), "第 0 行") {
+			t.Fatalf("[%s] 错误应带行号，实际：%v", b.name, err)
+		}
+	})
+}
+
+// TestUpdateByIdsOptimisticLockOnRealDB —— 批量入口的乐观锁与单行版同一口径：
+// 任一行版本冲突就中断，且错误可被 errors.Is 判到 ErrOptimisticLock。
+func TestUpdateByIdsOptimisticLockOnRealDB(t *testing.T) {
+	forEachBackend(t, func(t *testing.T, db *orm.DB, b backend) {
+		ctx := context.Background()
+		if err := db.AutoMigrate(ctx, &Doc{}); err != nil {
+			t.Fatalf("[%s] AutoMigrate 失败：%v", b.name, err)
+		}
+		docs := []Doc{{Title: "a"}, {Title: "b"}}
+		for i := range docs {
+			if err := orm.Insert(ctx, db, &docs[i]); err != nil {
+				t.Fatalf("[%s] Insert 第 %d 行失败：%v", b.name, i, err)
+			}
+		}
+
+		// 先正常更新一次把库里的 version 推高（实体也回写成新值），再把内存版本
+		// 人为退回一档 —— 等价于「别处已经改过这一行」。版本基数由真库读回，
+		// 不假设插入时的默认值（各后端对非空整型列的初始值处理一致，但不必依赖它）。
+		docs[0].Title = "a-touched"
+		if err := orm.UpdateById(ctx, db, &docs[0]); err != nil {
+			t.Fatalf("[%s] 预更新失败：%v", b.name, err)
+		}
+		cur, err := orm.SelectById[Doc](ctx, db, docs[0].ID)
+		if err != nil {
+			t.Fatalf("[%s] 回读第 0 行失败：%v", b.name, err)
+		}
+		docs[0].Version = cur.Version - 1
+		docs[0].Title, docs[1].Title = "a2", "b2"
+
+		err = orm.UpdateByIds[Doc](ctx, db, docs)
+		if err == nil {
+			t.Fatalf("[%s] 第 0 行版本已过期，应报冲突，实际通过", b.name)
+		}
+		if !errors.Is(err, orm.ErrOptimisticLock) {
+			t.Fatalf("[%s] 应为 ErrOptimisticLock，实际：%v", b.name, err)
+		}
+		if !strings.Contains(err.Error(), "第 0 行") {
+			t.Fatalf("[%s] 错误应指出冲突发生在第 0 行：%v", b.name, err)
+		}
+		// 第 1 行没有执行 —— 遇错即停。
+		second, err := orm.SelectById[Doc](ctx, db, docs[1].ID)
+		if err != nil {
+			t.Fatalf("[%s] 回读第 1 行失败：%v", b.name, err)
+		}
+		if second.Title != "b" {
+			t.Fatalf("[%s] 遇错即停：第 1 行不应被更新，实际 title=%q", b.name, second.Title)
+		}
+	})
 }

@@ -40,7 +40,7 @@
 - 🌐 **读写分离 / 多数据源**：`Config.ReadWrite`（或等价的 `Config.MultiSource`）声明主库 + 只读副本；框架按 SQL 前缀自动把写操作路由主库、读操作 round-robin 到副本，事务内自动回落主库；**`SELECT ... FOR UPDATE` / `FOR SHARE` 等悲观锁读也会识别并路由主库**，避免锁落在只读副本上失效。*`*readWriteRouter` 内部加锁，并发安全。
 - 🗃 **AutoMigrate（数据库迁移）**：`db.AutoMigrate(ctx, &User{}, &Order{})` 幂等建表（`CREATE TABLE IF NOT EXISTS`）+ **补齐已有表缺失的列**（`ALTER TABLE ADD COLUMN`，只增不减）+ 二级索引（PG/SQLite 用 `CREATE INDEX IF NOT EXISTS`；MySQL 不支持该子句，改由忽略「索引已存在」错误保证幂等），三方言自动生成 DDL；自动识别 `,vector(N)`（PG `vector(N)` / MySQL `VECTOR(N)` / SQLite `TEXT`）与 `,json`（PG `JSONB` / MySQL `JSON` / SQLite `TEXT`）、`,unique` / `,index`；无需引入迁移工具即可让表结构与结构体对齐。
 - 🔗 **关联预加载（Preload）**：`orm.Preload(ctx, db, &users, "Articles")` 一次性批量加载 **has_many / has_one / belongs_to** 关联，避免 N+1 查询；默认外键约定 `<类型名>_id`（如 `User` → `user_id`），可用 `orm:"has_many;fk:user_id"` / `orm:"belongs_to;fk:xxx"` 覆盖；软删除过滤对子查询同样生效。
-- ⋇ **Distinct 去重查询**：`orm.NewQuery[T]().Distinct()` 生成 `SELECT DISTINCT`，可搭配 `Select` / 条件 / 排序 / 分页照常使用。⚠️ **不能与向量检索（`Nearest` / `WithinDistance`）同时使用** —— 距离列 `dist` 每行都不同，加上它之后 `DISTINCT` 会静默失效（去重彻底不起作用）；不追加 `dist` 又会让 `SELECT DISTINCT` 的 `ORDER BY` 非法（PG 一律拒绝，MySQL 在排序列不在投影里时拒绝，SQLite 接受 —— 跨方言口径无法统一）。这个组合在 `SelectList` / `Count` / `Page` / 聚合上**一律 panic**，不给数据库留报语法错误的机会；需要去重请先按业务键查出去重（或改用 `GroupBy` 分组），再单独做向量检索。
+- ⋇ **Distinct 去重查询**：`orm.NewQuery[T]().Distinct()` 生成 `SELECT DISTINCT`，可搭配 `Select` / 条件 / 排序 / 分页照常使用。⚠️ **不能与按距离排序（`Nearest` / `NearestBy`）同时使用** —— 距离列 `dist` 每行都不同，加上它之后 `DISTINCT` 会静默失效（去重彻底不起作用）；不追加 `dist` 又会让 `SELECT DISTINCT` 的 `ORDER BY` 非法（PG 一律拒绝，MySQL 在排序列不在投影里时拒绝，SQLite 接受 —— 跨方言口径无法统一）。这个组合在 `SelectList` / `Count` / `Page` / 聚合上**一律 panic**，不给数据库留报语法错误的机会。**只做阈值过滤的 `WithinDistance` 不受影响**：它既不排序也不投影 `dist`，`SELECT DISTINCT * FROM t WHERE 距离 < ?` 完全合法（「邻域内去重后有多少条」照常可算）。
 
 ---
 
@@ -372,7 +372,7 @@ if errors.Is(err, orm.ErrNotFound) {
 }
 ```
 
-### 批量按主键（SelectByIds / DeleteByIds / UpdateByIdsSets）
+### 批量按主键（SelectByIds / DeleteByIds / UpdateByIdsSets / UpdateByIds）
 
 service 层最常见的「按 ID 列表批量查 / 删 / 改」有现成入口，逻辑删除语义与单数版完全一致（存在生效的逻辑删除列时走逻辑删除）：
 
@@ -383,10 +383,18 @@ users, err := orm.SelectByIds[User](ctx, db, 1, 2, 3)
 // 批量删除：返回受影响行数（软删模型走逻辑删除，ForceDeleteByIds 物理删除）
 n, err := orm.DeleteByIds[User](ctx, db, 4, 5)
 
-// 批量部分更新（map 形态，与 UpdateByIdSets 同语义）
+// 批量部分更新（map 形态：同一份 sets 套给多行，与 UpdateByIdSets 同语义）
 n, err := orm.UpdateByIdsSets[User](ctx, db,
     []any{int64(4), int64(5)},
     map[string]any{"status": 2, "reviewed_by": "admin"})
+
+// 逐条按主键更新实体（每行值各不相同：走 UpdateById 的口径，全列更新）
+err = orm.UpdateByIds[User](ctx, db, users) // 逐条执行、不隐式开事务、遇错即停
+
+// 需要「要么全成功要么全回滚」时自己套事务
+err = db.Transaction(ctx, func(tx *orm.DB) error {
+    return orm.UpdateByIds(ctx, tx, users)
+})
 ```
 
 > ⚠️ **空 ID 列表返回 `ErrInvalidArgument`**：`IN ()` 不是合法 SQL，把空列表折叠成恒真条件
@@ -394,6 +402,12 @@ n, err := orm.UpdateByIdsSets[User](ctx, db,
 > ID 数量受各方言占位符上限约束（PG / MySQL 65535、SQLite 32766），框架不做自动分片。
 > 批量更新不支持乐观锁版本列（多行版本各不相同，无法用单个 `WHERE version = ?` 表达），
 > sets 含版本列时直接报错。
+>
+> `UpdateByIds`（传 `[]T`）与上面三个 API 的差异要留意：它**逐条发 SQL**（每行 SET 值不同，
+> 合并只能拼 `CASE WHEN`），所以不要拿它跟 `BatchInsert` 的吞吐类比；它**不隐式开事务**，
+> 中途失败前面已更新的行不回滚；**主键为零值直接报错**（批量更新不做插入，主键为零通常是
+> 实体组装出错）；空切片是空操作（返回 nil）。好处是它完整支持乐观锁 —— 逐行比对、逐行
+> 自增版本，任一行冲突即中断并返回 `ErrOptimisticLock`。
 
 ### 条件查询列表（SelectList）
 
@@ -496,7 +510,7 @@ err := users.Transaction(ctx, func(tx *orm.Repo[User]) error {
 })
 ```
 
-`Repo[T]` 完整转发：`Insert / BatchInsert / SelectById / SelectByIds / SelectList / SelectOne / QueryIter / Page / Count / Exists / UpdateById / Save / Update / DeleteById / DeleteByIds / ForceDeleteByIds / UpdateByIdsSets / Delete / ForceDelete / Transaction`，底层与包级泛型函数完全一致，只是把 `T` 提前固定了。
+`Repo[T]` 完整转发：`Insert / BatchInsert / SelectById / SelectByIds / SelectList / SelectOne / QueryIter / Page / Count / Exists / UpdateById / UpdateByIds / Save / Update / DeleteById / DeleteByIds / ForceDeleteByIds / UpdateByIdsSets / Delete / ForceDelete / Transaction`，底层与包级泛型函数完全一致，只是把 `T` 提前固定了。
 
 ### 按主键更新（UpdateById）
 
@@ -904,6 +918,7 @@ stats, err := orm.Aggregate[DeptStat](ctx, db,
 | `SelectCol(col ColExpr)` | 追加一个分组列（类型安全版 `Select`，列名来自 `db` tag 白名单） |
 | `SelectSum / SelectAvg / SelectMax / SelectMin(col, alias)` | 追加 `FN(col) AS alias` |
 | `SelectCount(alias)` | 追加 `COUNT(*) AS alias` |
+| `SelectCountDistinct(col, alias)` | 追加 `COUNT(DISTINCT col) AS alias`（单列去重计数，**不计 NULL**；与整行的 `Distinct()` 不是一回事） |
 | `HavingCount(op, val)` | `HAVING COUNT(*) op ?`（其余同理：`HavingSum` / `HavingAvg` / `HavingMax` / `HavingMin`） |
 | `Aggregate[DTO](ctx, db, q)` | 执行并把分组结果逐行扫进 DTO（第二个类型参数由 `*Query[T]` 推导） |
 
@@ -915,6 +930,9 @@ stats, err := orm.Aggregate[DeptStat](ctx, db,
 - **DTO 不需要任何新的元数据**：既有行映射本就按「结果集列名 == 字段的 `db` 列名」匹配，
   而带 `AS` 的聚合列交给 `rows.Columns()` 的正是别名 —— 落到同一套逻辑上，也不需要给实体模型
   加「只读列」tag（`db:"-"` 会同时让它不进 INSERT，反而更绕）。
+- **NULL 会静默变成零值**：分组结果里的 NULL（例如某组 `SUM` 全为 NULL）落到非指针字段时
+  保留零值 —— `float64` 字段**无法区分**「该组总和为 0」与「该组无数据」。要区分就把 DTO 字段
+  声明成 `*float64`，指针会被置 `nil`。单值聚合（`Sum` / `Avg`）同一口径：空结果集返回 0 而不报错。
 - **分组列请自行 `GroupBy` 补齐**：MySQL 默认开 `ONLY_FULL_GROUP_BY`、PG 强制要求非聚合投影列
   必须出现在 `GROUP BY` 里，缺了会由数据库报错 —— 框架不替你猜分组键。
 - 处理后的行数 / 分页：`Count` 在这类带 `GROUP BY` 或 `DISTINCT` 的查询上会自动改成子查询计数
@@ -1236,7 +1254,16 @@ list, err := orm.SelectList(ctx, db,
 
 // 欧几里得（默认度量，等价于旧版 Nearest）+ 距离阈值：距离 < 0.3 才返回
 q := orm.NewQuery[Doc]().Nearest(embCol, vec, 10).WithinDistance(embCol, vec, 0.3)
+
+// 只做阈值过滤：不加 Nearest 时它不排序、也不附带 dist 列
+only := orm.NewQuery[Doc]().WithinDistance(embCol, vec, 0.3)
 ```
+
+> **`WithinDistance` 是纯过滤**：单独使用时生成 `SELECT * FROM docs WHERE 距离 < ?`，
+> **既不会按距离排序、也不会投影 `dist` 列**（需要排序请连 `Nearest` / `NearestBy`）。
+> 这样设计是因为纯过滤场景不应为一个排序白付全表距离计算；顺带的好处是它能与 `Distinct()` 共存
+> —— `SELECT DISTINCT * FROM docs WHERE 距离 < ?` 是合法 SQL，而带距离排序的 `DISTINCT` 在三方言上口径不一致（见 Distinct 一节）。
+> 如果你是从 v0.1.14 及更早版本升上来，旧行为是「自动排序并附带 `dist` 列」，升级时请检查依赖该顺序的调用点。
 
 **距离度量**（`orm.VectorMetric`，默认 `L2`）：
 
@@ -1300,6 +1327,12 @@ err := orm.Upsert(ctx, db, &User{Id: 1, Name: "neo", Age: 30}, nil)
 
 主键留零值时语义就是「插入新行、主键交给数据库」，此时不会写 `id` 列。`BatchUpsert` 因多行 `VALUES` 必须列数一致，按整批决策：整批都赋了主键才带上该列，只赋了部分会**直接报错**而不是猜。
 
+> ⚠️ **`conflictCols` 必须是模型里的真实列名**（空串 / 重复 / 未映射列一律返回 `ErrInvalidArgument`，且不下发 SQL）。
+> 这条校验主要为了兜住 MySQL：它的 `ON DUPLICATE KEY UPDATE` **语法里没有冲突键位置，会完全忽略 `conflictCols`**，
+> 一律按表上已有的唯一索引判定 —— 冲突键拼错在 MySQL 上不会报任何错，只会静默按另一个唯一键插入或更新。
+> PG / SQLite 会把冲突键原样拼进 `ON CONFLICT (...)`，拼错由数据库报错但指不回调用处。
+> 反过来也要记住：**MySQL 上「冲突键写对了」也不代表它生效**，真正决定行为的是表上的唯一索引。
+
 ### 部分更新（多字段 / map）
 
 不想整行更新时，用 `Query.Set(col, val)` 链式 + `UpdateSets`，或以 `map[string]any` 传 `UpdatePartial` / `UpdateByIdSets`。**强制带 WHERE 条件，禁止全表更新**；向量列同样自动序列化绑定。
@@ -1314,6 +1347,12 @@ _, _ = orm.UpdateSets(ctx, db, orm.NewQuery[User]().
 // map：按主键改部分字段
 _, _ = orm.UpdateByIdSets[User](ctx, db, int64(1), map[string]any{"name": "bob"})
 ```
+
+> ⚠️ **`UpdateSets` / `UpdatePartial` 不许写乐观锁版本列**：这两个入口是**按条件**更新，命中的是多行、各行版本互不相同，
+> 把调用方手里的单个值写进所有行等于一次性抹平版本差异 —— 之后任何带 `WHERE version = ?` 的更新都匹配不上，
+> 并发冲突检测彻底失效且不报错。`sets` 里出现版本列时直接返回 `ErrInvalidArgument`。
+> 需要单行乐观锁用 `UpdateByIdSets`（`sets` 带版本值即触发校验），需要按条件批量更新并让版本自增用实体路径的 `Update`。
+> 反过来说：这两个 entry **不会**替你 bump 版本列（与 `UpdateByIdSets` 的「sets 不带版本列就不碰版本列」同口径）。
 
 ### 乐观锁
 
@@ -1555,11 +1594,14 @@ cities, err := orm.SelectList(ctx, db,
 
 `Distinct()` 与 `Select` / `Eq` / `OrderBy` / `Limit` / `Page` 等链式条件完全兼容，顺序随意。
 
-> **不能与向量检索同时使用。** `Distinct()` + `Nearest` / `WithinDistance` 在 `SelectList` /
+> **不能与按距离排序同时使用。** `Distinct()` + `Nearest` / `NearestBy` 在 `SelectList` /
 > `Count` / `Page` / 聚合上**一律 panic**：距离列每行都不同，加上它 `DISTINCT` 会静默失效；
 > 不追加距离列，`SELECT DISTINCT` 的 `ORDER BY` 又非法（PG 一律拒绝、MySQL 在排序列不在投影里
-> 拒绝、SQLite 接受 —— 跨方言口径无法统一）。需要「去重 + 向量」请分两步：先用 `GroupBy`
+> 拒绝、SQLite 接受 —— 跨方言口径无法统一）。需要「去重 + 近邻」请分两步：先用 `GroupBy`
 > 或业务键去重，再对结果单独做向量检索。
+>
+> **只做阈值过滤的 `WithinDistance` 可以用**：它不排序、不投影 `dist`，
+> `SELECT DISTINCT * FROM t WHERE 距离 < ?` 在三方言上都合法，「邻域内去重后有多少条」照常能算。
 
 > `Select(cols ...string)` 只接受**列名**（会按方言加引号）。要投影 `SUM(col)`、`COUNT(*)` 这类**聚合表达式**，
 > 请用专用的 `SelectSum` / `SelectCount` 等构造器（见「分组聚合（GroupBy / Having）」），或走 `RawQuery`。

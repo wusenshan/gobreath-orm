@@ -365,6 +365,11 @@ This is intended for:
 - duplicate detection
 - approximate nearest-neighbor ranking
 
+`WithinDistance(col, vec, threshold)` is a **pure filter**: used on its own it emits
+`SELECT * FROM docs WHERE distance < ?` with no `ORDER BY` and no `dist` column.
+Chain it with `Nearest` / `NearestBy` when you also want distance ordering.
+Because it does not order by distance, it can be combined with `Distinct()`.
+
 ---
 
 ## Transactions
@@ -409,6 +414,14 @@ type User struct {
 
 Update operations automatically add the version check and increment the version counter.
 
+**The version column cannot be written through the map-based conditional entries** (`UpdateSets` /
+`UpdatePartial`): they update multiple rows with different versions, so writing one caller-supplied
+value would flatten them all and silently disable conflict detection. Those entries return
+`ErrInvalidArgument` when `sets` contains the version column; use `UpdateByIdSets` for single-row
+optimistic locking, or `Update` (entity form) to bump the version on a conditional batch update.
+Note that the map-based entries never bump the version on their own — same rule as
+`UpdateByIdSets` when `sets` omits the version column.
+
 ---
 
 ## Aggregrates and paging
@@ -436,6 +449,29 @@ total, err := orm.Sum(ctx, db,
 ```
 
 `Count`, `Exists`, `Sum`, `Avg`, `Max`, and `Min` are supported.
+
+Grouped aggregation uses projections plus `Aggregate[DTO]`:
+
+```go
+type DeptStat struct {
+    Dept  string  `db:"dept"`
+    Total float64 `db:"total"`
+    Cnt   int64   `db:"cnt"`
+}
+
+stats, err := orm.Aggregate[DeptStat](ctx, db,
+    orm.NewQuery[Sale]().
+        SelectCol(deptCol).
+        SelectSum(amountCol, "total").
+        SelectCountDistinct(customerCol, "customers"). // COUNT(DISTINCT "customer") AS "customers"
+        GroupBy(deptCol),
+)
+```
+
+Notes: aggregate aliases are required (dialects name anonymous aggregate columns differently);
+`SelectCountDistinct` counts distinct non-NULL values of one column and is **not** the same as
+`Distinct()` (which deduplicates whole rows). `NULL` results land in non-pointer DTO fields as
+zero values — use `*float64` if you need to tell "sum is 0" from "no rows".
 
 ---
 

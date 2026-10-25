@@ -42,14 +42,16 @@ type join struct {
 // 刻意不接受任意 SQL 片段 —— 只允许三种由框架拼出的形态：
 //  1. 普通列：fn 为空 → 渲染被引号包裹的列名（可带表别名前缀 "u.name"）；
 //  2. 聚合列：fn 为白名单里的聚合函数名 → 渲染 FN(col)，col 为空时渲染 FN(*)；
+//     若 distinct 为 true 则渲染 FN(DISTINCT col)（目前只有 COUNT 用到）；
 //  3. 别名：alias 非空 → 追加 AS "alias"。
 //
 // fn 与 col 都不由调用方以字符串形式给出：fn 取自框架内部的聚合白名单，
 // col 来自 ColExpr（列表达式），alias 需通过标识符规则校验（见 isValidAlias）。
 type selItem struct {
-	fn    string // 聚合函数名（SUM / AVG / MAX / MIN / COUNT），空表示普通列
-	col   string // 列名；fn 非空且 col 为空时渲染 FN(*)
-	alias string // AS 之后的列名，空表示不起别名
+	fn       string // 聚合函数名（SUM / AVG / MAX / MIN / COUNT），空表示普通列
+	col      string // 列名；fn 非空且 col 为空时渲染 FN(*)
+	alias    string // AS 之后的列名，空表示不起别名
+	distinct bool   // true 时渲染 FN(DISTINCT col)，仅对 COUNT 有意义
 }
 
 // sql 渲染单个投影项。表达式中的列名与别名一律走方言引号，不做字符串拼接。
@@ -61,7 +63,11 @@ func (it selItem) sql(d Dialect) string {
 	case it.col == "":
 		s = it.fn + "(*)"
 	default:
-		s = it.fn + "(" + quoteIdentPath(d, it.col) + ")"
+		arg := quoteIdentPath(d, it.col)
+		if it.distinct {
+			arg = "DISTINCT " + arg
+		}
+		s = it.fn + "(" + arg + ")"
 	}
 	if it.alias != "" {
 		s += " AS " + d.QuoteIdent(it.alias)
@@ -95,7 +101,8 @@ type Query[T any] struct {
 	hasVector     bool
 	vecCol        string
 	vector        any
-	vecK          int // 向量近邻条数上限（Nearest 的 k）：与分页 limit 分开存放，见 Nearest
+	vecK          int  // 向量近邻条数上限（Nearest 的 k）：与分页 limit 分开存放，见 Nearest
+	vecOrder      bool // true 时按距离排序（只有 Nearest / NearestBy 置位），并据此决定是否投影 dist 列
 	vecFilterOn   bool
 	vecFilter     float64
 	vectorMetric  VectorMetric   // 向量距离度量，默认 L2
@@ -440,6 +447,22 @@ func (q *Query[T]) SelectCount(alias string) *Query[T] {
 	return q.appendAgg(selItem{fn: "COUNT", alias: alias})
 }
 
+// SelectCountDistinct 追加 COUNT(DISTINCT col) AS alias：统计该列**去重后**的非 NULL 值个数。
+//
+// 它与 Distinct() 不是一回事：Distinct() 作用于整行（SELECT DISTINCT），
+// 这里只对单列去重后计数。最常见的用法是分组里数「有多少个不同的客户」：
+//
+//	stats, err := orm.Aggregate[DeptStat](ctx, db, orm.NewQuery[Sale]().
+//	    SelectCol(saleCols.Dept).
+//	    SelectCountDistinct(saleCols.Customer, "customers").
+//	    GroupBy(saleCols.Dept))
+//
+// 按 SQL 语义，COUNT(DISTINCT col) **不计 NULL**：想单独统计 NULL 那一组，
+// 用 GroupBy 把该列作为分组键。
+func (q *Query[T]) SelectCountDistinct(col ColExpr, alias string) *Query[T] {
+	return q.appendAgg(selItem{fn: "COUNT", col: col.name, alias: alias, distinct: true})
+}
+
 // SelectSum 追加 SUM(col) AS alias。
 func (q *Query[T]) SelectSum(col ColExpr, alias string) *Query[T] {
 	return q.appendAgg(selItem{fn: "SUM", col: col.name, alias: alias})
@@ -539,6 +562,7 @@ func (q *Query[T]) Nearest(col ColExpr, vec any, k int) *Query[T] {
 	// 也会在 Count 里被清掉（分页不该影响总数）。k 是近邻检索自身的上限，
 	// 必须独立于分页存在 —— 否则 Count 会把近邻查询的总数算成全表行数。
 	q.vecK = k
+	q.vecOrder = true
 	q.orders = append(q.orders, order{vec: true, asc: true})
 	return q
 }
@@ -556,7 +580,14 @@ func (q *Query[T]) WithVectorMetric(m VectorMetric) *Query[T] {
 }
 
 // WithinDistance 增加向量距离阈值过滤（默认 L2）：仅返回距离小于 threshold 的行。
-// 常与 Nearest 连用，既限制召回范围又按距离排序。
+//
+// 它**只管过滤**，不改投影、也不排序 —— 生成的是
+// `SELECT * FROM t WHERE 距离 < ?`，没有 dist 列、没有 ORDER BY。
+// 需要「先按距离排序再取前 k 条」请连上 Nearest / NearestBy。
+//
+// 早先的实现在单独使用时也会追加 `距离 AS dist` 并兜底 `ORDER BY 距离`，
+// 代价是纯过滤场景白付一次全表距离计算 + 排序；且 dist 列会让
+// SELECT DISTINCT 失效、与分页总数口径打架。现已改正（见 CHANGELOG v0.1.15）。
 func (q *Query[T]) WithinDistance(col ColExpr, vec any, threshold float64) *Query[T] {
 	q.hasVector = true
 	q.vecCol = col.name
@@ -849,7 +880,7 @@ func (q *Query[T]) Build() (string, []any) {
 	// 结果集会从 1 列变成 2 列，Scan 单值直接报 "expected 1 destination arguments in Scan"。
 	// 另外聚合时的向量排序也要跳过（见下方 ORDER BY），否则是非法 SQL。
 	noVecCol := q.noVecCol
-	// DISTINCT 与向量距离列不能共存，且这个组合此前是**静默做错事**：
+	// DISTINCT 与「按距离排序」不能共存，且这个组合此前是**静默做错事**：
 	// dist 是每行都不同的表达式列，DISTINCT 作用于整行 → 追加 dist 之后每行必然唯一，
 	// 去重彻底失效；而 Count 的内层查询关掉了 dist（noVecCol），那里是真去重 ——
 	// 于是「列表行数」与分页总数按两套口径算，分页器与列表对不上且不报错。
@@ -857,9 +888,13 @@ func (q *Query[T]) Build() (string, []any) {
 	// 表达式必须出现在选择列表里（MySQL 8 同样拒绝），去掉 dist 会让排序非法。
 	// 两种语义无法同时满足，故显式失败。
 	//
-	// 闸门**不能**再带 !noVecCol（即不能给 Count / Page / 聚合开后门）。早先那版认为
+	// 判据是 **vecOrder 而不是 hasVector**：只做距离阈值过滤（WithinDistance）时
+	// 既没有 dist 列、也没有距离排序，`SELECT DISTINCT * FROM t WHERE 距离 < ?`
+	// 完全合法 ——「邻域内去重后有多少条」是个正常需求，不该被一并拦掉。
+	//
+	// 闸门**不能**带 !noVecCol（即不能给 Count / Page / 聚合开后门）。早先那版认为
 	// 「Count 内层 noVecCol=true 就没有矛盾、照常可用」，这个判断是错的：关掉 dist 列
-	// 只影响投影，ORDER BY 依旧由 hasVector 兜底生成，内层实际拼出
+	// 只影响投影，ORDER BY 依旧由 vecOrder 兜底生成，内层实际拼出
 	//
 	//	SELECT DISTINCT * FROM "articles" ORDER BY "emb" <-> $1 LIMIT 3
 	//
@@ -872,13 +907,14 @@ func (q *Query[T]) Build() (string, []any) {
 	// 跨方言不一致；再叠上 SelectList 已 panic、Count 却放行的契约缺口，调用方在
 	// Page 上只会拿到一个不带调用栈的数据库语法错误。清掉 ORDER BY 也不是出路：
 	// 近邻排序一旦消失，LIMIT k 截来的是任意 k 行，Count 会静默给出无意义的数字。
-	if q.distinct && q.hasVector {
-		panic("orm: Distinct() 不能与向量检索（Nearest / NearestBy / WithinDistance）同时使用：" +
+	if q.distinct && q.vecOrder {
+		panic("orm: Distinct() 不能与按距离排序（Nearest / NearestBy）同时使用：" +
 			"距离列 dist 每行都不同，会让 DISTINCT 静默失效；去掉 dist 又会让 DISTINCT 的排序非法" +
 			"（PG 一律拒绝；MySQL 仅在排序列不在投影时才拒绝 —— 同一条 SQL 在不同方言上" +
 			"一个报错一个通过，口径无法统一）。Count / Page / 聚合走同一条闸门，不与列表查询" +
 			"分叉：否则取列表给清晰 panic、取总数给数据库语法错误。" +
-			"需要去重请先按业务键查出去重（或改用 GroupBy 分组），再单独做向量检索")
+			"只做阈值过滤请改用 WithinDistance（它不排序、不投影 dist，可与 Distinct 共存）；" +
+			"需要近邻排序又要去重，请先按业务键查出去重（或改用 GroupBy 分组），再单独做向量检索")
 	}
 	args := []any{}
 	idx := 0
@@ -890,8 +926,9 @@ func (q *Query[T]) Build() (string, []any) {
 
 	// 向量参数「按需」分配 —— 分配参数与写出占位符必须是同一个动作，不能在开头无条件注入。
 	//
-	// 渲染距离表达式的地方共三处：投影里的 dist 列（受 noVecCol 控制）、距离阈值过滤
-	// （受 vecFilterOn 控制）、按距离排序（聚合时整段跳过）。三者都可能同时是关的，
+	// 渲染距离表达式的地方共三处：投影里的 dist 列（受 vecOrder && !noVecCol 控制）、
+	// 距离阈值过滤（受 vecFilterOn 控制）、按距离排序（受 vecOrder / orders 控制，
+	// 聚合时整段跳过）。三者都可能同时是关的，
 	// 于是 SQL 里一个占位符都没有、args 里却多出一个向量：lib/pq 会直接报
 	// "bind message supplies 1 parameters, but prepared statement requires 0"，
 	// MySQL / SQLite 的 prepared 路径同样失败。
@@ -936,7 +973,10 @@ func (q *Query[T]) Build() (string, []any) {
 		}
 		sel = strings.Join(parts, ", ")
 	}
-	if q.hasVector && !noVecCol {
+	// dist 列只在「按距离排序」时才有意义：它是给近邻检索结果附带的距离值。
+	// 纯阈值过滤（WithinDistance）既不排序也不需要这个列 —— 早先无条件追加，
+	// 让 SELECT DISTINCT 失效、让 DTO 凭空多一列、还白算一次距离表达式。
+	if q.vecOrder && !noVecCol {
 		dist := fmt.Sprintf("%s AS dist", d.VectorDistance(q.vecCol, d.Placeholder(vecPH()), q.vectorMetric))
 		if sel == "*" {
 			sel = "*" + ", " + dist
@@ -1010,7 +1050,7 @@ func (q *Query[T]) Build() (string, []any) {
 		if len(ords) > 0 {
 			sql += " ORDER BY " + strings.Join(ords, ", ")
 		}
-	} else if q.hasVector && q.aggFn == "" {
+	} else if q.vecOrder && q.aggFn == "" {
 		sql += fmt.Sprintf(" ORDER BY %s", d.VectorDistance(q.vecCol, d.Placeholder(vecPH()), q.vectorMetric))
 	}
 

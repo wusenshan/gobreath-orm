@@ -116,7 +116,8 @@ func (r *Repo[T]) ForceDelete(ctx context.Context, q *Query[T]) error {
 }
 
 // Save 按主键判断插入或更新：主键为零值 → Insert（自增主键照常回填），
-// 非零 → 全列更新，命中 0 行（记录不存在或已被逻辑删除）返回 ErrNotFound。
+// 非零 → 全列更新。命中 0 行时：无乐观锁版本列报 ErrNotFound，
+// 有版本列报 ErrOptimisticLock（0 行可能是不存在，也可能是版本冲突，单看影响行数无法区分）。
 // 需要真正的 upsert 语义请用 Upsert。
 func (r *Repo[T]) Save(ctx context.Context, entity *T, opts ...WriteOption) error {
 	return Save[T](ctx, r.db, entity, opts...)
@@ -140,6 +141,12 @@ func (r *Repo[T]) DeleteByIds(ctx context.Context, ids ...any) (int64, error) {
 // 空 ID 列表返回 ErrInvalidArgument。
 func (r *Repo[T]) ForceDeleteByIds(ctx context.Context, ids ...any) (int64, error) {
 	return ForceDeleteByIds[T](ctx, r.db, ids...)
+}
+
+// UpdateByIds 按主键逐条更新一批实体（逐条执行、不隐式开事务、遇错即停）。
+// 主键为零值直接报错；空切片是空操作。需要整体原子请套 Transaction。
+func (r *Repo[T]) UpdateByIds(ctx context.Context, entities []T, opts ...WriteOption) error {
+	return UpdateByIds[T](ctx, r.db, entities, opts...)
 }
 
 // UpdateByIdsSets 按主键列表更新 map 指定的字段，返回受影响行数。

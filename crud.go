@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"sort"
@@ -369,6 +370,13 @@ func bindVal(meta *modelMeta, col string, val any) (any, error) {
 //
 // 冲突键需对应表中的主键或唯一索引，否则数据库会报约束错误。更新列 = 全部可写列减去冲突键；
 // 若无可更新列（仅冲突键一列），退化为 DO NOTHING（PG/SQLite）或等价无操作（MySQL）。
+//
+// conflictCols 必须是模型中的真实列名（空串 / 重复 / 未映射列一律返回
+// ErrInvalidArgument）。这条校验是必要的跨方言兜底：**MySQL 的
+// ON DUPLICATE KEY UPDATE 完全忽略冲突键**，只按表上存在的唯一索引判定 ——
+// 在 MySQL 上把冲突键拼错不会报任何错，只会静默按另一个唯一键插入或更新；
+// PG/SQLite 则会原样拼进 ON CONFLICT，交给数据库报错。前置校验让两种方言的行为一致。
+// 反过来说：**MySQL 上「冲突键写对了」也不代表生效**，真正的判定依据是表上的唯一索引。
 func Upsert[T any](ctx context.Context, db *DB, entity *T, conflictCols []string, opts ...WriteOption) error {
 	meta := getMeta[T]()
 	cfg := applyWriteOptions(opts...)
@@ -393,6 +401,9 @@ func Upsert[T any](ctx context.Context, db *DB, entity *T, conflictCols []string
 			return fmt.Errorf("orm: %s 无主键且未指定冲突键，无法 Upsert", meta.table)
 		}
 		cc = []string{meta.pk.colName}
+	}
+	if err := checkConflictCols(meta, cc, "Upsert"); err != nil {
+		return err
 	}
 	cols = upsertConflictCols(meta, ev, cols, cc)
 	updateCols := make([]string, 0, len(cols))
@@ -466,6 +477,46 @@ func Upsert[T any](ctx context.Context, db *DB, entity *T, conflictCols []string
 // 三方言真库实测全中，而 mock 测试恰好把这条错误 SQL 断言成了期望值，所以长期未暴露。
 //
 // 主键为类型零值时**不补**：那时的语义本来就是「插入新行，主键交给数据库」。
+// checkConflictCols 校验 upsert 的冲突键列表（Upsert / BatchUpsert 共用）。
+//
+// 为什么必须前置校验 —— 跨方言口径在这件事上完全相反：
+//   - PG / SQLite 把冲突键原样拼进 ON CONFLICT (...)，列名拼错由**数据库**报
+//     `column "emial" does not exist`，指不回调用处；重复列则是数据库层的
+//     "conflict target specified more than once"。
+//   - MySQL 的 ON DUPLICATE KEY UPDATE **根本不看冲突键**，一律按表上的唯一索引判定。
+//     于是同一个拼错的列名，在 PG 上炸、在 MySQL 上静默按「别的唯一键」插入或更新 ——
+//     调用方以为自己指定了冲突键，实际完全没生效，而且没有任何信号。
+//
+// 这与 checkSetCols 对 map 入口做的是同一类校验（列必须是模型里的真实列），
+// 只是这里还要额外挡空串与重复：空串会渲染成 ON CONFLICT ("")，重复会让
+// ON CONFLICT 的列数与 updateCols 的排除逻辑对不上。
+//
+// 只拒绝「模型里根本没有的列」（fi == nil）。标了 `,ignore` 的列仍然放行：
+// 这类列在表里真实存在、只是 ORM 不负责写它，把它当冲突键（例如外部维护的唯一索引）
+// 是合法用法。
+func checkConflictCols(meta *modelMeta, cc []string, api string) error {
+	if len(cc) == 0 {
+		return fmt.Errorf("orm: %s %s: %w：未指定冲突键", meta.table, api, ErrInvalidArgument)
+	}
+	seen := make(map[string]struct{}, len(cc))
+	for _, c := range cc {
+		if c == "" {
+			return fmt.Errorf("orm: %s %s 的冲突键含空列名：%w", meta.table, api, ErrInvalidArgument)
+		}
+		if _, dup := seen[c]; dup {
+			return fmt.Errorf("orm: %s %s 的冲突键 %q 重复：%w", meta.table, api, c, ErrInvalidArgument)
+		}
+		seen[c] = struct{}{}
+		if fieldInfoForCol(meta, c) == nil {
+			return fmt.Errorf("orm: %s %s 的冲突键 %q 不是模型中的列：%w（PG/SQLite 会把它原样拼进 "+
+				"ON CONFLICT，MySQL 则完全忽略冲突键、只按表上唯一索引判定 —— 拼错在 MySQL 上不会报错，"+
+				"只会静默按另一个唯一键执行；确需对未映射列做冲突判定请用原生 SQL）",
+				meta.table, api, c, ErrInvalidArgument)
+		}
+	}
+	return nil
+}
+
 func upsertConflictCols(meta *modelMeta, ev reflect.Value, cols, conflict []string) []string {
 	var extra []string
 	for _, c := range conflict {
@@ -569,6 +620,9 @@ func BatchUpsert[T any](ctx context.Context, db *DB, entities []T, conflictCols 
 			return fmt.Errorf("orm: %s 无主键且未指定冲突键，无法 BatchUpsert", meta.table)
 		}
 		cc = []string{meta.pk.colName}
+	}
+	if err := checkConflictCols(meta, cc, "BatchUpsert"); err != nil {
+		return err
 	}
 	// 逐行补冲突键列 —— 同一批里各行的自增主键可能有的已赋值、有的没赋值，
 	// 但多行 VALUES 必须列数一致，故这里统一决策（见 upsertBatchConflictCols）。
@@ -1028,6 +1082,12 @@ func checkSetCols(meta *modelMeta, sets map[string]any) error {
 // q.sets 为空则报错。字段名必须是模型中的真实列名（含 db:"..." 的列名），
 // 否则报错且不下发 SQL。返回受影响行数。
 //
+// **不能写乐观锁版本列**（模型带 version 列时，sets 里出现它直接返回
+// ErrInvalidArgument）：这里命中的是多行、各行版本互不相同，写死一个值会让
+// 并发冲突检测失效。需要单行乐观锁请用 UpdateByIdSets。同理，本入口**不**自增
+// 版本列（与 UpdateByIdSets 的「sets 不带版本列就不碰版本列」同口径）——若要
+// 按条件批量更新并让版本自增，请用实体路径的 Update（它会发 version = version + 1）。
+//
 // 例：
 //
 //	orm.UpdateSets(ctx, db, orm.NewQuery[User]().
@@ -1048,6 +1108,23 @@ func updateSetsImpl[T any](ctx context.Context, db *DB, q *Query[T], sets map[st
 	}
 	if err := checkSetCols(meta, sets); err != nil {
 		return 0, err
+	}
+	// 乐观锁版本列不能由 map 直接写。UpdateSets / UpdatePartial 是**按条件**更新，
+	// 命中的是多行、各行版本号互不相同：把调用方手里的单个值写进所有行，等于
+	// 一次性抹平版本差异 —— 之后任何带 `WHERE version = ?` 的更新都匹配不上
+	// （或者反过来，被一个过期值命中），并发冲突检测彻底失效，而且不报错。
+	// Update（实体路径）早已是同一套理由：那里跳过实体的版本值、改发
+	// `version = version + 1`（见上方 Update 内注释）。这里没有「正确值」可写，
+	// 因为多行版本各异，所以只能显式失败。
+	//
+	// 这条校验**不能**下沉到 checkSetCols：UpdateByIdSets 正是靠 sets 里带版本值
+	// 来触发单行乐观锁（那里合法），一刀切会把那条路径打死。
+	if vi := resolveVersion(meta, db); vi != nil {
+		if _, ok := sets[vi.colName]; ok {
+			return 0, fmt.Errorf("orm: %s 的 %q 是乐观锁版本列，UpdateSets / UpdatePartial 不允许直接写：%w："+
+				"按条件更新命中的是多行、各行版本互不相同，写死一个值会让并发冲突检测形同虚设；"+
+				"单行请用 UpdateByIdSets（那里 sets 带版本值即触发 WHERE version 校验）", meta.table, vi.colName, ErrInvalidArgument)
+		}
 	}
 	d := db.dialect
 	phIdx := 0
@@ -1405,6 +1482,47 @@ func ForceDeleteByIds[T any](ctx context.Context, db *DB, ids ...any) (int64, er
 	return res.RowsAffected()
 }
 
+// UpdateByIds 按主键逐条更新一批实体，是 UpdateById 的多行形态。
+//
+// 语义刻意保持「朴素」，不要拿它跟 BatchInsert 的吞吐类比：
+//   - **逐条执行**：每行的 SET 值都不同，无法合并成一条语句（真要一条语句只能拼
+//     CASE WHEN 或按值分组，SQL 会随行数膨胀，还会撞上参数上限）；
+//   - **不隐式开事务**：中途失败时前面已更新的行不会回滚。需要整体原子，
+//     请自行用 db.Transaction 包一层（见示例）；
+//   - **遇错即停**：错误里带下标与主键值，能直接定位是哪一行出的问题；
+//   - **主键为零值直接报错**：批量更新不做「没有就插入」。主键为零通常是实体组装
+//     出错（漏扫描、拷贝丢了主键），静默跳过比报错危险得多。要 upsert 请用
+//     Upsert / BatchUpsert，要插入请用 Insert / BatchInsert。
+//
+// 带乐观锁版本列时逐行比对并自增版本（与 UpdateById 完全一致）：任一行版本冲突
+// 都会中断并返回 ErrOptimisticLock，该错误同样可用 errors.Is 判别。
+//
+// 空切片返回 nil —— 只是没东西可做，不是错误（与 DeleteByIds 的空 ID 守卫不同：
+// 那里折叠成空条件会变成全表操作，这里不会执行任何语句）。
+//
+//	err := db.Transaction(ctx, func(tx *orm.DB) error {
+//	    return orm.UpdateByIds(ctx, tx, users) // 任一行失败 → 整体回滚
+//	})
+func UpdateByIds[T any](ctx context.Context, db *DB, entities []T, opts ...WriteOption) error {
+	meta := getMeta[T]()
+	if meta.pk == nil {
+		return fmt.Errorf("orm: %s 无主键，无法 UpdateByIds", meta.table)
+	}
+	for i := range entities {
+		pk := reflect.ValueOf(&entities[i]).Elem().FieldByIndex(meta.pk.idx)
+		if pk.IsZero() {
+			return fmt.Errorf("orm: UpdateByIds 第 %d 行主键为 %q 的零值：批量更新不做插入，"+
+				"主键为空通常是实体组装出错；要插入请用 Insert / BatchInsert，要 upsert 请用 Upsert",
+				i, meta.pk.colName)
+		}
+		if err := UpdateById(ctx, db, &entities[i], opts...); err != nil {
+			return fmt.Errorf("orm: UpdateByIds 第 %d 行（%s = %v）更新失败：%w",
+				i, meta.pk.colName, pk.Interface(), err)
+		}
+	}
+	return nil
+}
+
 // UpdateByIdsSets 按主键列表更新 sets 指定的字段（UpdateByIdSets 的批量形态）。
 // 自动跳过已逻辑删除的行，返回受影响行数。
 //
@@ -1468,10 +1586,16 @@ func UpdateByIdsSets[T any](ctx context.Context, db *DB, ids []any, sets map[str
 
 // Save 按主键判断插入或更新的「直觉版」保存入口：
 //   - 主键为零值（含 nil 指针）→ Insert，自增主键照常回填；
-//   - 主键非零 → 按 UpdateById 的口径全列更新，命中 0 行（记录不存在或已被逻辑删除）
-//     返回 ErrNotFound（errors.Is 可判别）—— 不静默、也不退回 Insert：拿着非零主键
-//     却插入新行，通常意味着主键被意外清零或并发删除，应当显式失败；
-//     需要真正的 upsert 语义请用 Upsert。
+//   - 主键非零 → 按 UpdateById 的口径全列更新，命中 0 行返回错误 —— 不静默、
+//     也不退回 Insert：拿着非零主键却插入新行，通常意味着主键被意外清零或并发删除，
+//     应当显式失败；需要真正的 upsert 语义请用 Upsert。
+//
+// 命中 0 行时报什么错，取决于模型**有没有乐观锁版本列**（这点容易踩）：
+//   - 无版本列 → ErrNotFound，语义是「记录不存在或已被逻辑删除」；
+//   - 有版本列 → ErrOptimisticLock。updateByIdImpl 的 WHERE 同时带着主键和
+//     `version = 旧值`，0 行既可能是记录不存在、也可能被别人改过版本，
+//     单看影响行数无法区分，所以统一报成冲突（错误信息里会列出三种可能）。
+//     要判「到底是不是不存在」，先 SelectById 查一次再决定是否重试。
 //
 // 写入选项（OmitZero / OnlyColumns）原样透传给 Insert / UpdateById。
 // 注意非零主键的更新会写入全部可写列（未赋值字段写回零值），与 UpdateById 一致。
@@ -1489,6 +1613,15 @@ func Save[T any](ctx context.Context, db *DB, entity *T, opts ...WriteOption) er
 	}
 	n, err := updateByIdImpl[T](ctx, db, entity, opts...)
 	if err != nil {
+		// 带版本列时，0 行被 updateByIdImpl 统一报成 ErrOptimisticLock —— 它无法区分
+		// 「记录不存在」与「版本被别人改过」（两者的 WHERE 都命中 0 行）。这里补上
+		// 三种可能，避免调用方把它当成纯粹的并发冲突去无脑重试。
+		if errors.Is(err, ErrOptimisticLock) {
+			return fmt.Errorf("orm: Save 更新命中 0 行（主键 %s = %v）：记录不存在 / 已被逻辑删除 / "+
+				"版本冲突三者之一 —— 该模型带乐观锁版本列，单凭影响行数无法区分；"+
+				"需要确认是哪种，请先 SelectById 再决定是否重试：%w",
+				meta.pk.colName, ev.FieldByIndex(meta.pk.idx).Interface(), err)
+		}
 		return err
 	}
 	if n == 0 {
