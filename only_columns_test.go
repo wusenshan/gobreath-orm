@@ -23,16 +23,18 @@ type onlyColsLogicUser struct {
 }
 
 // TestOnlyColumnsUpdateById 白名单只放 name 时，SET 子句里不得出现 age。
+// 白名单用类型安全的 Col 闭包表达 —— 调用点不出现字符串列名。
 func TestOnlyColumnsUpdateById(t *testing.T) {
 	ctx := context.Background()
 	db := newMockDB(t)
 
-	if err := UpdateById(ctx, db, &User{Id: 7, Name: "neo", Age: 30}, OnlyColumns("name")); err != nil {
+	if err := UpdateById(ctx, db, &User{Id: 7, Name: "neo", Age: 30},
+		OnlyColumns(Col[User](func(u *User) *string { return &u.Name }))); err != nil {
 		t.Fatalf("UpdateById 失败：%v", err)
 	}
 	want := `UPDATE "users" SET "name" = ? WHERE "id" = ?`
 	if recQuery != want {
-		t.Fatalf("OnlyColumns(\"name\") 应只更新 name：\n 实际 %s\n 期望 %s", recQuery, want)
+		t.Fatalf("OnlyColumns(name) 应只更新 name：\n 实际 %s\n 期望 %s", recQuery, want)
 	}
 	if len(recArgs) != 2 {
 		t.Fatalf("应只有 2 个参数（SET 的 name + WHERE 的 id），实际 %v", recArgs)
@@ -47,7 +49,10 @@ func TestOnlyColumnsMultiColumn(t *testing.T) {
 	ctx := context.Background()
 	db := newMockDB(t)
 
-	if err := UpdateById(ctx, db, &User{Id: 7, Name: "neo", Age: 30}, OnlyColumns("age", "name")); err != nil {
+	if err := UpdateById(ctx, db, &User{Id: 7, Name: "neo", Age: 30},
+		OnlyColumns(
+			Col[User](func(u *User) *int { return &u.Age }),
+			Col[User](func(u *User) *string { return &u.Name }))); err != nil {
 		t.Fatalf("UpdateById 失败：%v", err)
 	}
 	if !strings.Contains(recQuery, `SET "age" = ?, "name" = ?`) {
@@ -61,7 +66,10 @@ func TestOnlyColumnsWithOmitZero(t *testing.T) {
 	db := newMockDB(t)
 
 	// age 留零值：白名单放行 name+age，OmitZero 再把 age 剔掉
-	if err := UpdateById(ctx, db, &User{Id: 7, Name: "neo"}, OnlyColumns("name", "age"), OmitZero()); err != nil {
+	if err := UpdateById(ctx, db, &User{Id: 7, Name: "neo"},
+		OnlyColumns(
+			Col[User](func(u *User) *string { return &u.Name }),
+			Col[User](func(u *User) *int { return &u.Age })), OmitZero()); err != nil {
 		t.Fatalf("UpdateById 失败：%v", err)
 	}
 	if !strings.Contains(recQuery, `SET "name" = ?`) {
@@ -78,7 +86,10 @@ func TestOnlyColumnsRejectsPK(t *testing.T) {
 	ctx := context.Background()
 	db := newMockDB(t)
 
-	err := UpdateById(ctx, db, &User{Id: 7, Name: "neo"}, OnlyColumns("id", "name"))
+	err := UpdateById(ctx, db, &User{Id: 7, Name: "neo"},
+		OnlyColumns(
+			Col[User](func(u *User) *int64 { return &u.Id }),
+			Col[User](func(u *User) *string { return &u.Name })))
 	if err == nil {
 		t.Fatal("白名单含主键列时应报错，实际通过")
 	}
@@ -93,7 +104,10 @@ func TestOnlyColumnsRejectsAutoInc(t *testing.T) {
 	ctx := context.Background()
 	db := newMockDB(t)
 
-	err := Insert(ctx, db, &User{Name: "neo", Age: 30}, OnlyColumns("id", "name"))
+	err := Insert(ctx, db, &User{Name: "neo", Age: 30},
+		OnlyColumns(
+			Col[User](func(u *User) *int64 { return &u.Id }),
+			Col[User](func(u *User) *string { return &u.Name })))
 	if err == nil {
 		t.Fatal("Insert 的白名单含自增主键时应报错，实际通过")
 	}
@@ -103,11 +117,13 @@ func TestOnlyColumnsRejectsAutoInc(t *testing.T) {
 }
 
 // TestOnlyColumnsRejectsUnknownCol 拼错列名必须报错（而不是静默生成少一列的 SET）。
+// 拼写错误只可能出现在字符串逃生舱 OnlyColumnsRaw 上（Col 闭包拼不拼错是编译期的事）——
+// 这条用例同时锁住：走 Raw 时框架照样校验，不会静默降级。
 func TestOnlyColumnsRejectsUnknownCol(t *testing.T) {
 	ctx := context.Background()
 	db := newMockDB(t)
 
-	err := UpdateById(ctx, db, &User{Id: 7, Name: "neo"}, OnlyColumns("nmae"))
+	err := UpdateById(ctx, db, &User{Id: 7, Name: "neo"}, OnlyColumnsRaw("nmae"))
 	if err == nil {
 		t.Fatal("白名单含不存在的列时应报错（拼写防呆），实际通过")
 	}
@@ -122,7 +138,8 @@ func TestOnlyColumnsRejectsLogicCol(t *testing.T) {
 	db := newMockDB(t)
 
 	now := time.Now()
-	err := UpdateById(ctx, db, &onlyColsLogicUser{Id: 7, Name: "neo", DeletedAt: &now}, OnlyColumns("deleted_at"))
+	err := UpdateById(ctx, db, &onlyColsLogicUser{Id: 7, Name: "neo", DeletedAt: &now},
+		OnlyColumns(Col[onlyColsLogicUser](func(u *onlyColsLogicUser) **time.Time { return &u.DeletedAt })))
 	if err == nil {
 		t.Fatal("白名单含逻辑删除列时应报错，实际通过")
 	}
@@ -149,12 +166,28 @@ func TestOnlyColumnsEmpty(t *testing.T) {
 	}
 }
 
+// TestOnlyColumnsColOf ColOf（生成器产出的 XxxCols.Field 底层路径）同样能进白名单，
+// 保证 ormgen 生成物与 Col 闭包两条路都通。
+func TestOnlyColumnsColOf(t *testing.T) {
+	ctx := context.Background()
+	db := newMockDB(t)
+
+	if err := UpdateById(ctx, db, &User{Id: 7, Name: "neo", Age: 30},
+		OnlyColumns(ColOf[User]("Name"))); err != nil {
+		t.Fatalf("UpdateById 失败：%v", err)
+	}
+	if !strings.Contains(recQuery, `SET "name" = ?`) || strings.Contains(recQuery, `"age"`) {
+		t.Fatalf("ColOf(Name) 应只更新 name：%s", recQuery)
+	}
+}
+
 // TestOnlyColumnsDuplicateTolerated 白名单重复项去重而不是报错（无害，不该打扰调用方）。
 func TestOnlyColumnsDuplicateTolerated(t *testing.T) {
 	ctx := context.Background()
 	db := newMockDB(t)
 
-	if err := UpdateById(ctx, db, &User{Id: 7, Name: "neo", Age: 30}, OnlyColumns("name", "name")); err != nil {
+	nameCol := Col[User](func(u *User) *string { return &u.Name })
+	if err := UpdateById(ctx, db, &User{Id: 7, Name: "neo", Age: 30}, OnlyColumns(nameCol, nameCol)); err != nil {
 		t.Fatalf("重复列名不应报错：%v", err)
 	}
 	if got := strings.Count(recQuery, `"name" = ?`); got != 1 {

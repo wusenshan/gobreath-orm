@@ -35,14 +35,30 @@ func OmitZero() WriteOption {
 
 // OnlyColumns 把本次写入限定在给定列上，其余列不进入 SQL。
 //
+// 列以类型安全的列表达式给出（orm.Col 闭包 / orm.ColOf / 生成器产出的 XxxCols.Field），
+// 调用点不出现字符串列名：字段改名会在编译期暴露，列名永远来自结构体 db tag，
+// 与查询构造器（Eq / OrderBy 等）完全同构。列名来自配置、变量等动态场景时
+// 请用 OnlyColumnsRaw，框架仍会在执行前校验。
+//
 // 主要用途是 UpdateById / Update：它们默认写入**全部**可写列，实体上未赋值的字段
 // （典型是 time.Time 的零值）会被一并写回，把库里已有的值抹成零值。用 OnlyColumns
 // 显式声明本次要更新的列即可避免。
 //
 // 与 OmitZero 的区别：OmitZero 按「值是否为零值」动态跳过，OnlyColumns 是静态白名单；
-// 两者可叠加（先取白名单，再按零值过滤）。列名必须是模型的真实列名 ——
-// 拼错或指向主键 / 自增 / 逻辑删除列时直接报错，不做静默忽略（见 filterOnlyCols）。
-func OnlyColumns(cols ...string) WriteOption {
+// 两者可叠加（先取白名单，再按零值过滤）。列必须是模型的真实可写列 ——
+// 指向主键 / 自增 / 逻辑删除 / 不存在的列时直接报错，不做静默忽略（见 filterOnlyCols）。
+func OnlyColumns(cols ...ColExpr) WriteOption {
+	names := make([]string, 0, len(cols))
+	for _, c := range cols {
+		names = append(names, c.Name())
+	}
+	return OnlyColumnsRaw(names...)
+}
+
+// OnlyColumnsRaw 是 OnlyColumns 的字符串逃生舱：列名来自配置、变量等无法在调用点
+// 写出闭包的动态场景。拼写错误仍会被 filterOnlyCols 在执行前报错，但编译期不再有
+// 任何保护 —— 静态可写的列一律优先用 OnlyColumns（ColExpr）。
+func OnlyColumnsRaw(cols ...string) WriteOption {
 	return func(c *writeConfig) {
 		c.only = cols
 		c.onlySet = true

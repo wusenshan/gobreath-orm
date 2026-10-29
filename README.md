@@ -649,15 +649,22 @@ type Article struct {
 // 只想改标题，但 CreatedAt 是零值 —— 这一句会把 created_at 抹成 0001-01-01
 orm.UpdateById(ctx, db, &Article{Id: 1, Title: "新标题"})
 
-// 用白名单明确表达意图
-orm.UpdateById(ctx, db, &Article{Id: 1, Title: "新标题"}, orm.OnlyColumns("title"))
+// 用白名单明确表达意图（列来自类型安全的列表达式，调用点不手写字符串）
+orm.UpdateById(ctx, db, &Article{Id: 1, Title: "新标题"},
+    orm.OnlyColumns(orm.Col[Article](func(a *Article) *string { return &a.Title })))
 // UPDATE "articles" SET "title" = ? WHERE "id" = ?
+
+// 用 ormgen 生成器时，直接用生成的列闭包，与查询构造器完全同构
+orm.UpdateById(ctx, db, &Article{Id: 1, Title: "新标题"}, orm.OnlyColumns(ArticleCols.Title))
+
+// 列名来自配置 / 变量等动态场景：字符串逃生舱（框架仍会在执行前校验）
+orm.UpdateById(ctx, db, &Article{Id: 1, Title: "新标题"}, orm.OnlyColumnsRaw(dynamicCols...))
 ```
 
 行为要点：
 
-- 列名必须是模型的真实列名。**拼错、或指向主键 / 自增 / 逻辑删除列时直接报错**，不做静默忽略 —— 静默忽略会让「我以为更新了 name，其实 SQL 里根本没有它」一直藏着。
-- 与 `OmitZero` 叠加时先取白名单、再按零值过滤：`OnlyColumns("title", "body")` + `OmitZero()` 只会写入其中非零值的那几列。
+- 列必须是模型的真实可写列。**拼错、或指向主键 / 自增 / 逻辑删除列时直接报错**，不做静默忽略 —— 静默忽略会让「我以为更新了 name，其实 SQL 里根本没有它」一直藏着。`OnlyColumns` 的列来自 `ColExpr`，字段改名在编译期暴露；字符串逃生舱 `OnlyColumnsRaw` 也会在执行前校验。
+- 与 `OmitZero` 叠加时先取白名单、再按零值过滤：`OnlyColumns(ArticleCols.Title, ArticleCols.Body)` + `OmitZero()` 只会写入其中非零值的那几列。
 - 白名单内的重复列名自动去重，不报错；传空（`OnlyColumns()`）会报「白名单为空」，而不是发出没有 SET 子句的 SQL。
 - 适用于把「本次更新哪些字段」当作业务语义显式表达出来的场景（例如 PATCH 接口只允许改若干字段），而不是依赖「零值跳过」这类隐式规则去猜。
 

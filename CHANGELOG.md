@@ -2,6 +2,10 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/)。
 
+## Unreleased
+
+- **feat（破坏性）: `OnlyColumns` 白名单统一为类型安全的 `ColExpr` 写法**：v0.1.13 刚发布的 `OnlyColumns(cols ...string)` 仍是手写字符串列名，与查询构造器「调用点零字段名 / 零 SQL 字符串」的路线相悖 —— 字段改名后字符串不跟着变，拼错只有运行到 `filterOnlyCols` 才报错。现改签名为 `OnlyColumns(cols ...ColExpr)`：列来自 `orm.Col[T](闭包)` / `orm.ColOf[T](字段名)` / 生成器产出的 `XxxCols.Field`，与 `Eq` / `OrderBy` 完全同构，字段改名编译期暴露、列名永远来自 db tag。动态列名（列名来自配置 / 变量）走新增的字符串逃生舱 `OnlyColumnsRaw(cols ...string)`，框架仍会在执行前校验（拼错 / 主键 / 自增 / 逻辑删除列照旧报错，不静默忽略）。写入侧 `filterOnlyCols` 及白名单校验逻辑零改动（`writeConfig.only` 仍为 `[]string`，构造期取 `ColExpr.Name()`）。迁移：`OnlyColumns("title")` → `OnlyColumns(orm.Col[Article](func(a *Article) *string { return &a.Title }))` 或 `OnlyColumns(ArticleCols.Title)`；确需字符串时改用 `OnlyColumnsRaw`。（`crud.go` + `only_columns_test.go` + `integration/api_it_test.go` + README 示例同步更新）
+
 ## v0.1.13 (2026-10-03)
 
 - **fix（破坏性）: 带类型语义的 `db` tag 修饰符不再校验字段类型 —— 四种「静默做错事」收敛为解析期 panic**：`,logic` / `,version` / `,vector` / `,autoincrement` 这四个修饰符决定生成什么样的 SQL，但此前**没有任何一处检查字段类型**，于是「修饰符打在类型不支持的字段上」一律表现为运行期的静默错误（真库 4 后端实测 + 逐条 mutation 验证）：
