@@ -4,6 +4,12 @@
 
 ## Unreleased
 
+- **feat: `Remove` 家族 —— 带行级审计的物理删除（穿透软删）**：此前的物理删除只有 `ForceDelete*`，那是**盲删**：一条 `DELETE` 下发，调用方事后只能拿到 `RowsAffected` 一个数字，**删了哪些行完全没有记录**；合规硬删 / 清库 / 数据修复场景都要求「删之前先留档」，只能自己先 `SelectList` 再逐条删（两次手工拼装，条件与删除之间还可能不一致）。现提供三个一等入口（`remove.go` 新文件 + `repo.go` 包装）：
+  - `Remove(ctx, db, entities ...*T)`：单个 / 多个实体，按主键物理删除；
+  - `RemoveQuery(ctx, db, q)`：按查询条件，返回被删行快照；
+  - `RemoveSQL[T](ctx, db, sql, args...)`：自定义 `SELECT` 圈定范围（**只接受 SELECT**；任意 `DELETE` 仍走 `RawExec`，语义差异在文档与错误文案里都写明）。
+  统一流程 = **先 `SELECT` 捞出行快照（穿透软删：不带「未删除」条件，已软删的行一并纳入）→ 按捕获到的主键分片 `DELETE` → 每批发 `RemoveEvent`**。关键设计：① **钩子看到的行就是实际删除的行**——按捕获主键删除，而不是复用原条件再删一次，消灭「条件命中」与「`DELETE` 下发」之间的行变动窗口；② `RemoveEvent{Table, SQL, Args, Count, Rows, PKs}` 同时带行快照（动态类型 `[]*T`）与归一化主键（`keyOf` 口径，打日志不必反射），监听器经 `Config.RemoveListeners` / `db.WithRemoveListener` 注册，并附开箱即用的 `RemoveAuditLogger(w)`；③ 分片上限 `removeInChunk = 500`（对齐 `preloadInChunk` 的参数上限口径），**每片独立事件**；④ 守卫全部前移到「任何 `DELETE` 下发之前」：零主键（实体组装错误的典型信号）、空实体列表（`ErrInvalidArgument`）、无条件的 `RemoveQuery`、带 `Limit`/`Offset` 的 `RemoveQuery`（「只删前 N 条」一旦静默失效就是全表物理删除）、`RemoveSQL` 的 SELECT 首表与实体表不一致（剥得出表名才校验，剥不出不误拦）、SELECT 投影缺主键列；⑤ 派生 DB 全部继承监听器（`WithPrefix` / `WithLogger` / `WithExecutor` 等 8 个副本构造器同步接线）—— 派生时丢监听器等于审计静默失效。语义边界写明：捕获与删除**不隐式开事务**（要强一致自己包 `db.Transaction`），且与既有 `Hook`（`HookKindExec`，只看到 SQL 文本）是两个层次。新增 `remove_test.go`（SQL 形状 / 实参 / 事件内容 / 软删穿透 / 分片 / 五类守卫 / 派生继承 / Repo 转发）与真库 `integration/remove_it_test.go`（sqlite 通过：软删行被物理删且 Unscoped 查不到、多实体单批、条件删除快照、`RemoveSQL` 含软删行、守卫零痕迹）；**mutation check ×4 全部转红**（去掉零主键守卫、去掉首表校验、去掉 `Limit` 守卫、`WithPrefix` 丢监听器）。
+
 - **feat（破坏性）: `OnlyColumns` 白名单统一为类型安全的 `ColExpr` 写法**：v0.1.13 刚发布的 `OnlyColumns(cols ...string)` 仍是手写字符串列名，与查询构造器「调用点零字段名 / 零 SQL 字符串」的路线相悖 —— 字段改名后字符串不跟着变，拼错只有运行到 `filterOnlyCols` 才报错。现改签名为 `OnlyColumns(cols ...ColExpr)`：列来自 `orm.Col[T](闭包)` / `orm.ColOf[T](字段名)` / 生成器产出的 `XxxCols.Field`，与 `Eq` / `OrderBy` 完全同构，字段改名编译期暴露、列名永远来自 db tag。动态列名（列名来自配置 / 变量）走新增的字符串逃生舱 `OnlyColumnsRaw(cols ...string)`，框架仍会在执行前校验（拼错 / 主键 / 自增 / 逻辑删除列照旧报错，不静默忽略）。写入侧 `filterOnlyCols` 及白名单校验逻辑零改动（`writeConfig.only` 仍为 `[]string`，构造期取 `ColExpr.Name()`）。迁移：`OnlyColumns("title")` → `OnlyColumns(orm.Col[Article](func(a *Article) *string { return &a.Title }))` 或 `OnlyColumns(ArticleCols.Title)`；确需字符串时改用 `OnlyColumnsRaw`。（`crud.go` + `only_columns_test.go` + `integration/api_it_test.go` + README 示例同步更新）
 
 ## v0.1.15 (2026-10-25)
