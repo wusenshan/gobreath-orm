@@ -28,3 +28,6 @@ Thumbs.db
 *.prof
 coverage.html
 coverage.out
+
+# WorkBuddy workspace metadata
+.workbuddy/

@@ -2,7 +2,7 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/)。
 
-## Unreleased
+## v0.1.16 (2026-11-12)
 
 - **feat: `Remove` 家族 —— 带行级审计的物理删除（穿透软删）**：此前的物理删除只有 `ForceDelete*`，那是**盲删**：一条 `DELETE` 下发，调用方事后只能拿到 `RowsAffected` 一个数字，**删了哪些行完全没有记录**；合规硬删 / 清库 / 数据修复场景都要求「删之前先留档」，只能自己先 `SelectList` 再逐条删（两次手工拼装，条件与删除之间还可能不一致）。现提供三个一等入口（`remove.go` 新文件 + `repo.go` 包装）：
   - `Remove(ctx, db, entities ...*T)`：单个 / 多个实体，按主键物理删除；
