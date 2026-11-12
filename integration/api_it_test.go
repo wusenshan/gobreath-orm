@@ -501,7 +501,8 @@ func TestWriteOptionsOnRealDB(t *testing.T) {
 
 		// ---- OnlyColumns：白名单内的列照写，白名单外的列保持原值 ----
 		if err := orm.UpdateById(ctx, db,
-			&User{ID: target.ID, Age: 99}, orm.OnlyColumns("age")); err != nil {
+			&User{ID: target.ID, Age: 99},
+			orm.OnlyColumns(orm.Col[User](func(u *User) *int { return &u.Age }))); err != nil {
 			t.Fatalf("[%s] UpdateById(OnlyColumns(age))：%v", b.name, err)
 		}
 		got, err := orm.SelectById[User](ctx, db, target.ID)
@@ -541,7 +542,9 @@ func TestWriteOptionsOnRealDB(t *testing.T) {
 		// ---- 两者叠加：先取白名单，再按零值过滤 ----
 		if err := orm.UpdateById(ctx, db,
 			&User{ID: target.ID, City: "", Age: 77},
-			orm.OnlyColumns("age", "city"), orm.OmitZero()); err != nil {
+			orm.OnlyColumns(
+				orm.Col[User](func(u *User) *int { return &u.Age }),
+				orm.Col[User](func(u *User) *string { return &u.City })), orm.OmitZero()); err != nil {
 			t.Fatalf("[%s] UpdateById(OnlyColumns+OmitZero)：%v", b.name, err)
 		}
 		got3, _ := orm.SelectById[User](ctx, db, target.ID)
@@ -555,9 +558,9 @@ func TestWriteOptionsOnRealDB(t *testing.T) {
 			name string
 			opt  orm.WriteOption
 		}{
-			{"拼错的列名", orm.OnlyColumns("nmae")},
-			{"主键", orm.OnlyColumns("id")},
-			{"逻辑删除列", orm.OnlyColumns("deleted_at")},
+			{"拼错的列名（Raw 逃生舱）", orm.OnlyColumnsRaw("nmae")},
+			{"主键", orm.OnlyColumns(orm.Col[User](func(u *User) *int64 { return &u.ID }))},
+			{"逻辑删除列", orm.OnlyColumns(orm.Col[User](func(u *User) **time.Time { return &u.DeletedAt }))},
 		}
 		for _, c := range bad {
 			if err := orm.UpdateById(ctx, db, &User{ID: target.ID, Age: 1}, c.opt); err == nil {

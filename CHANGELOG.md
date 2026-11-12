@@ -2,6 +2,10 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/)。
 
+## Unreleased
+
+- **feat（破坏性）: `OnlyColumns` 白名单统一为类型安全的 `ColExpr` 写法**：v0.1.13 刚发布的 `OnlyColumns(cols ...string)` 仍是手写字符串列名，与查询构造器「调用点零字段名 / 零 SQL 字符串」的路线相悖 —— 字段改名后字符串不跟着变，拼错只有运行到 `filterOnlyCols` 才报错。现改签名为 `OnlyColumns(cols ...ColExpr)`：列来自 `orm.Col[T](闭包)` / `orm.ColOf[T](字段名)` / 生成器产出的 `XxxCols.Field`，与 `Eq` / `OrderBy` 完全同构，字段改名编译期暴露、列名永远来自 db tag。动态列名（列名来自配置 / 变量）走新增的字符串逃生舱 `OnlyColumnsRaw(cols ...string)`，框架仍会在执行前校验（拼错 / 主键 / 自增 / 逻辑删除列照旧报错，不静默忽略）。写入侧 `filterOnlyCols` 及白名单校验逻辑零改动（`writeConfig.only` 仍为 `[]string`，构造期取 `ColExpr.Name()`）。迁移：`OnlyColumns("title")` → `OnlyColumns(orm.Col[Article](func(a *Article) *string { return &a.Title }))` 或 `OnlyColumns(ArticleCols.Title)`；确需字符串时改用 `OnlyColumnsRaw`。（`crud.go` + `only_columns_test.go` + `integration/api_it_test.go` + README 示例同步更新）
+
 ## v0.1.15 (2026-10-25)
 
 - **fix（破坏性）: `Distinct()` + 向量检索的闸门给 `Count` / `Page` / 聚合留了后门 —— 那里生成的是非法 SQL**：v0.1.13 的闸门写成 `q.distinct && q.hasVector && !noVecCol`，理由是「Count 的内层 `noVecCol=true`，不带 dist 列，不存在去重失效问题，照常可用」。**这个判断是错的**：`noVecCol` 只关掉投影里的 dist 列，按距离排序仍由 `hasVector` 兜底生成，内层实际拼出 `SELECT DISTINCT * FROM "articles" ORDER BY "emb" <-> $1 LIMIT 3`。真库实测三方言形态不同：**PG 一律报** `for SELECT DISTINCT, ORDER BY expressions must appear in select list`；**MySQL 只在排序列不在投影里时报 3065**（默认 `DISTINCT *` 投影时反而接受）；**SQLite 完全接受、静默执行**。于是同一条查询「PG 炸、MySQL/SQLite 过」，跨方言口径无法统一；再叠上 `SelectList` 已 panic、`Count` 却放行的契约缺口，调用方在 `Page` 里只会拿到一个不带调用栈的数据库语法错误。现闸门去掉 `!noVecCol`，`SelectList` / `Count` / `Page` / `Sum` 等聚合**一律 panic**。清掉 `ORDER BY` 不是替代方案：近邻排序一旦消失，`LIMIT k` 截来的是任意 k 行，`Count` 会静默给出无意义的数字。原先编码了错误前提的 `TestCountStillAllowsDistinctWithVector`（只断言「SQL 里没有 dist 列」、没断言 `ORDER BY`，是假绿）改写为 `TestCountRejectsDistinctWithVector`（Count / Page / Sum 三个子用例）；**mutation check**：闸门退回 `&& !noVecCol` → Count、Sum 两个子用例转红。
