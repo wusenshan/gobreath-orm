@@ -115,6 +115,24 @@ func (r *Repo[T]) ForceDelete(ctx context.Context, q *Query[T]) error {
 	return ForceDelete[T](ctx, r.db, q)
 }
 
+// ---- Remove（带行级审计的物理删除）----
+
+// Remove 按实体主键物理删除（穿透逻辑删除列），支持单条与多条。
+// 行快照经 RemoveListener（db.WithRemoveListener / Config.RemoveListeners 注册）发出。
+func (r *Repo[T]) Remove(ctx context.Context, entities ...*T) (int64, error) {
+	return Remove[T](ctx, r.db, entities...)
+}
+
+// RemoveQuery 按查询条件物理删除（穿透逻辑删除列），返回被删行快照与受影响行数。
+func (r *Repo[T]) RemoveQuery(ctx context.Context, q *Query[T]) ([]*T, int64, error) {
+	return RemoveQuery[T](ctx, r.db, q)
+}
+
+// RemoveSQL 按自定义 SELECT 捞出行后按主键物理删除，返回快照与受影响行数。
+func (r *Repo[T]) RemoveSQL(ctx context.Context, query string, args ...any) ([]*T, int64, error) {
+	return RemoveSQL[T](ctx, r.db, query, args...)
+}
+
 // Save 按主键判断插入或更新：主键为零值 → Insert（自增主键照常回填），
 // 非零 → 全列更新。命中 0 行时：无乐观锁版本列报 ErrNotFound，
 // 有版本列报 ErrOptimisticLock（0 行可能是不存在，也可能是版本冲突，单看影响行数无法区分）。

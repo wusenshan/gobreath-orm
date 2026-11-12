@@ -514,7 +514,7 @@ err := users.Transaction(ctx, func(tx *orm.Repo[User]) error {
 })
 ```
 
-`Repo[T]` 完整转发：`Insert / BatchInsert / SelectById / SelectByIds / SelectList / SelectOne / QueryIter / Page / Count / Exists / UpdateById / UpdateByIds / Save / Update / DeleteById / DeleteByIds / ForceDeleteByIds / UpdateByIdsSets / Delete / ForceDelete / Transaction`，底层与包级泛型函数完全一致，只是把 `T` 提前固定了。
+`Repo[T]` 完整转发：`Insert / BatchInsert / SelectById / SelectByIds / SelectList / SelectOne / QueryIter / Page / Count / Exists / UpdateById / UpdateByIds / Save / Update / DeleteById / DeleteByIds / ForceDeleteByIds / UpdateByIdsSets / Delete / ForceDelete / Remove / RemoveQuery / RemoveSQL / Transaction`，底层与包级泛型函数完全一致，只是把 `T` 提前固定了。
 
 ### 按主键更新（UpdateById）
 
@@ -1143,6 +1143,47 @@ orm.SelectList(ctx, db, orm.NewQuery[User]().Unscoped())      // 不过滤已删
 orm.Delete(ctx, db, orm.NewQuery[User]().Unscoped().Eq(...))  // 物理删（无视逻辑列）
 orm.ForceDeleteById[User](ctx, db, 1)                         // 物理删（Repo 同样有 ForceDelete/ForceDeleteById）
 ```
+
+### 带审计的物理删除：`Remove`（穿透软删 + 行级钩子）
+
+`ForceDelete*` 是**盲删**：一条 `DELETE` 下发，只有 `RowsAffected` 一个数字，删了哪些行没人知道。要在硬删之前留档（打日志 / 推下游 / 事后追溯），用 `Remove` 家族：**先 `SELECT` 把将被删除的行完整捞出来（含已被软删的行，穿透软删），再按捕获到的主键物理删除，每批 `DELETE` 之后把行快照交给 `RemoveListener`**。
+
+```go
+db := orm.Open(orm.Config{
+    Driver: "postgres", DSN: dsn,
+    RemoveListeners: []orm.RemoveListener{orm.RemoveAuditLogger(os.Stdout)}, // 开箱即用
+})
+
+// 单个 / 多个实体
+n, err := orm.Remove(ctx, db, &u)
+n, err = orm.Remove(ctx, db, &u1, &u2)
+
+// 按查询条件（返回被删行快照）
+rows, n, err := orm.RemoveQuery(ctx, db, orm.NewQuery[User]().Lt(
+    orm.Col[User](func(u *User) *time.Time { return &u.CreatedAt }), cutoff))
+
+// 自定义 SELECT 圈定范围（只接受 SELECT；任意 DELETE 请用 RawExec —— 那是盲删）
+rows, n, err := orm.RemoveSQL[User](ctx, db,
+    "SELECT * FROM users WHERE last_login < ? AND deleted_at IS NOT NULL", cutoff)
+
+// 自己的审计逻辑：事件里带完整行快照、主键列表、实际下发的 DELETE 与行数
+db = db.WithRemoveListener(func(ev orm.RemoveEvent) {
+    log.Printf("硬删 %s %d 行: pks=%v sql=%s", ev.Table, ev.Count, ev.PKs, ev.SQL)
+    deleted := ev.Rows.([]*User) // 需要行内容时断言回具体类型
+    _ = deleted
+})
+```
+
+| 要点 | 说明 |
+|---|---|
+| **先查后删** | 钩子看到的行 == 实际 `DELETE` 的主键集合（不是「猜出来的条件命中行」：条件与 `DELETE` 之间行可能变动，按捕获主键删消灭了这个窗口） |
+| **穿透软删** | 捕获与删除都不带「未删除」条件，已软删的行同样物理消失 —— 这正是「清库 / 合规硬删」要的语义 |
+| **分片** | 单条 `DELETE` 最多 500 个主键（对齐 preload 的参数上限口径），**每片独立发一个事件**，`Count` 为该片行数 |
+| **守卫先于 SQL** | 零主键、空实体列表、无条件、带 `Limit`/`Offset`、`RemoveSQL` 的 SELECT 表与实体不一致、投影缺主键 —— 全部在**任何 `DELETE` 下发之前**报错 |
+| **不隐式开事务** | 捕获与删除是两条语句；需要「查出来的一定还在」请自行包 `db.Transaction`（两语句会走同一事务连接） |
+| **与既有钩子的分工** | `Hook`（`HookKindExec`）看的是 SQL 文本；行级快照只走 `RemoveListener`，两者互不替代 |
+
+`Repo[T]` 同步转发 `Remove / RemoveQuery / RemoveSQL`。
 
 ### 约定软删除字段名（免 tag）
 

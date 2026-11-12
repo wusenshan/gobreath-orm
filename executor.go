@@ -31,6 +31,7 @@ type DB struct {
 	readWrite       *readWriteRouter
 	softDeleteField string // 约定软删除字段名；实体未用 ,logic tag 声明时按此字段名匹配（列名或 Go 字段名）
 	optimisticField string // 约定乐观锁字段名；实体未用 ,version tag 声明时按此字段名匹配（列名或 Go 字段名）
+	removeListeners []RemoveListener // Remove 家族的行级审计监听器；未显式注册则为 nil（不发事件）
 }
 
 // DataSource 表示一个独立数据库连接源；只有显式配置后才创建并挂载。
@@ -118,8 +119,11 @@ type Config struct {
 	// 受影响行数为 0 时返回 ErrOptimisticLock。
 	OptimisticField string
 
-	// StrictTagCheck 严格校验 struct tag 格式（默认 false）。
-	// 开启后，模型解析阶段会校验 db tag 是否使用标准引号格式 `db:"col,pk"`；
+	// RemoveListeners 是 Remove 家族（Remove / RemoveQuery / RemoveSQL）的行级审计
+	// 监听器：每批物理 DELETE 下发后收到被删行快照（RemoveEvent）。仅在显式配置后生效。
+	RemoveListeners []RemoveListener
+
+	// StrictTagCheck 严格校验 struct tag 格式（默认 false）。	// 开启后，模型解析阶段会校验 db tag 是否使用标准引号格式 `db:"col,pk"`；
 	// 若写成无引号的 `db:col,pk`，reflect 读不到 db key 会导致 pk/autoincrement
 	// 等修饰符静默丢失（自增主键被写入 0 值且不报错），此时直接 panic 暴露问题。
 	// 默认关闭以兼容旧行为；一旦任一 Open 开启，全局进入严格模式（越严越安全）。
@@ -225,6 +229,9 @@ func Open(args ...any) (*DB, error) {
 	}
 	if len(cfg.Hooks) > 0 {
 		db = db.WithHooks(cfg.Hooks...)
+	}
+	if len(cfg.RemoveListeners) > 0 {
+		db = db.WithRemoveListener(cfg.RemoveListeners...)
 	}
 	if cfg.SoftDeleteField != "" {
 		db = db.WithSoftDeleteField(cfg.SoftDeleteField)
@@ -587,6 +594,7 @@ func (db *DB) WithHooks(hooks ...Hook) *DB {
 		readWrite:       db.readWrite,
 		softDeleteField: db.softDeleteField,
 		optimisticField: db.optimisticField,
+		removeListeners: db.removeListeners,
 	}
 	return cloned
 }
@@ -605,6 +613,7 @@ func (db *DB) WithExecutor(e Executor) *DB {
 		readWrite:       nil,
 		softDeleteField: db.softDeleteField,
 		optimisticField: db.optimisticField,
+		removeListeners: db.removeListeners,
 	}
 }
 
@@ -622,6 +631,7 @@ func (db *DB) WithPrefix(prefix string) *DB {
 		readWrite:       db.readWrite,
 		softDeleteField: db.softDeleteField,
 		optimisticField: db.optimisticField,
+		removeListeners: db.removeListeners,
 	}
 }
 
@@ -640,6 +650,7 @@ func (db *DB) WithSoftDeleteField(name string) *DB {
 		readWrite:       db.readWrite,
 		softDeleteField: name,
 		optimisticField: db.optimisticField,
+		removeListeners: db.removeListeners,
 	}
 }
 
@@ -658,6 +669,7 @@ func (db *DB) WithOptimisticField(name string) *DB {
 		readWrite:       db.readWrite,
 		softDeleteField: db.softDeleteField,
 		optimisticField: name,
+		removeListeners: db.removeListeners,
 	}
 }
 
@@ -674,6 +686,7 @@ func (db *DB) WithLogger(f LogFunc) *DB {
 		readWrite:       db.readWrite,
 		softDeleteField: db.softDeleteField,
 		optimisticField: db.optimisticField,
+		removeListeners: db.removeListeners,
 	}
 }
 
@@ -690,6 +703,7 @@ func (db *DB) WithLogLevel(l LogLevel) *DB {
 		readWrite:       db.readWrite,
 		softDeleteField: db.softDeleteField,
 		optimisticField: db.optimisticField,
+		removeListeners: db.removeListeners,
 	}
 }
 
@@ -706,6 +720,7 @@ func (db *DB) WithSlowThreshold(d time.Duration) *DB {
 		readWrite:       db.readWrite,
 		softDeleteField: db.softDeleteField,
 		optimisticField: db.optimisticField,
+		removeListeners: db.removeListeners,
 	}
 }
 
