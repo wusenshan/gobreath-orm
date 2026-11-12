@@ -1,5 +1,7 @@
 # 集成测试（真实数据库）
 
+**简体中文** | [English](README.en.md)
+
 用真库验证 gobreath-orm。**这些用例不在根模块里**，`go test ./...` 不会跑到它们 ——
 原因见下。
 
@@ -266,19 +268,21 @@ MySQL 默认的严格模式直接报 `Error 1292`。PG（接受公元 1 年）�
 
 ## 其它实测记录
 
-- **`BatchInsert` 不分批，且有实测到的硬上限**（`TestBatchInsertVarLimit` 会把触顶行为打进日志）。
-  `BatchInsert` 把全部实体拼成**一条** INSERT，绑定参数随行数线性增长，而各库都有上限。
+- **`BatchInsert` 会自动分批，而「安全行数」必须按列数算**（`TestBatchInsertVarLimit` 会把触顶行为打进日志）。
+  单条语句的绑定参数随行数线性增长，而各库都有上限；v0.1.13 起 `BatchInsert` / `BatchUpsert` 已按
+  「方言参数上限 ÷ 每行列数」自动分片（`batchRowsPerStmt`，可用 `orm.WithChunkSize(...)` 覆盖）。
+  下面这组数据说明了为什么阈值只能按列数推、不能写死行数 ——
   以 `User`（**6 个可写列**：8 个字段里 `id` 是自增列、`deleted_at` 是逻辑删除列，都被排除）实测：
 
-  | 方言 | 最后一次成功 | 触顶时报错 |
+  | 方言 | 最后一次成功（单条语句） | 触顶时报错 |
   |---|---|---|
   | SQLite | 3000 行（18000 参数） | 9000 行（54000 参数）→ `too many SQL variables`（上限 32766） |
   | PostgreSQL | 9000 行（54000 参数） | 20000 行（120000 参数）→ `extended protocol limited to 65535 parameters` |
   | MySQL | 9000 行（54000 参数） | 20000 行（120000 参数）→ `Error 1390: Prepared statement contains too many placeholders` |
 
   换成 6 列的表，安全行数上限是 **10922（PG/MySQL，65535 占位符）** 与 **5461（SQLite，32766）**。
-  单表列数越少、上限越高，所以「多少行要分批」必须按列数算，不能写死行数 ——
-  这正是 `orm.WithChunkSize(...)` 该由框架算而不是用户猜的理由。
+  列越少、上限越高 —— 这正是分片要按「列数」算而不是按固定行数的理由。
+  分片只保证**单条语句**的原子性，跨批不保证：需要「要么全成功要么全不写入」请自己开事务。
   属于「测试环境没事（几百行）、上生产才暴露」的坑。
 - **JSON 里的数字比较语义不统一**：PG 的 `->>` 出来是 `text`，直接拿数字比会报
   `operator does not exist: text = integer`；SQLite 的 `json_extract` 出来是整数，

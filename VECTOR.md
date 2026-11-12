@@ -1,5 +1,7 @@
 # 向量检索（AI / RAG 原生支持）
 
+**简体中文** | [English](VECTOR.en.md)
+
 > 一份文档讲清楚三件事：**向量在数据库里是怎么存的（逻辑）**、**它能带来什么效果**、**怎么接入一个 AI 向量模型把它跑起来**。
 > 配套可运行示例见 [`examples/vector-search`](examples/vector-search)：
 > - `main.go` 离线看 Postgres / MySQL 两套方言 SQL

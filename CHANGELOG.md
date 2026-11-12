@@ -1,5 +1,7 @@
 # Changelog
 
+**简体中文** | [English](CHANGELOG.en.md)
+
 本项目遵循 [Semantic Versioning](https://semver.org/)。
 
 ## v0.1.16 (2026-11-12)
